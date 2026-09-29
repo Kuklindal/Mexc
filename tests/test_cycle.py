@@ -38,6 +38,9 @@ class Sheet:
             self.fail_once = False
             raise TimeoutError("Response lost after write")
 
+    async def send_weekly(self, sales):
+        pass
+
 
 class Operator(Console):
     def __init__(self):
@@ -809,7 +812,8 @@ class SheetsTests(unittest.IsolatedAsyncioTestCase):
                 "completed_at": "2026-09-22T20:30:45+00:00"}
         await sheets.send(sale)
         await sheets.send(sale)
-        self.assertEqual(calls, [("PUT", "A5:C5", [[107.5877, "23.09.2026", "03:30:45"]])] * 2)
+        from config import p2_nickname
+        self.assertEqual(calls, [("PUT", "A5:D5", [[107.5877, "23.09.2026", "03:30:45", p2_nickname('default')]])] * 2)
 
 
 if __name__ == "__main__":

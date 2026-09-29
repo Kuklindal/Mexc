@@ -11,9 +11,15 @@ import random
 import uuid
 from typing import Callable
 
+from adspower import AdsPowerError, AdsPowerTimeout, AdsPowerUnavailable
 from journal import Journal
-from mexc_client import MexcAPIError, ad_replenish_params, ad_verification, counterparty_identity
+from mexc_client import MexcAPIError, MexcReadUnavailable, ad_replenish_params, ad_verification, counterparty_identity
 from sheets import Reporter
+
+
+class AdsPowerPreflightUnavailable(AdsPowerUnavailable):
+    """A browser preflight failed before the exchange action was sent."""
+    pass
 
 
 COMPLETED_STATES = {"DONE", "COMPLETED"}
@@ -144,6 +150,7 @@ STEPS = [
     Step("reverse_paid", "p1", "П1 оплачивает сделку и отмечает оплату"),
     Step("reverse_release", "p2", "П2 проверяет получение денег и выпускает USDT"),
     Step("reverse_complete", "both", "Обратная сделка завершена, USDT получены П1"),
+    Step("reverse_replenish_buy", "p1", "П1 пополняет объявление покупки USDT после обратной сделки"),
     Step("reverse_replenish", "p1", "П1 пополняет исходное объявление продажи полученными USDT"),
 ]
 
@@ -159,12 +166,13 @@ def new_spec(console: Console, mode: str, profiles: dict[str, str], *,
     console.write(f"П2 купит у П1 USDT на {amount} {fiat}.")
     adv_no = sell_adv_no.strip() or console.ask("Номер готового объявления П1 о продаже USDT (advNo)")
     return {"mode": mode, "amount": amount, "fiat": fiat, "profiles": profiles,
-            "forward_adv_no": adv_no, "reverse_adv_no": buy_adv_no.strip(), "automatic": automatic}
+            "forward_adv_no": adv_no, "reverse_adv_no": buy_adv_no.strip(), "automatic": automatic,
+            "buy_replenish": True}
 
 
 def auto_plan(args, env: dict) -> dict:
     """Validate the whole batch before creating its first cycle."""
-    count = args.count if args.count is not None else int(env.get("AUTO_CYCLE_COUNT", "1"))
+    count = args.count if args.count is not None else 1
     if count < 1:
         raise ValueError("Количество циклов должно быть положительным целым числом")
     explicit_range = args.min_amount is not None or args.max_amount is not None
@@ -211,7 +219,8 @@ async def run_series(runner, cycle_id: str):
                 runner.console.write(f"Серия завершена: {series['count']} циклов.")
             return
         if (runner.journal.cycle(cycle_id)["status"] != "completed"
-                or not runner.result("reverse_replenish")):
+                or not runner.result("reverse_replenish")
+                or (spec.get("buy_replenish") and not runner.result("reverse_replenish_buy"))):
             raise Paused("Следующий цикл не запущен: предыдущий цикл и пополнение не завершены")
         following = dict(series, index=series["index"] + 1)
         runner.check_stop()
@@ -304,7 +313,8 @@ class CycleRunner:
             raise ValueError("Для проверки П2 нужен точный MEXC_P2_NICKNAME")
         if cycle["status"] == "abandoned":
             raise ValueError("Этот цикл сброшен. Для нового цикла используйте команду cycle.")
-        if cycle["status"] == "completed" and self.result("reverse_replenish"):
+        if (cycle["status"] == "completed" and self.result("reverse_replenish")
+                and (not self.spec.get("buy_replenish") or self.result("reverse_replenish_buy"))):
             self.console.write("Этот цикл уже завершён. Повторных операций не будет.")
             await self.reporter.flush()
             await self.close_completed_tabs()
@@ -325,6 +335,8 @@ class CycleRunner:
             for step in STEPS:
                 current = step
                 self.check_stop()
+                if step.key == "reverse_replenish_buy" and not self.spec.get("buy_replenish"):
+                    continue
                 saved = self.journal.step(cycle_id, step.key)
                 if (step.key == 'reverse_create' and saved and saved['status'] == 'unknown'
                         and not saved['result'].get('order_no') and self.journal.reverse_daily_limit_rejected(cycle_id)):
@@ -339,17 +351,40 @@ class CycleRunner:
                         self.daily_limit_message() + "\nПодтвердите, что доступный лимит проверен на MEXC и позволяет эту сделку.",
                         f"ЛИМИТ ПРОВЕРЕН {step.key}")
                     saved = None
+                if saved and saved['status'] == 'rejected' and saved['result'].get('rejected_code') == 700003:
+                    # MEXC explicitly rejected the timestamp before processing.
+                    # A later resume may safely create a fresh signed request.
+                    saved = None
                 leg, action = step.key.split("_", 1)
+                if step.key == "reverse_replenish_buy":
+                    action = "replenish"
                 remote = None
                 if (step.key == "forward_check" and saved and saved["status"] == "done"
                         and self.browser and self.spec["mode"] == "api"
                         and not self.result("forward_paid")):
                     fresh = await self.snapshot(leg)
-                    if fresh["state"] == "NOT_PAID" and await self.browser.inspect(fresh["order_no"]) not in {"passed", "not_required"}:
+                    verification = None
+                    if fresh["state"] == "NOT_PAID":
+                        try:
+                            verification = await self.browser.inspect(fresh["order_no"])
+                        except (AdsPowerTimeout, AdsPowerUnavailable) as exc:
+                            raise AdsPowerPreflightUnavailable(str(exc)) from exc
+                    if verification is not None and verification not in {"passed", "not_required"}:
                         await self.event(step, "pending", "Проверка документов не подтверждена; прежняя отметка по заголовку отменена")
                         saved = None
                 if self.spec["mode"] == "api" and action in {"paid", "release"}:
                     remote = await self.snapshot(leg)
+                    if (self.automatic and step.key == "forward_paid" and saved
+                            and saved["status"] == "unknown"
+                            and remote["state"] in PAYMENT_START_STATES[leg]
+                            and not self.result("forward_release")
+                            and self.journal.forward_paid_browser_preflight_timeout(cycle_id)):
+                        # Recover a cycle stopped by the old handler: the only
+                        # AdsPower call in forward_paid precedes mark_paid.
+                        await self.event(step, "pending",
+                                         "Повтор чтения AdsPower: запрос отметки оплаты не отправлялся",
+                                         saved["result"])
+                        saved = None
                     if saved and saved["status"] == "done":
                         expected = PAID_STATES if action == "paid" else COMPLETED_STATES
                         if remote["state"] not in expected:
@@ -368,6 +403,42 @@ class CycleRunner:
                 already_applied = remote is not None and remote["state"] in (PAID_STATES if action == "paid" else COMPLETED_STATES)
                 if already_applied:
                     uncertain = True
+                if self.automatic and uncertain and step.key == 'forward_check':
+                    fresh = await self.snapshot('forward')
+                    self.check_state(fresh, {'NOT_PAID'})
+                    order_no = fresh['order_no']
+                    state = await self.browser.open_order(order_no)
+                    if state in {'passed', 'not_required'}:
+                        await self.event(step, 'done', 'Проверка документов подтверждена MEXC',
+                                         {'order_no': order_no, 'verification': state})
+                        continue
+                    if state != 'ready':
+                        raise Paused('Проверка документов не подтверждена; состояние кнопки неизвестно')
+                    self.check_stop()
+                    await self.guard_participants()
+                    await self.event(step, 'in_flight', 'Повтор нажатия после сверки состояния кнопки',
+                                     {'order_no': order_no, 'verification': 'adspower'})
+                    try:
+                        await self.browser.approve(order_no)
+                    except BaseException as exc:
+                        self.journal.transition(cycle_id, step.key, step.actor, 'unknown',
+                            f'Результат нажатия требует сверки ({type(exc).__name__})',
+                            context=self.context(step.key), result={'order_no': order_no})
+                        raise
+                    await self.event(step, 'done', 'Проверка документов пройдена на MEXC',
+                                     {'order_no': order_no, 'verification': 'seller_check_completed_on_mexc'})
+                    continue
+                if self.automatic and uncertain and action == 'replenish':
+                    # A timed-out update may already have reached MEXC. Reconcile
+                    # against the saved absolute target; never add the increment twice.
+                    plan = saved['result']
+                    if plan.get('adv_no') and plan.get('target_available'):
+                        ad = await self.clients['p1'].get_ad(plan['adv_no'])
+                        self.check_replenished(ad, plan)
+                        if plan.get('method') == 'quantity_only':
+                            await self.check_browser_ad(plan)
+                        await self.event(step, 'done', 'Пополнение подтверждено текущим остатком MEXC', plan)
+                        continue
                 if self.automatic and uncertain and not already_applied:
                     raise Paused("Результат предыдущей операции требует сверки. Автоматического повтора нет; продолжите с --interactive.")
                 if uncertain and action == "replenish" and saved["result"].get("rejected_code") in {700002, 60048, 60064}:
@@ -424,12 +495,31 @@ class CycleRunner:
                 self.check_stop()
                 payment_context = ({"payment_account_id": prepared["payment_account_id"]}
                                    if "payment_account_id" in prepared else None)
+                if action in {"message", "reply"}:
+                    # Preserve the exact phrase before the network call, so an
+                    # uncertain send can be reconciled without changing text.
+                    payment_context = {"order_no": prepared["order_no"], "text": prepared["text"]}
+                if action == 'check':
+                    payment_context = {'order_no': prepared['order_no'],
+                                       'verification': prepared.get('verification')}
                 if action == "replenish":
                     payment_context = prepared
                 await self.event(step, "in_flight", step.label + (": авторежим" if self.automatic else ": подтверждено оператором"), payment_context)
                 try:
                     result = await self.execute(step, prepared, recovery=uncertain)
                 except BaseException as exc:
+                    if isinstance(exc, AdsPowerPreflightUnavailable):
+                        self.journal.transition(cycle_id, step.key, step.actor, 'pending',
+                            'AdsPower недоступен до отправки действия на MEXC; шаг можно повторить',
+                            context=self.context(step.key), result=payment_context)
+                        raise
+                    if (isinstance(exc, MexcAPIError) and exc.code == 700003
+                            and exc.http_status == 400):
+                        self.journal.transition(cycle_id, step.key, step.actor, 'rejected',
+                            'MEXC отклонил время подписи; запрос не выполнен',
+                            result={k: v for k, v in prepared.items() if k != 'notify_code'}
+                                   | {'rejected_code': 700003}, context=self.context(step.key))
+                        raise
                     if (action == 'create' and isinstance(exc, MexcAPIError)
                             and exc.code == 60085 and exc.http_status in {200, 400}):
                         self.journal.transition(cycle_id, step.key, step.actor, 'rejected',
@@ -450,16 +540,20 @@ class CycleRunner:
             await self.close_completed_tabs()
             self.console.write("Цикл завершён.")
         except BaseException as exc:
-            status = ("stopped" if isinstance(exc, (OperatorStopped, KeyboardInterrupt)) else
+            transient_adspower = self.automatic and isinstance(exc, AdsPowerUnavailable)
+            transient_mexc_read = self.automatic and isinstance(exc, MexcReadUnavailable)
+            timestamp_rejected = (self.automatic and isinstance(exc, MexcAPIError)
+                                  and exc.code == 700003 and exc.http_status == 400)
+            status = ("waiting" if transient_adspower or transient_mexc_read or timestamp_rejected else
+                      "stopped" if isinstance(exc, (OperatorStopped, KeyboardInterrupt)) else
                       "paused" if isinstance(exc, (Paused, KeyboardInterrupt)) else "error")
             reason = str(exc) if isinstance(exc, (Paused, MexcAPIError, ValueError)) else type(exc).__name__
-            from adspower import AdsPowerError
             if isinstance(exc, AdsPowerError):
                 reason = str(exc)
             self.journal.transition(cycle_id, current.key, current.actor, status,
                 f"{current.label}: {reason[:700]}",
                 context=self.context(current.key), cycle_status="paused")
-            if isinstance(exc, Exception):
+            if isinstance(exc, Exception) and not (transient_adspower or transient_mexc_read):
                 await self.reporter.flush()
             raise
 
@@ -475,7 +569,10 @@ class CycleRunner:
     async def close_completed_tabs(self):
         if not self.browser or self.spec["mode"] != "api":
             return
-        if not all(self.result(key) for key in ("forward_complete", "reverse_complete", "reverse_replenish")):
+        required = ["forward_complete", "reverse_complete", "reverse_replenish"]
+        if self.spec.get("buy_replenish"):
+            required.append("reverse_replenish_buy")
+        if not all(self.result(key) for key in required):
             return
         try:
             closed = await self.browser.close_order_tabs([
@@ -588,13 +685,16 @@ class CycleRunner:
 
     async def prepare(self, step: Step, *, recovery: bool) -> dict:
         leg, action = step.key.split("_", 1)
+        if step.key == "reverse_replenish_buy":
+            action = "replenish"
         manual = self.spec["mode"] == "manual" or recovery
         ctx = self.context(step.key)
         if action == "replenish":
             snapshot = await self.snapshot("reverse")
             self.check_state(snapshot, COMPLETED_STATES)
             quantity = money(self.result("reverse_complete")["quantity"])
-            adv_no = self.result("forward_ad")["adv_no"]
+            buy_ad = step.key == "reverse_replenish_buy"
+            adv_no = self.result("reverse_ad" if buy_ad else "forward_ad")["adv_no"]
             if self.spec["mode"] == "manual":
                 self.console.confirm(f"На MEXC добавьте {quantity} USDT к остатку объявления {adv_no}. "
                                      "Если уже добавили, повторно не пополняйте.", f"ПОПОЛНЕНО {adv_no}")
@@ -614,7 +714,8 @@ class CycleRunner:
                 self.console.write(f"Доступный остаток объявления соответствует цели {saved['target_available']} USDT. "
                                    "Проверьте пополнение на MEXC; повторного запроса не будет.")
                 return saved
-            plan = await self.quantity_plan(ad, adv_no, quantity) if ad.get('overVerify') is None else self.replenish_plan(ad, adv_no, quantity)
+            plan = (await self.quantity_plan(ad, adv_no, quantity, side="BUY" if buy_ad else "SELL")
+                    if buy_ad or ad.get('overVerify') is None else self.replenish_plan(ad, adv_no, quantity))
             self.console.write(f"Объявление {adv_no}: сейчас {plan['before_available']} USDT, добавить {quantity} USDT. "
                                f"Ожидаемый доступный остаток: {plan['target_available']} USDT.\n"
                                f"Статус объявления: {ad.get('advStatus', 'неизвестен')}; публикация этим шагом не выполняется.")
@@ -755,6 +856,8 @@ class CycleRunner:
 
     async def execute(self, step: Step, data: dict, *, recovery: bool) -> dict:
         leg, action = step.key.split("_", 1)
+        if step.key == "reverse_replenish_buy":
+            action = "replenish"
         if self.spec["mode"] == "manual":
             return data
         if action in {"message", "reply", "check", "paid", "release", "complete"}:
@@ -773,9 +876,22 @@ class CycleRunner:
                     await self.check_browser_ad(data)
                 return data
             if data.get('method') == 'quantity_only':
-                if await self.quantity_plan(ad, data['adv_no'], data['quantity']) != data:
+                try:
+                    current = await self.quantity_plan(ad, data['adv_no'], data['quantity'],
+                                                       side=data.get('side', 'SELL'))
+                except AdsPowerUnavailable as exc:
+                    raise AdsPowerPreflightUnavailable(str(exc)) from None
+                if ('target_total' in data and 'target_total' in current):
+                    same = all(current.get(key) == data.get(key) for key in
+                               ('adv_no', 'quantity', 'fiat', 'side', 'over_verify', 'target_total'))
+                else:
+                    same = current == data
+                if not same:
                     raise Paused("Объявление изменилось после подтверждения; пополнение не отправлено")
-                await self.browser.replenish_ad(data)
+                try:
+                    await self.browser.replenish_ad(data)
+                except AdsPowerUnavailable as exc:
+                    raise AdsPowerPreflightUnavailable(str(exc)) from None
                 self.check_replenished(await self.clients['p1'].get_ad(data['adv_no']), data)
                 await self.check_browser_ad(data)
                 return data
@@ -812,8 +928,13 @@ class CycleRunner:
             # Placeholder until a verified read-receipt mechanism is configured.
             data["chat_read"] = await self.clients[receiver].mark_chat_read(data["order_no"])
         elif action == "paid":
-            if leg == "forward" and self.browser and await self.browser.inspect(data["order_no"]) not in {"passed", "not_required"}:
-                raise Paused("Дополнительная проверка документов ещё не пройдена на сервере MEXC; отметка оплаты не отправлена")
+            if leg == "forward" and self.browser:
+                try:
+                    verification = await self.browser.inspect(data["order_no"])
+                except (AdsPowerTimeout, AdsPowerUnavailable) as exc:
+                    raise AdsPowerPreflightUnavailable(str(exc)) from exc
+                if verification not in {"passed", "not_required"}:
+                    raise Paused("Дополнительная проверка документов ещё не пройдена на сервере MEXC; отметка оплаты не отправлена")
             await client.mark_paid(data["order_no"], data["payment_account_id"])
             self.check_state(await self.snapshot(leg), PAID_STATES)
         elif action == "release":
@@ -825,26 +946,51 @@ class CycleRunner:
         if not self.browser:
             raise Paused("Для пополнения без сброса настроек нужен открытый профиль П1 AdsPower")
         actual = await self.browser.ad_details(plan['adv_no'])
-        if (str(actual.get('id')) != plan['adv_no']
-                or ad_verification(actual) != plan['over_verify']
-                or Decimal(str(actual.get('availableQuantity', 'NaN'))) != Decimal(plan['target_available'])):
+        verification = (json.dumps(actual.get('overVerify'), sort_keys=True, ensure_ascii=False)
+                        if plan.get('side') == 'BUY' else ad_verification(actual))
+        if 'target_total' in plan:
+            matched = (Decimal(str(actual.get('availableQuantity', 'NaN')))
+                       + Decimal(str(actual.get('frozenQuantity', 'NaN')))
+                       == Decimal(plan['target_total']))
+        else:
+            matched = Decimal(str(actual.get('availableQuantity', 'NaN'))) == Decimal(plan['target_available'])
+        if str(actual.get('id')) != plan['adv_no'] or verification != plan['over_verify'] or not matched:
             raise Paused("Остаток или дополнительная проверка не совпадают с планом; повторное пополнение запрещено")
 
-    async def quantity_plan(self, ad: dict, adv_no: str, quantity: str) -> dict:
+    async def quantity_plan(self, ad: dict, adv_no: str, quantity: str, side: str = 'SELL') -> dict:
         if not self.browser:
             raise Paused("API не возвращает настройки проверки. Для пополнения без их сброса нужен AdsPower П1")
         actual = await self.browser.ad_details(adv_no)
-        if (actual.get('id') != adv_no or actual.get('coinName') != 'USDT' or actual.get('tradeType') != 1
+        api_frozen = ad.get('frozenQuantity')
+        browser_frozen = actual.get('frozenQuantity')
+        if api_frozen is not None and browser_frozen is not None:
+            balance_matches = (Decimal(str(actual.get('availableQuantity', 'NaN'))) + Decimal(str(browser_frozen))
+                               == Decimal(str(ad.get('availableQuantity', 'NaN'))) + Decimal(str(api_frozen)))
+        else:
+            balance_matches = (Decimal(str(actual.get('availableQuantity', 'NaN')))
+                               == Decimal(str(ad.get('availableQuantity', 'NaN'))))
+        if (actual.get('id') != adv_no or actual.get('coinName') != 'USDT'
+                or actual.get('tradeType') != (0 if side == 'BUY' else 1)
+                or ad.get('side', side) != side
                 or actual.get('currency') != self.spec['fiat'] or ad.get('advNo') != adv_no
-                or Decimal(str(actual.get('availableQuantity', 'NaN'))) != Decimal(str(ad.get('availableQuantity', 'NaN')))):
+                or not balance_matches):
             raise Paused("Данные объявления в API и браузере расходятся; пополнение остановлено")
         available = Decimal(str(actual['availableQuantity']))
         increment = Decimal(money(quantity))
         if not available.is_finite() or available < 0:
             raise ValueError("Некорректный остаток объявления")
-        return {'method': 'quantity_only', 'adv_no': adv_no, 'fiat': self.spec['fiat'], 'quantity': str(increment),
+        verification = (json.dumps(actual.get('overVerify'), sort_keys=True, ensure_ascii=False)
+                        if side == 'BUY' else ad_verification(actual))
+        plan = {'method': 'quantity_only', 'adv_no': adv_no, 'fiat': self.spec['fiat'], 'quantity': str(increment),
                 'before_available': str(available), 'target_available': str(available + increment),
-                'over_verify': ad_verification(actual)}
+                'over_verify': verification, 'side': side}
+        if api_frozen is not None and browser_frozen is not None:
+            frozen = Decimal(str(browser_frozen))
+            if not frozen.is_finite() or frozen < 0:
+                raise Paused('Некорректный замороженный остаток объявления')
+            plan.update(before_frozen=str(frozen), before_total=str(available + frozen),
+                        target_total=str(available + frozen + increment))
+        return plan
 
     def replenish_plan(self, ad: dict, adv_no: str, quantity: str) -> dict:
         if ad.get("advNo") != adv_no or ad.get("fiatUnit") != self.spec["fiat"]:
@@ -867,17 +1013,22 @@ class CycleRunner:
         if plan.get("over_verify") and ad.get("overVerify") is not None:
             if ad_verification(ad) != plan["over_verify"]:
                 raise Paused("Настройка дополнительной проверки после пополнения изменилась; повтор пополнения запрещён. Проверьте объявление на MEXC")
-        if (ad.get("advNo") != plan.get("adv_no") or ad.get("side") != "SELL"
+        if 'target_total' in plan:
+            matched = (Decimal(str(ad.get('availableQuantity', 'NaN')))
+                       + Decimal(str(ad.get('frozenQuantity', 'NaN'))) == Decimal(plan['target_total']))
+        else:
+            matched = Decimal(str(ad.get('availableQuantity', 'NaN'))) == Decimal(plan['target_available'])
+        if (ad.get("advNo") != plan.get("adv_no") or ad.get("side") != plan.get("side", "SELL")
                 or ad.get("coinName") != "USDT" or ad.get("fiatUnit") != self.spec["fiat"]
                 or "target_available" not in plan
-                or Decimal(str(ad.get("availableQuantity", "NaN"))) != Decimal(plan["target_available"])
+                or not matched
                 or ("target_max_limit" in plan and Decimal(str(ad.get("maxSingleTransAmount", "NaN"))) != Decimal(plan["target_max_limit"]))):
             raise Paused("Доступный остаток или максимальный лимит объявления не совпадает с подтверждённым планом. Автоматического повтора не будет: "
                          "сверьте пополнение и новые сделки на MEXC. Не добавляйте USDT повторно, если пополнение уже выполнено.")
 
 
 async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock: bool = True,
-                      notify_prepare_errors: bool = True) -> int:
+                      notify_prepare_errors: bool = True, telegram_keyboard=None) -> int:
     import os
     from pathlib import Path
     from contextlib import nullcontext
@@ -946,9 +1097,9 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 sheets = GoogleSheets(sheet_id, os.getenv("GOOGLE_SHEET_TAB", "Продажи"), str(credentials_path))
             if bool(settings.telegram_bot_token) != bool(settings.telegram_chat_id):
                 raise ValueError("Заполните вместе TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID")
-            reporter = Reporter(journal, telegram, sheets)
+            reporter = Reporter(journal, telegram, sheets, keyboard=telegram_keyboard)
             if args.command == "sync-journal":
-                pending = await reporter.flush()
+                pending = await reporter.flush(force_sheets=True)
                 print(f"В очереди: Telegram — {pending['telegram']}, суммы продаж — {pending['sales']}.")
                 return 0 if (not telegram.enabled or not pending['telegram']) and (not sheets or not pending['sales']) else 1
             existing = journal.cycle(args.resume) if args.resume else None
@@ -986,7 +1137,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 for actor in ("p1", "p2"):
                     profile = Settings.from_env(actor, p2_profile=p2_profile if actor == "p2" else None)
                     profiles[actor] = fingerprint(profile.api_key)
-                    clients[actor] = MexcP2PClient(profile.api_key, profile.secret_key, profile.base_url, profile.recv_window)
+                    clients[actor] = MexcP2PClient(profile.api_key, profile.secret_key, profile.base_url,
+                                                   profile.recv_window, proxy_url=profile.proxy_url)
                 if profiles["p1"] == profiles["p2"]:
                     raise ValueError("Для П1 и П2 указаны одинаковые API-ключи")
                 if existing and profiles != existing["spec"]["profiles"]:

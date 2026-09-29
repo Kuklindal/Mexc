@@ -1,0 +1,22 @@
+[Unit]
+Description=AdsPower Local API (headless)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=mexc
+WorkingDirectory=/home/mexc
+EnvironmentFile=/etc/mexc/adspower.env
+ExecStart=/usr/bin/env adspower_global --headless=true --api-key=${ADSPOWER_API_KEY} --api-port=${ADSPOWER_API_PORT}
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+LogNamespace=mexc
+
+[Install]
+WantedBy=multi-user.target

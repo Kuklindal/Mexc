@@ -1,11 +1,10 @@
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
 def setup_logging(log_dir: str = "logs", level: str = "INFO") -> logging.Logger:
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-
     logger = logging.getLogger("mexc_p2p")
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     logger.propagate = False
@@ -20,14 +19,15 @@ def setup_logging(log_dir: str = "logs", level: str = "INFO") -> logging.Logger:
     console = logging.StreamHandler()
     console.setFormatter(formatter)
 
-    file_handler = RotatingFileHandler(
-        Path(log_dir) / "mexc_p2p.log",
-        maxBytes=5_000_000,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-
     logger.addHandler(console)
-    logger.addHandler(file_handler)
+    if os.getenv("LOG_TO_FILE", "true").strip().lower() not in {"0", "false", "no", "off"}:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            Path(log_dir) / "mexc_p2p.log",
+            maxBytes=5_000_000,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
     return logger

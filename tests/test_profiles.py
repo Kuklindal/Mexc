@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from config import Settings, p2_prefix, select_p2_profile
+from config import Settings, p2_prefix, proxy_url, select_p2_profile
 from cycle import run_command
 from main import build_parser
 import test_auto as fixtures
@@ -44,6 +44,22 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 p2_prefix(name)
 
+    def test_each_p2_reads_only_its_own_proxy(self):
+        env = {'MEXC_P2_API_KEY': 'default-key', 'MEXC_P2_SECRET_KEY': 'default-secret',
+               'MEXC_P2_PROXY_URL': 'http://proxy-default.example:8080',
+               'MEXC_P2_2_API_KEY': 'second-key', 'MEXC_P2_2_SECRET_KEY': 'second-secret',
+               'MEXC_P2_2_PROXY_URL': 'socks5://proxy-second.example:1080'}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(Settings.from_env('p2', p2_profile='default').proxy_url,
+                             env['MEXC_P2_PROXY_URL'])
+            self.assertEqual(Settings.from_env('p2', p2_profile='2').proxy_url,
+                             env['MEXC_P2_2_PROXY_URL'])
+            self.assertIsNone(Settings.from_env('p1', require_keys=False).proxy_url)
+        for invalid in ('ftp://proxy.example:8080', 'http://proxy.example',
+                        'http://proxy.example:8080/path', 'http://proxy.example:bad'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                proxy_url(invalid, 'PROXY')
+
 
 class ProfileCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_binds_keys_identity_payment_and_persists_selection(self):
@@ -54,6 +70,7 @@ class ProfileCommandTests(unittest.IsolatedAsyncioTestCase):
                    'MEXC_P2_API_KEY': 'wrong-default-key', 'MEXC_P2_SECRET_KEY': 'wrong-secret',
                    'MEXC_P2_MEMBER_ID': 'wrong-member', 'MEXC_P2_NICKNAME': 'wrong-name', 'MEXC_P2_PAYMENT_ID': '111',
                    'MEXC_P2_2_API_KEY': 'p2-second-key', 'MEXC_P2_2_SECRET_KEY': 'p2-second-secret',
+                   'MEXC_P2_2_PROXY_URL': 'http://proxy-second.example:8080',
                    'MEXC_P2_2_MEMBER_ID': 'ID2', 'MEXC_P2_2_NICKNAME': 'Second', 'MEXC_P2_2_PAYMENT_ID': '222'}
             captured = []
             async def series(runner, cycle_id):
@@ -73,6 +90,7 @@ class ProfileCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('p2-second-key', json.dumps(saved['spec']))
                 self.assertEqual(client.call_args_list[0].args[:2], ('p1-key', 'p1-secret'))
                 self.assertEqual(client.call_args_list[1].args[:2], ('p2-second-key', 'p2-second-secret'))
+                self.assertEqual(client.call_args_list[1].kwargs['proxy_url'], 'http://proxy-second.example:8080')
                 resume = build_parser().parse_args(['cycle', '--resume', saved['id']])
                 self.assertEqual(await run_command(resume), 0)
                 self.assertEqual(captured[-1][0].p2_profile, '2')

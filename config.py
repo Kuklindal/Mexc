@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 from dotenv import load_dotenv
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -18,6 +19,30 @@ def p2_profile_name(value: str) -> str:
 def p2_prefix(name: str) -> str:
     name = p2_profile_name(name)
     return "MEXC_P2" if name == "default" else f"MEXC_P2_{name.upper()}"
+
+
+def p2_nickname(profile: str, saved: str | None = None, env=None) -> str:
+    """Human-readable MEXC name; keep the profile key for account selection only."""
+    if saved and saved.strip():
+        return saved.strip()
+    source = os.environ if env is None else env
+    return source.get(f"{p2_prefix(profile)}_NICKNAME", "").strip() or profile
+
+
+def proxy_url(value: str, field: str) -> str | None:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        valid = (parsed.scheme in {'http', 'socks5'} and parsed.hostname and parsed.port
+                 and parsed.path in {'', '/'} and not parsed.query and not parsed.fragment
+                 and not any(char.isspace() for char in value))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(f'{field}: нужен URL http:// или socks5:// с адресом и портом')
+    return value
 
 
 def select_p2_profile(requested: str | None, saved_spec: dict | None, env) -> str:
@@ -50,6 +75,7 @@ class Settings:
     log_level: str
     log_dir: str
     enable_state_changes: bool
+    proxy_url: str | None = None
 
     @classmethod
     def from_env(cls, account: str | None = None, *, require_keys: bool = True,
@@ -79,4 +105,5 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             log_dir=os.getenv("LOG_DIR", "logs"),
             enable_state_changes=_bool("ENABLE_STATE_CHANGES", False),
+            proxy_url=proxy_url(os.getenv(f"{prefix}_PROXY_URL", ""), f"{prefix}_PROXY_URL"),
         )

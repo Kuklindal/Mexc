@@ -136,6 +136,20 @@ class Journal:
         except (ValueError, TypeError):
             return False
 
+    def forward_paid_browser_preflight_timeout(self, cycle_id: str) -> bool:
+        """Recognize only the legacy read timeout before the first mark-paid call."""
+        events = self.db.execute("""SELECT status, message FROM events
+            WHERE cycle_id=? AND step='forward_paid' ORDER BY id""", (cycle_id,)).fetchall()
+        if sum(row['status'] == 'in_flight' for row in events) != 1:
+            return False
+        unknown = next((index for index, row in reversed(list(enumerate(events)))
+                        if row['status'] == 'unknown'), None)
+        if unknown is None or 'AdsPowerTimeout' not in events[unknown]['message']:
+            return False
+        return any(row['status'] == 'error'
+                   and 'AdsPower: команда Runtime.evaluate не ответила' in row['message']
+                   for row in events[unknown + 1:])
+
     def transition(self, cycle_id: str, step: str, actor: str, status: str, message: str,
                    *, result: dict | None = None, context: dict | None = None,
                    cycle_status: str | None = None) -> None:
@@ -181,10 +195,17 @@ class Journal:
         return row[0] if row else None
 
     def pending_sales(self) -> list[dict]:
-        return [dict(r) for r in self.db.execute("SELECT * FROM sales WHERE sent=0 ORDER BY id")]
+        return [dict(r) for r in self.db.execute("""SELECT sales.*,
+            COALESCE(json_extract(cycles.spec, '$.p2_profile'), 'default') AS p2_profile,
+            json_extract(cycles.spec, '$.nicknames.p2') AS p2_nickname
+            FROM sales JOIN cycles ON cycles.id=sales.cycle_id
+            WHERE sales.sent=0 ORDER BY sales.id""")]
 
     def sales(self) -> list[dict]:
-        return [dict(r) for r in self.db.execute("SELECT * FROM sales ORDER BY id")]
+        return [dict(r) for r in self.db.execute("""SELECT sales.*,
+            COALESCE(json_extract(cycles.spec, '$.p2_profile'), 'default') AS p2_profile,
+            json_extract(cycles.spec, '$.nicknames.p2') AS p2_nickname
+            FROM sales JOIN cycles ON cycles.id=sales.cycle_id ORDER BY sales.id""")]
 
     def sale_delivered(self, sale_id: int):
         with self.db:

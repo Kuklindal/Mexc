@@ -1,9 +1,10 @@
 import unittest
 import json
+import httpx
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
-from adspower import AdsPower, AdsPowerError, AdsPowerTimeout, local_url
+from adspower import AdsPower, AdsPowerError, AdsPowerTimeout, AdsPowerUnavailable, local_url
 
 
 ORDER = "d1823100470541552640"
@@ -18,6 +19,27 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             yield self.call
         self.browser.connection = connection
         self.browser.verification_state = AsyncMock(return_value="passed")
+
+    async def test_local_api_read_timeout_retries_without_browser_command(self):
+        response = httpx.Response(200, json={'code': 0, 'data': {'status': 'Active',
+            'ws': {'puppeteer': 'ws://127.0.0.1:9222/devtools/browser/one'}}})
+        with patch('adspower.httpx.AsyncClient') as factory, \
+                patch('adspower.asyncio.sleep', new=AsyncMock()) as sleep:
+            client = factory.return_value.__aenter__.return_value
+            client.get = AsyncMock(side_effect=[httpx.ReadTimeout('temporary'), response])
+            endpoint = await self.browser.endpoint()
+        self.assertEqual(endpoint, 'ws://127.0.0.1:9222/devtools/browser/one')
+        self.assertEqual(client.get.await_count, 2)
+        sleep.assert_awaited_once_with(2)
+
+    async def test_persistent_local_api_timeout_is_classified_for_scheduler(self):
+        with patch('adspower.httpx.AsyncClient') as factory, \
+                patch('adspower.asyncio.sleep', new=AsyncMock()):
+            client = factory.return_value.__aenter__.return_value
+            client.get = AsyncMock(side_effect=httpx.ReadTimeout('temporary'))
+            with self.assertRaises(AdsPowerUnavailable):
+                await self.browser.endpoint()
+        self.assertEqual(client.get.await_count, 3)
 
     async def test_inspect_does_not_click(self):
         self.browser.locate = AsyncMock(return_value=("session", "ready"))

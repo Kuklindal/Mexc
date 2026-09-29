@@ -133,6 +133,7 @@ async def async_main() -> int:
         secret_key=settings.secret_key,
         base_url=settings.base_url,
         recv_window=settings.recv_window,
+        proxy_url=settings.proxy_url,
     )
 
     try:

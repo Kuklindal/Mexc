@@ -1,0 +1,5 @@
+[Journal]
+Storage=persistent
+MaxRetentionSec=2day
+MaxFileSec=1h
+SystemMaxUse=200M

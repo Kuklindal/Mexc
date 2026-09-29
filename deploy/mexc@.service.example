@@ -1,0 +1,27 @@
+[Unit]
+Description=MEXC Telegram control (%i)
+Wants=network-online.target
+Requires=adspower-headless.service
+After=network-online.target adspower-headless.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=mexc
+WorkingDirectory=/opt/mexc/%i
+Environment=PYTHONUNBUFFERED=1
+Environment=LOG_TO_FILE=false
+Environment=AUTO_RESUME_ON_BOOT=true
+ExecStartPre=/opt/mexc/%i/.venv/bin/python /opt/mexc/%i/deploy/start_adspower_profile.py
+ExecStart=/opt/mexc/%i/.venv/bin/python /opt/mexc/%i/main.py telegram-control
+Restart=always
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=300
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+LogNamespace=mexc
+
+[Install]
+WantedBy=multi-user.target

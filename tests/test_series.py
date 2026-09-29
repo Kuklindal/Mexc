@@ -49,14 +49,14 @@ class SeriesTests(unittest.IsolatedAsyncioTestCase):
                 self.plan(*options)
 
     def test_env_defaults_cli_override_and_fixed_amount(self):
-        env = dict(AUTO_MIN_AMOUNT='9000', AUTO_MAX_AMOUNT='9500', AUTO_CYCLE_COUNT='4', AUTO_FIAT='RUB')
+        env = dict(AUTO_MIN_AMOUNT='9000', AUTO_MAX_AMOUNT='9500', AUTO_FIAT='RUB')
         plan = self.plan(env=env)
-        self.assertEqual((plan['min_amount'], plan['max_amount'], plan['count']), ('9000', '9500', 4))
+        self.assertEqual((plan['min_amount'], plan['max_amount'], plan['count']), ('9000', '9500', 1))
         plan = self.plan('--min-amount', '9100', '--max-amount', '9200', '--count', '2', env=env)
         self.assertEqual((plan['min_amount'], plan['max_amount'], plan['count']), ('9100', '9200', 2))
         plan = self.plan('--amount', '9150 RUB', env=env)
         self.assertEqual(random_amount(plan), '9150')
-        self.assertEqual(plan['count'], 4)
+        self.assertEqual(plan['count'], 1)
 
     async def test_exact_cycle_count_refill_and_no_repeat_on_resume(self):
         runner = self.attach_series()

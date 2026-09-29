@@ -59,6 +59,7 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved['method'], 'quantity_only')
         self.assertEqual(saved['over_verify'], '{"types":[1]}')
 
+
     def test_changed_verification_invalidates_plan_and_postcheck(self):
         runner = self.runner()
         runner.spec = self.spec
@@ -67,6 +68,27 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(original, runner.replenish_plan(changed, 'AD-SELL', '100'))
         with self.assertRaises(Paused):
             runner.check_replenished(changed | {'availableQuantity': '109'}, original)
+
+    async def test_temporary_other_order_lock_does_not_invalidate_quantity_refill(self):
+        runner = self.runner()
+        runner.spec = self.spec
+        ad = self.exchange.ad | {'availableQuantity': '9', 'frozenQuantity': '0'}
+        actual = {'id': 'AD-SELL', 'coinName': 'USDT', 'currency': 'RUB',
+                  'tradeType': 1, 'availableQuantity': '7', 'frozenQuantity': '2',
+                  'overVerify': {'types': [1]}}
+        browser = type('Browser', (), {})()
+        browser.ad_details = AsyncMock(side_effect=lambda _: actual.copy())
+        runner.browser = browser
+        plan = await runner.quantity_plan(ad, 'AD-SELL', '100')
+        self.assertEqual(plan['target_total'], '109')
+        self.assertEqual(plan['target_available'], '107')
+        actual.update(availableQuantity='6', frozenQuantity='103')
+        after = ad | {'availableQuantity': '6', 'frozenQuantity': '103'}
+        runner.check_replenished(after, plan)
+        await runner.check_browser_ad(plan)
+        after['frozenQuantity'] = '102'
+        with self.assertRaises(Paused):
+            runner.check_replenished(after, plan)
 
     async def test_actual_request_contains_url_encoded_json(self):
         client = MexcP2PClient('test-key', 'test-secret')

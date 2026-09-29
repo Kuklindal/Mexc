@@ -5,6 +5,7 @@ __pycache__/
 .env.*
 !.env.example
 credentials/
+google-service-account.json
 data/
 logs/
 *.sqlite3*

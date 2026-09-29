@@ -119,7 +119,8 @@ async def run_command(args, console=None):
                 settings = Settings.from_env(spec['account'], p2_profile=spec['p2_profile'])
                 if fingerprint(settings.api_key) != spec['key_hash']:
                     raise ValueError('API-ключ отличается от ключа сохранённого перевода; верните исходные настройки')
-            client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url, settings.recv_window)
+            client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url,
+                                   settings.recv_window, proxy_url=settings.proxy_url)
             if args.command == 'wallet-transfer':
                 return await transfers.send(client, spec)
             if args.not_sent:

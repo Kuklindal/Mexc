@@ -1,0 +1,10 @@
+[Unit]
+Description=Check MEXC service log retention hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=mexc-log-vacuum.service
+
+[Install]
+WantedBy=timers.target

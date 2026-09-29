@@ -12,6 +12,7 @@ from urllib.parse import urlencode, quote
 
 import httpx
 import websockets
+from python_socks.async_.asyncio import Proxy
 
 
 class MexcAPIError(RuntimeError):
@@ -19,6 +20,10 @@ class MexcAPIError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+
+
+class MexcReadUnavailable(MexcAPIError):
+    """A read-only request failed; no exchange state change was requested."""
 
 
 def counterparty_identity(detail: dict) -> tuple[str, str]:
@@ -116,15 +121,20 @@ class MexcP2PClient:
         secret_key: str,
         base_url: str = "https://api.mexc.com",
         recv_window: int = 5000,
+        proxy_url: str | None = None,
     ):
         self.api_key = api_key
         self.secret_key = secret_key.encode("utf-8")
         self.base_url = base_url.rstrip("/")
         self.recv_window = recv_window
+        self.server_offset_ms = 0
+        self.proxy_url = proxy_url
         self.logger = logging.getLogger("mexc_p2p.api")
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(20.0),
             headers={"X-MEXC-APIKEY": self.api_key},
+            proxy=proxy_url,
+            trust_env=False,
         )
 
     async def close(self) -> None:
@@ -141,7 +151,7 @@ class MexcP2PClient:
             items.append((key, str(value)))
 
         items.append(("recvWindow", str(self.recv_window)))
-        items.append(("timestamp", str(int(time.time() * 1000))))
+        items.append(("timestamp", str(int(time.time() * 1000) + self.server_offset_ms)))
 
         # MEXC rejects signatures using '+' for spaces; sign and send the same
         # percent-encoded bytes, including %20 for spaces and %2B for literal '+'.
@@ -159,21 +169,32 @@ class MexcP2PClient:
         path: str,
         params: dict[str, Any] | None = None,
     ) -> Any:
-        query = self._signed_query(params)
-        url = f"{self.base_url}{path}?{query}"
-
         self.logger.debug("%s %s", method.upper(), path)
-        try:
-            response = await self.http.request(method.upper(), url)
-        except httpx.RequestError as exc:
-            raise MexcAPIError(f"MEXC network error ({type(exc).__name__}); execution may be unknown") from None
+        for attempt in range(2):
+            query = self._signed_query(params)
+            url = f"{self.base_url}{path}?{query}"
+            try:
+                response = await self.http.request(method.upper(), url)
+            except httpx.RequestError as exc:
+                if method.upper() == "GET":
+                    raise MexcReadUnavailable(
+                        f"MEXC read request failed ({type(exc).__name__}); no action was sent") from None
+                raise MexcAPIError(f"MEXC network error ({type(exc).__name__}); execution may be unknown") from None
 
-        # Important for trading APIs: do not blindly retry state-changing calls
-        # on network/5xx errors because execution status may be unknown.
-        try:
-            payload = response.json()
-        except Exception:
-            raise MexcAPIError(f"Non-JSON response: HTTP {response.status_code}")
+            # Never retry a network/5xx failure on a state-changing endpoint.
+            try:
+                payload = response.json()
+            except Exception:
+                raise MexcAPIError(f"Non-JSON response: HTTP {response.status_code}")
+            if (attempt == 0 and response.status_code < 500 and isinstance(payload, dict)
+                    and payload.get('code') == 700003):
+                try:
+                    await self._sync_server_time()
+                except (httpx.HTTPError, ValueError, TypeError, KeyError):
+                    pass  # Keep the original explicit rejection below.
+                else:
+                    continue
+            break
 
         if response.status_code >= 400:
             raise MexcAPIError(
@@ -294,6 +315,31 @@ class MexcP2PClient:
             raise MexcAPIError("MEXC вернул неожиданный результат проверки перевода")
         return payload
 
+    async def _sync_server_time(self) -> None:
+        before = time.time() * 1000
+        response = await self.http.get(f"{self.base_url}/api/v3/time")
+        after = time.time() * 1000
+        response.raise_for_status()
+        server_time = response.json()['serverTime']
+        if type(server_time) is not int or server_time <= 0:
+            raise ValueError('Invalid MEXC server time')
+        self.server_offset_ms = round(server_time - (before + after) / 2)
+
+    async def wallet_list(self, path: str, params: dict | None = None) -> list[dict]:
+        payload = await self._request("GET", path, params or {})
+        if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
+            raise MexcAPIError(f"Некорректный список кошелька: {path}")
+        return payload
+
+    async def withdraw_usdt(self, amount: str, network: str, address: str,
+                            memo: str, request_id: str) -> str:
+        payload = await self._request("POST", "/api/v3/capital/withdraw", {
+            "coin": "USDT", "netWork": network, "address": address,
+            "memo": memo or None, "amount": amount, "withdrawOrderId": request_id})
+        if not isinstance(payload, dict) or not payload.get("id"):
+            raise MexcAPIError("Ответ на вывод не содержит ID; повтор запрещён, нужна сверка истории")
+        return str(payload["id"])
+
     async def create_order(
         self,
         *,
@@ -393,12 +439,26 @@ class MexcP2PClient:
             "params": json.dumps(body, ensure_ascii=False, separators=(",", ":")),
         }
 
-        async with websockets.connect(ws_url, open_timeout=15, close_timeout=5) as ws:
-            await ws.send(json.dumps(request, ensure_ascii=False))
-            raw = await asyncio.wait_for(ws.recv(), timeout=20)
-            response = json.loads(raw)
-            if not response.get("success"):
-                raise MexcAPIError(f"Chat send failed: {response}")
+        sock = None
+        if self.proxy_url:
+            try:
+                # Some HTTP proxies answer CONNECT with HTTP/1.0, which the
+                # websockets proxy parser rejects. python-socks accepts it.
+                sock = await Proxy.from_url(self.proxy_url).connect(
+                    dest_host='fiat.mexc.com', dest_port=443, timeout=15)
+            except Exception as exc:
+                raise MexcAPIError(f"Chat proxy connection failed ({type(exc).__name__})") from None
+        try:
+            async with websockets.connect(ws_url, open_timeout=15, close_timeout=5,
+                                          proxy=None, **({'sock': sock} if sock else {})) as ws:
+                await ws.send(json.dumps(request, ensure_ascii=False))
+                raw = await asyncio.wait_for(ws.recv(), timeout=20)
+                response = json.loads(raw)
+                if not response.get("success"):
+                    raise MexcAPIError(f"Chat send failed: {response}")
+        finally:
+            if sock is not None:
+                sock.close()
 
     async def mark_chat_read(self, order_no: str) -> bool:
         # Disabled placeholder: fetching history is not a read receipt.

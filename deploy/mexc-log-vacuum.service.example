@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate and remove old MEXC service logs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/journalctl --namespace=mexc --rotate --vacuum-time=46h

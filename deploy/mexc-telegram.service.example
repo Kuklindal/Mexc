@@ -1,0 +1,17 @@
+[Unit]
+Description=MEXC P2P Telegram control
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/opt/mexc_p2p_merchant_bot
+ExecStart=/opt/mexc_p2p_merchant_bot/.venv/bin/python /opt/mexc_p2p_merchant_bot/main.py telegram-control
+Restart=on-failure
+RestartSec=10
+UMask=0077
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

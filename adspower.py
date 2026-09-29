@@ -21,6 +21,11 @@ class AdsPowerTimeout(AdsPowerError):
     pass
 
 
+class AdsPowerUnavailable(AdsPowerError):
+    """Temporary failure reaching the local AdsPower API before a browser command."""
+    pass
+
+
 # The site's quantity endpoint changes only the available quantity. It does not
 # resave trade requirements like the public save_or_update endpoint does.
 AD_QUANTITY = r"""async (advNo, plan) => {
@@ -31,7 +36,8 @@ AD_QUANTITY = r"""async (advNo, plan) => {
         const response = await fetch(root + '/' + advNo, {method:'GET',credentials:'same-origin',cache:'no-store'});
         const body = await response.json(), d = body.data;
         if (!response.ok || body.code !== 0 || !d || d.id !== advNo) throw new Error('ad_read');
-        return {id:d.id, availableQuantity:d.availableQuantity, overVerify:d.overVerify ?? null,
+        return {id:d.id, availableQuantity:d.availableQuantity, frozenQuantity:d.frozenQuantity,
+            overVerify:d.overVerify ?? null,
             coinName:d.coinName, currency:d.currency, tradeType:d.tradeType};
     };
     const verification = value => {
@@ -43,15 +49,21 @@ AD_QUANTITY = r"""async (advNo, plan) => {
     };
     const before = await read();
     if (!plan) return before;
-    if (before.coinName !== 'USDT' || before.currency !== plan.fiat || before.tradeType !== 1
-            || Number(before.availableQuantity) !== Number(plan.before_available)
+    const total = d => Number(d.availableQuantity) + Number(d.frozenQuantity);
+    const sameTotal = (d, expected) => Number.isFinite(total(d)) && Number.isFinite(Number(expected))
+        && Math.abs(total(d) - Number(expected)) <= 1e-8;
+    if (before.coinName !== 'USDT' || before.currency !== plan.fiat
+            || before.tradeType !== (plan.side === 'BUY' ? 0 : 1)
+            || (plan.target_total !== undefined ? !sameTotal(before, plan.before_total)
+                : Number(before.availableQuantity) !== Number(plan.before_available))
             || verification(before.overVerify) !== verification(plan.over_verify)) return {error:'ad_changed'};
     const response = await fetch(root + '/quantity', {method:'POST',credentials:'same-origin',
         body:new URLSearchParams({id:advNo,quantity:plan.quantity})});
     const body = await response.json();
     if (!response.ok || body.code !== 0) return {error:'quantity_rejected',code:body.code,http:response.status};
     const after = await read();
-    if (Number(after.availableQuantity) !== Number(plan.target_available)
+    if ((plan.target_total !== undefined ? !sameTotal(after, plan.target_total)
+            : Number(after.availableQuantity) !== Number(plan.target_available))
             || verification(after.overVerify) !== verification(before.overVerify)) return {error:'result_mismatch'};
     return after;
 }"""
@@ -114,8 +126,16 @@ class AdsPower:
         if not self.profile_id or not self.api_key:
             raise AdsPowerError("Заполните ADSPOWER_P1_PROFILE_ID и ADSPOWER_API_KEY в .env")
         async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
-            response = await client.get(self.base_url + "/api/v1/browser/active",
-                params={"user_id": self.profile_id}, headers={"Authorization": "Bearer " + self.api_key})
+            for attempt in range(3):
+                try:
+                    response = await client.get(self.base_url + "/api/v1/browser/active",
+                        params={"user_id": self.profile_id}, headers={"Authorization": "Bearer " + self.api_key})
+                    break
+                except (httpx.TimeoutException, httpx.ConnectError) as exc:
+                    if attempt == 2:
+                        raise AdsPowerUnavailable(
+                            f"AdsPower Local API временно недоступен ({type(exc).__name__})") from None
+                    await asyncio.sleep(2 * (attempt + 1))
         if response.status_code != 200:
             raise AdsPowerError(f"AdsPower HTTP {response.status_code}: проверьте Local API и ключ")
         payload = response.json()
@@ -129,7 +149,8 @@ class AdsPower:
     @asynccontextmanager
     async def connection(self):
         try:
-            async with websockets.connect(await self.endpoint(), open_timeout=10, close_timeout=3) as ws:
+            async with websockets.connect(await self.endpoint(), open_timeout=10, close_timeout=3,
+                                          proxy=None) as ws:
                 seq = 0
 
                 async def call(method, params=None, session=None):
@@ -286,6 +307,12 @@ class AdsPower:
         if (not all(n.is_finite() for n in (quantity, before, target))
                 or quantity <= 0 or before < 0 or before + quantity != target):
             raise AdsPowerError("Некорректный план пополнения; запрос не отправлен")
+        if 'target_total' in plan:
+            frozen = Decimal(plan['before_frozen'])
+            total = Decimal(plan['target_total'])
+            if (not frozen.is_finite() or frozen < 0 or not total.is_finite()
+                    or before + frozen + quantity != total):
+                raise AdsPowerError("Некорректный общий остаток объявления; запрос не отправлен")
         return await self._ad_quantity(plan['adv_no'], plan)
 
     async def _ad_quantity(self, adv_no: str, plan: dict | None = None) -> dict:
