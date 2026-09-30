@@ -14,6 +14,16 @@ sys.path.insert(0, str(ROOT))
 from adspower import AdsPower  # noqa: E402
 
 
+def api_error(response: httpx.Response, api_key: str) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return f"HTTP {response.status_code}; ответ не является JSON"
+    code = payload.get("code")
+    message = str(payload.get("msg") or "").replace(api_key, "[скрыто]")[:300]
+    return f"HTTP {response.status_code}; код {code}; {message}".rstrip("; ")
+
+
 async def main() -> None:
     load_dotenv(ROOT / ".env")
     browser = AdsPower.from_env()
@@ -31,10 +41,11 @@ async def main() -> None:
                 await asyncio.sleep(5)
                 continue
             if response.status_code != 200:
-                raise RuntimeError(f"AdsPower Local API: HTTP {response.status_code}")
+                raise RuntimeError("AdsPower Local API: " + api_error(response, browser.api_key))
             payload = response.json()
             if payload.get("code") != 0:
-                raise RuntimeError("AdsPower отклонил проверку профиля; проверьте API-ключ и ID")
+                raise RuntimeError("AdsPower отклонил проверку профиля: "
+                                   + api_error(response, browser.api_key))
             if payload.get("data", {}).get("status") == "Active":
                 # The trading code also requires a local CDP endpoint.
                 await browser.endpoint()
@@ -44,7 +55,8 @@ async def main() -> None:
                 response = await client.get(browser.base_url + "/api/v1/browser/start",
                     params={"user_id": browser.profile_id}, headers=headers)
                 if response.status_code != 200 or response.json().get("code") != 0:
-                    raise RuntimeError("AdsPower не открыл профиль П1; проверьте его в Local API")
+                    raise RuntimeError("AdsPower не открыл профиль П1: "
+                                       + api_error(response, browser.api_key))
                 started = True
             await asyncio.sleep(5)
     raise RuntimeError("AdsPower не подтвердил запуск профиля П1 за 120 секунд")
