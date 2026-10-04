@@ -14,7 +14,7 @@ import signal
 from config import PROJECT_DIR, Settings, select_p2_profile, p2_nickname
 from cycle import OperatorStopped, Paused, auto_plan, run_command, steps_for_spec
 from journal import Journal, process_lock
-from notifier import TelegramNotifier
+from notifier import TelegramNotifier, TelegramRequestError
 from sheets import GoogleSheets, Reporter
 
 KRASNOYARSK = timezone(timedelta(hours=7))
@@ -971,6 +971,7 @@ class TelegramControl:
         try:
             while not self.shutdown_event.is_set():
                 try:
+                    operation = 'profile check'
                     now = asyncio.get_running_loop().time()
                     if (browser_guard and browser_guard.api_key and browser_guard.profile_id
                             and now >= profile_check_at):
@@ -1003,13 +1004,17 @@ class TelegramControl:
                                                  'Проверь Local API; бот не закрыл другие профили.')
                             profile_check_failed = True
                     if not self.running:
+                        operation = 'notification delivery'
                         await reporter.flush()
+                    operation = 'getUpdates'
                     updates = await self.telegram.request('getUpdates', {'offset': self.offset, 'timeout': 20,
                         'allowed_updates': ['message', 'callback_query']}, timeout=30)
                     for update in updates:
+                        operation = 'update handling'
                         await self.handle(update)
                 except (RuntimeError, ValueError, TypeError, KeyError) as exc:
-                    self.logger.warning('Telegram control request failed (%s)', type(exc).__name__)
+                    detail = str(exc) if isinstance(exc, TelegramRequestError) else type(exc).__name__
+                    self.logger.warning('Telegram control %s failed: %s', operation, detail)
                     await asyncio.sleep(5)
         finally:
             self.stop_event.set()

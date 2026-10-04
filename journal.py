@@ -66,6 +66,8 @@ class Journal:
                 amount TEXT NOT NULL, fiat TEXT NOT NULL, quantity TEXT NOT NULL,
                 message TEXT NOT NULL, telegram_sent INTEGER NOT NULL DEFAULT 0
             );
+            CREATE INDEX IF NOT EXISTS idx_events_cycle_step_status
+                ON events(cycle_id, step, status, id);
             CREATE TABLE IF NOT EXISTS sales (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id TEXT UNIQUE NOT NULL,
                 amount TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0

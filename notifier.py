@@ -2,6 +2,10 @@ import logging
 import httpx
 
 
+class TelegramRequestError(RuntimeError):
+    """A Telegram API failure with no token, URL or message content."""
+
+
 class TelegramNotifier:
     def __init__(self, bot_token: str | None, chat_id: str | None):
         self.bot_token = bot_token
@@ -20,10 +24,21 @@ class TelegramNotifier:
                 response.raise_for_status()
                 body = response.json()
                 if body.get("ok") is not True:
-                    raise ValueError("Telegram rejected request")
+                    code = body.get("error_code")
+                    detail = f"HTTP {code}" if type(code) is int else "rejected response"
+                    if code == 409 and method == "getUpdates":
+                        detail += " (another getUpdates poller may be running)"
+                    raise TelegramRequestError(f"Telegram {method}: {detail}")
                 return body.get("result")
+        except TelegramRequestError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            detail = ("HTTP 409 (another getUpdates poller may be running)"
+                      if status == 409 and method == "getUpdates" else f"HTTP {status}")
+            raise TelegramRequestError(f"Telegram {method}: {detail}") from None
         except Exception as exc:
-            raise RuntimeError(f"Telegram {method}: {type(exc).__name__}") from None
+            raise TelegramRequestError(f"Telegram {method}: {type(exc).__name__}") from None
 
     async def send(self, text: str, *, reply_markup: dict | None = None) -> bool:
         if not self.enabled:
@@ -42,6 +57,6 @@ class TelegramNotifier:
             await self.request("sendMessage", payload)
             return True
         except Exception as exc:
-            # HTTP exception strings contain the bot token in the URL.
-            self.logger.warning("Telegram notification failed (%s)", type(exc).__name__)
+            detail = str(exc) if isinstance(exc, TelegramRequestError) else type(exc).__name__
+            self.logger.warning("Telegram notification failed: %s", detail)
             return False

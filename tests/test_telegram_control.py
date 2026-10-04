@@ -742,3 +742,17 @@ class TelegramTransportTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError) as caught:
                 await bot.request('getUpdates', {})
         self.assertNotIn('SENSITIVE_TEST_TOKEN', str(caught.exception))
+
+    async def test_telegram_failure_identifies_operation_without_exposing_token(self):
+        bot = TelegramNotifier('SENSITIVE_TEST_TOKEN', '123')
+        request = httpx.Request('POST', 'https://api.telegram.org/botSENSITIVE_TEST_TOKEN/getUpdates')
+        response = httpx.Response(409, request=request,
+                                  json={'ok': False, 'error_code': 409,
+                                        'description': 'SENSITIVE_TEST_TOKEN'})
+        with patch('notifier.httpx.AsyncClient') as factory:
+            factory.return_value.__aenter__.return_value.post = AsyncMock(return_value=response)
+            with self.assertRaises(RuntimeError) as caught:
+                await bot.request('getUpdates', {})
+        self.assertIn('getUpdates: HTTP 409', str(caught.exception))
+        self.assertIn('another getUpdates poller', str(caught.exception))
+        self.assertNotIn('SENSITIVE_TEST_TOKEN', str(caught.exception))
