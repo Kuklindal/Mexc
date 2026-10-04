@@ -23,6 +23,11 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--mode", choices=["api", "manual"], help="api (по умолчанию) — подтверждения в консоли; manual — действия кнопками на сайте")
     cycle.add_argument("--resume", metavar="ID", help="Продолжить сохранённый цикл")
     cycle.add_argument("--p2-profile", metavar="NAME", help="Профиль П2 из .env; при --resume берётся сохранённый")
+    cycle.add_argument("--p1-profile", metavar="NAME", help="Профиль П1: p1 или настроенный профиль П2")
+    cycle.add_argument("--reverse-maker", choices=["p1", "p2"],
+                       help="Владелец объявления обратной продажи USDT; для новых режимов — p2")
+    cycle.add_argument('--scheduler-mode', choices=['volume', 'unique', 'cash_volume', 'eflp_volume', 'eflp_unique'],
+                        help='Внутренняя привязка к сохранённому режиму Telegram')
     control = cycle.add_mutually_exclusive_group()
     control.add_argument("--auto", action="store_true", help="Автоматический режим без подтверждений в консоли")
     control.add_argument("--interactive", action="store_true", help="Продолжить с ручными подтверждениями, включая разбор ошибки авторежима")
@@ -39,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     control_bot.add_argument("--p2-profile", metavar="NAME", help="Профиль П2 для новых запусков; иначе из .env")
     browser_check = sub.add_parser("adspower-check", help="Проверить профиль П1 и кнопку ордера без нажатия")
     browser_check.add_argument("order_no")
+    sub.add_parser("adspower-open", help="Открыть профиль П1 AdsPower и вкладку MEXC без действий по ордеру")
 
     transfer = sub.add_parser("wallet-transfer", help="Перевести USDT между фиатным и спотовым счетами одного аккаунта")
     transfer.add_argument("--account", required=True, choices=["p1", "p2"])
@@ -116,6 +122,11 @@ async def async_main() -> int:
         state = await AdsPower.from_env().inspect(args.order_no)
         print("AdsPower: нужный ордер найден; " + ("кнопка доступна." if state == "ready" else "проверка уже пройдена."))
         print("Никаких кнопок не нажато.")
+        return 0
+    if args.command == "adspower-open":
+        from deploy.open_adspower_mexc import main as open_mexc
+
+        await open_mexc()
         return 0
     if args.command in {"cycle", "cycle-status", "cycle-reset", "sync-journal"}:
         from cycle import run_command

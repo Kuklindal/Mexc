@@ -16,6 +16,7 @@ from config import Settings
 from cycle import CycleRunner, OperatorStopped, Paused, fingerprint
 from mexc_client import MexcP2PClient
 from rollover import save_state
+from trade_profiles import profile_prefix
 
 NETWORK_NAMES = {'PLASMA': 'PLASMA', 'BEP20': 'BSC'}
 NETWORK_ALIASES = {'PLASMA': {'PLASMA'},
@@ -98,6 +99,7 @@ class ReturnFunds:
         self.journal, self.state, self.stop = journal, state, stop_event
         self.p1, self.p2, self.browser = p1, p2, browser
         self.pending = state['pending_return']
+        self.p1_prefix = profile_prefix(self.pending.get('p1_profile', 'p1'))
         self.timeout = int(os.getenv('ROLLOVER_CONFIRM_TIMEOUT_SECONDS', '1800'))
         if not 10 <= self.timeout <= 86400:
             raise ValueError('ROLLOVER_CONFIRM_TIMEOUT_SECONDS должен быть от 10 до 86400')
@@ -119,7 +121,7 @@ class ReturnFunds:
             raise Paused('Нулевой объём купленных USDT')
         candidates = []
         for label in configured_networks():
-            pinned = os.getenv(f'MEXC_P1_DEPOSIT_ADDRESS_{label}', '').strip()
+            pinned = os.getenv(f'{self.p1_prefix}_DEPOSIT_ADDRESS_{label}', '').strip()
             if not pinned:
                 continue
             name = NETWORK_NAMES[label]
@@ -131,7 +133,7 @@ class ReturnFunds:
                     or not source.get('contract') or source.get('contract') != target.get('contract')):
                 continue
             destination_info = await destination(self.p1, name, pinned)
-            if os.getenv(f'MEXC_P1_DEPOSIT_MEMO_{label}', '').strip() != destination_info['memo']:
+            if os.getenv(f'{self.p1_prefix}_DEPOSIT_MEMO_{label}', '').strip() != destination_info['memo']:
                 raise Paused(f'Memo депозита П1 для {label} не совпадает с настройкой')
             fee = amount(source.get('withdrawFee'))
             try:
@@ -145,8 +147,9 @@ class ReturnFunds:
                 continue
             candidates.append((label, name, source, destination_info, fee, withdrawal))
         if not candidates:
-            raise Paused('Нет доступной сети с указанным адресом П1. Заполните MEXC_P1_DEPOSIT_ADDRESS_PLASMA '
-                         'или MEXC_P1_DEPOSIT_ADDRESS_BEP20 и проверьте сеть на MEXC')
+            raise Paused(f'Нет доступной сети с указанным адресом П1. Заполните '
+                         f'{self.p1_prefix}_DEPOSIT_ADDRESS_PLASMA или '
+                         f'{self.p1_prefix}_DEPOSIT_ADDRESS_BEP20 и проверьте сеть на MEXC')
         label, name, source, destination_info, fee, withdrawal = random.choice(candidates)
         self.save('planned', quantity=text(quantity), fee=text(fee), withdraw_amount=text(withdrawal),
                   network=name, network_label=label, address=destination_info['address'], memo=destination_info['memo'],
@@ -192,8 +195,8 @@ class ReturnFunds:
             current = await network(self.p2, p['network'])
             address = await destination(self.p1, p['network'], p['address'])
             label = p.get('network_label', p['network'])
-            if (os.getenv(f'MEXC_P1_DEPOSIT_ADDRESS_{label}', '').strip() != p['address']
-                    or os.getenv(f'MEXC_P1_DEPOSIT_MEMO_{label}', '').strip() != p['memo']):
+            if (os.getenv(f'{self.p1_prefix}_DEPOSIT_ADDRESS_{label}', '').strip() != p['address']
+                    or os.getenv(f'{self.p1_prefix}_DEPOSIT_MEMO_{label}', '').strip() != p['memo']):
                 raise Paused('Адрес или memo П1 в .env изменились после выбора сети; вывод остановлен')
             if (current.get('withdrawEnable') is not True or current.get('contract') != p['contract']
                     or amount(current.get('withdrawFee')) != amount(p['fee'])
@@ -302,13 +305,20 @@ class ReturnFunds:
 async def finish_return(journal, state, stop_event):
     from adspower import AdsPower
     pending = state['pending_return']
-    p1_settings, p2_settings = Settings.from_env('p1'), Settings.from_env('p2', p2_profile=pending['profile'])
+    p1_key = pending.get('p1_profile', 'p1')
+    p1_settings = (Settings.from_env('p1') if p1_key == 'p1'
+                   else Settings.from_env('p2', p2_profile=p1_key))
+    p2_settings = Settings.from_env('p2', p2_profile=pending['profile'])
     p1 = MexcP2PClient(p1_settings.api_key, p1_settings.secret_key, p1_settings.base_url,
                        p1_settings.recv_window, proxy_url=p1_settings.proxy_url)
     p2 = MexcP2PClient(p2_settings.api_key, p2_settings.secret_key, p2_settings.base_url,
                        p2_settings.recv_window, proxy_url=p2_settings.proxy_url)
     try:
-        await ReturnFunds(journal, state, stop_event, p1, p2, AdsPower.from_env()).run()
+        browser = (AdsPower.from_env() if p1_key == 'p1' else
+                   AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
+                            os.getenv('ADSPOWER_API_KEY', ''),
+                            os.getenv(f'{profile_prefix(p1_key)}_ADSPOWER_PROFILE_ID', '')))
+        await ReturnFunds(journal, state, stop_event, p1, p2, browser).run()
     finally:
         await p1.close()
         await p2.close()

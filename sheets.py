@@ -18,6 +18,8 @@ from config import p2_nickname
 
 HEADER = ["Сумма продажи (USDT)", "Дата (Красноярск)", "Время (UTC+7)", "Профиль П2"]
 WEEKLY_MARKER = "Недельная сводка MEXC"
+EFLP_MARKER = "Eflp: аккаунт П1"
+EFLP_META_HEADER = ["П1 для сводки Eflp", "Режим", "MEMBER_ID П2"]
 MOSCOW = timezone(timedelta(hours=3))
 
 
@@ -91,6 +93,33 @@ def sale_values(sale: dict) -> list:
 
 def sale_profile(sale: dict) -> str:
     return p2_nickname(sale.get("p2_profile") or "default", sale.get("p2_nickname"))
+
+
+def sale_p1_name(sale: dict) -> str:
+    profile = sale.get('p1_profile') or 'p1'
+    saved = (sale.get('p1_nickname') or '').strip()
+    if saved:
+        return saved
+    if profile == 'p1':
+        return os.getenv('MEXC_P1_NICKNAME', '').strip() or 'p1'
+    return p2_nickname(profile)
+
+
+def eflp_meta_values(sale: dict) -> list[str]:
+    return [sale_p1_name(sale), sale.get('scheduler_mode') or '',
+            sale.get('p2_member_id') or '']
+
+
+def eflp_formulas(sales: list[dict], row_count: int) -> list[list[str]]:
+    accounts = sorted({sale_p1_name(sale) for sale in sales
+                       if sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}})
+    rows = [['', '', ''] for _ in range(max(2, row_count, len(accounts) + 1))]
+    rows[0] = [EFLP_MARKER, 'Объём USDT', 'Уникальных П2']
+    for row_number, name in enumerate(accounts, 2):
+        rows[row_number - 1] = [name,
+            f'=SUMIFS($A$2:$A;$Q$2:$Q;N{row_number};$R$2:$R;"eflp*";$E$2:$E;">="&$E$1;$E$2:$E;"<"&($E$1+7))',
+            f'=COUNTUNIQUEIFS($S$2:$S;$Q$2:$Q;N{row_number};$R$2:$R;"eflp*";$E$2:$E;">="&$E$1;$E$2:$E;"<"&($E$1+7);$S$2:$S;"<>")']
+    return rows
 
 
 def sheet_number(value) -> Decimal:
@@ -238,6 +267,24 @@ class GoogleSheets:
             raise GoogleSheetsError("Столбец E занят; служебные даты не перезаписали чужие данные")
         selected, choices = week_choices(sales, existing[0][1] if existing and len(existing[0]) > 1 else None)
         rows = weekly_formulas(sales, selected, len(existing))
+        eflp_existing = (await self.request('GET', 'N:P')).get('values', [])
+        if any(any(cell != '' for cell in row) for row in eflp_existing) and (
+                not eflp_existing[0] or eflp_existing[0][0] != EFLP_MARKER):
+            raise GoogleSheetsError('Столбцы N:P заняты; сводка Eflp не перезаписала чужие данные')
+        eflp_rows = eflp_formulas(sales, len(eflp_existing))
+        by_row = {int(sale['id']): sale for sale in sales}
+        metadata = [EFLP_META_HEADER] + [
+            eflp_meta_values(by_row[row]) if row in by_row else []
+            for row in range(1, max(by_row, default=0) + 1)]
+        existing_meta = (await self.request('GET', 'Q:S')).get('values', [])
+        if existing_meta and existing_meta[0] != EFLP_META_HEADER:
+            raise GoogleSheetsError('Столбцы Q:S заняты; данные Eflp не перезаписаны')
+        for index, row in enumerate(existing_meta[1:], 1):
+            if row and (index >= len(metadata) or (row + [''] * (3 - len(row))) != metadata[index]):
+                raise GoogleSheetsError('Служебные строки Eflp расходятся с журналом; запись остановлена')
+        if len(existing_meta) < len(metadata):
+            first = max(1, len(existing_meta))
+            await self.request('PUT', f'Q{first}:S{len(metadata)}', metadata[first - 1:])
         sheet_id = await self.get_sheet_id()
 
         def cell(value):
@@ -252,8 +299,12 @@ class GoogleSheets:
                                       {"values": [cell('=ARRAYFORMULA(IF(B2:B="";"";IFERROR(DATEVALUE(B2:B)+TIMEVALUE(C2:C)-4/24;"")))')]}
                                       ], "fields": "userEnteredValue"}},
             {"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
-                                        "endRowIndex": len(rows), "startColumnIndex": 5, "endColumnIndex": 10},
+                                         "endRowIndex": len(rows), "startColumnIndex": 5, "endColumnIndex": 10},
                              "rows": [{"values": [cell(value) for value in row]} for row in rows],
+                             "fields": "userEnteredValue"}},
+            {"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
+                                         "endRowIndex": len(eflp_rows), "startColumnIndex": 13, "endColumnIndex": 16},
+                             "rows": [{"values": [cell(value) for value in row]} for row in eflp_rows],
                              "fields": "userEnteredValue"}},
             {"setDataValidation": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
                                              "endRowIndex": 1, "startColumnIndex": 6, "endColumnIndex": 7},
@@ -263,6 +314,10 @@ class GoogleSheets:
                                             "inputMessage": "Выберите неделю: четверг 18:50 МСК"}}},
             {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS",
                                                      "startIndex": 4, "endIndex": 5},
+                                           "properties": {"hiddenByUser": True},
+                                           "fields": "hiddenByUser"}},
+            {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                                                     "startIndex": 13, "endIndex": 16},
                                            "properties": {"hiddenByUser": True},
                                            "fields": "hiddenByUser"}},
         ]
@@ -280,7 +335,7 @@ class Reporter:
         self.sheet_error_reported = False
 
     def telegram_text(self, event: dict) -> str:
-        if event['step'] == 'rollover_switch_notice':
+        if event['step'] in {'rollover_switch_notice', 'ad_rejection_alert', 'eflp_profile_done'}:
             return event['message']
         cid = event["cycle_id"]
         cycle = self.journal.cycle(cid)
@@ -317,7 +372,8 @@ class Reporter:
                     self.sheet_error_reported = True
         if self.telegram.enabled:
             for event in self.journal.pending("telegram"):
-                important = event["status"] in {"error", "paused"} or event['step'] == 'rollover_switch_notice'
+                important = (event["status"] in {"error", "paused"}
+                              or event['step'] in {'rollover_switch_notice', 'ad_rejection_alert', 'eflp_profile_done'})
                 if not important:
                     # Suppress old queued progress messages too; retain the full local history.
                     self.journal.delivered("telegram", event["id"])

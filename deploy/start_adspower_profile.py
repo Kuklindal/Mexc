@@ -49,11 +49,15 @@ async def main() -> None:
             if payload.get("data", {}).get("status") == "Active":
                 # The trading code also requires a local CDP endpoint.
                 await browser.endpoint()
+                closed = await browser.close_other_local_profiles()
+                if closed:
+                    print(f"AdsPower: закрыто лишних профилей: {closed}", flush=True)
                 print("AdsPower: профиль П1 активен", flush=True)
                 return
             if not started:
+                # The headless Local API does not make browser profiles headless.
                 response = await client.get(browser.base_url + "/api/v1/browser/start",
-                    params={"user_id": browser.profile_id}, headers=headers)
+                    params={"user_id": browser.profile_id, "headless": 1}, headers=headers)
                 if response.status_code != 200 or response.json().get("code") != 0:
                     raise RuntimeError("AdsPower не открыл профиль П1: "
                                        + api_error(response, browser.api_key))

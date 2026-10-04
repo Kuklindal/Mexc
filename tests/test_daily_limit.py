@@ -12,12 +12,12 @@ class DailyLimitTests(unittest.IsolatedAsyncioTestCase):
     tearDown = fixtures.AutoTests.tearDown
     runner = fixtures.AutoTests.runner
 
-    def reject(self, runner, *, reverse=True, http_status=200):
+    def reject(self, runner, *, reverse=True, http_status=200, code=60085):
         original = runner.clients['p2'].create_order
 
         async def create(**params):
             if ('tradable_quantity' in params) == reverse:
-                raise MexcAPIError('Daily limit', code=60085, http_status=http_status)
+                raise MexcAPIError('Order rejected', code=code, http_status=http_status)
             return await original(**params)
 
         runner.clients['p2'].create_order = AsyncMock(side_effect=create)
@@ -59,6 +59,44 @@ class DailyLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create.await_count, 1)
         self.assertEqual(self.exchange.orders, {})
         self.assertEqual(self.journal.sales(), [])
+
+    async def test_ad_rejection_before_purchase_creates_no_order(self):
+        runner = self.runner()
+        create = self.reject(runner, reverse=False, http_status=400, code=85010)
+        with patch('cycle.asyncio.sleep', new=AsyncMock()), self.assertRaisesRegex(Paused, '85010'):
+            await runner.run(self.cycle_id)
+        self.assertEqual(self.journal.step(self.cycle_id, 'forward_create')['result']['rejected_code'], 85010)
+        with self.assertRaisesRegex(Paused, '85010'):
+            await runner.run(self.cycle_id)
+        self.assertEqual(create.await_count, 1)
+        self.assertEqual(self.exchange.orders, {})
+
+    async def test_ad_rejection_after_purchase_preserves_usdt_for_return(self):
+        runner = self.runner()
+        create = self.reject(runner, code=85010)
+        with patch('cycle.asyncio.sleep', new=AsyncMock()), self.assertRaisesRegex(Paused, '85010'):
+            await runner.run(self.cycle_id)
+        self.assertEqual(self.journal.step(self.cycle_id, 'forward_complete')['status'], 'done')
+        self.assertEqual(self.journal.step(self.cycle_id, 'reverse_create')['result']['rejected_code'], 85010)
+        self.assertEqual(create.await_count, 2)
+        self.assertEqual(self.exchange.orders['ORDER-1']['state'], 'DONE')
+
+    async def test_legacy_forward_ad_rejection_is_recovered_without_order_retry(self):
+        runner = self.runner()
+        create = self.reject(runner, reverse=False, code=85010)
+        with patch('cycle.asyncio.sleep', new=AsyncMock()), self.assertRaises(Paused):
+            await runner.run(self.cycle_id)
+        self.journal.transition(self.cycle_id, 'forward_create', 'p2', 'unknown', 'Legacy uncertain result')
+        original_time = '2026-10-01T00:37:05+00:00'
+        with patch('journal.now', return_value=original_time):
+            self.journal.transition(self.cycle_id, 'forward_create', 'p2', 'error',
+                'POST /api/v3/fiat/merchant/order/deal: MEXC error: {"code":85010}')
+        with self.assertRaisesRegex(Paused, '85010'):
+            await runner.run(self.cycle_id)
+        self.assertEqual(create.await_count, 1)
+        self.assertEqual(self.journal.step(self.cycle_id, 'forward_create')['result']['rejected_code'], 85010)
+        self.assertEqual(self.journal.create_rejection_details(self.cycle_id, 'forward_create'),
+                         (85010, original_time))
 
     async def test_server_error_is_not_treated_as_definite_rejection(self):
         runner = self.runner()

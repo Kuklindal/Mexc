@@ -6,9 +6,11 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from cycle import OperatorStopped, Paused
+from config import p2_nickname
 from adspower import AdsPowerUnavailable
 from mexc_client import MexcAPIError, MexcReadUnavailable
-from rollover import (amount_from_ad, begin, cooldown_after_limit, eligible,
+from rollover import (amount_from_ad, begin, cooldown_after_ad_rejection,
+                      cooldown_after_limit, eligible,
                       enqueue_switch_notice, finish_limited_cycle, load_state, next_wait, run, save_state)
 from telegram_control import TelegramControl
 from sheets import Reporter
@@ -42,6 +44,154 @@ class RolloverTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(limit['third_trade'])
         self.assertEqual(datetime.fromisoformat(limit['until']), base + timedelta(hours=26))
         self.assertFalse(limit['manual_block'])
+
+    async def test_ad_rejection_uses_24_hours_from_rejection(self):
+        moment = datetime(2026, 10, 1, 1, tzinfo=timezone.utc)
+        timer = cooldown_after_ad_rejection(moment)
+        self.assertEqual(datetime.fromisoformat(timer['until']), moment + timedelta(days=1))
+        self.assertEqual(timer['reason'], '85010')
+        self.assertFalse(timer['manual_block'])
+        state = {'profiles': ['default'], 'mode': 'single', 'selected': 'default',
+                 'cursor': 0, 'cooldowns': {'default': timer}}
+        self.assertIsNone(eligible(state, moment + timedelta(hours=23)))
+        self.assertEqual(eligible(state, moment + timedelta(days=1)), 'default')
+
+    async def test_ad_rejection_streak_survives_new_series(self):
+        self.journal.abandon(self.cycle_id)
+        with patch.dict(os.environ, {'ROLLOVER_PROFILES': 'default'}):
+            state = begin(self.journal, 'single', selected='default')
+            state['ad_rejection_streaks']['default'] = 2
+            state['ad_rejection_last_cycles']['default'] = 'previous-cycle'
+            state['status'] = 'stopped'
+            save_state(self.journal, state)
+            restarted = begin(self.journal, 'single', selected='default')
+        self.assertEqual(restarted['ad_rejection_streaks']['default'], 2)
+        self.assertEqual(restarted['ad_rejection_last_cycles']['default'], 'previous-cycle')
+
+    async def test_forward_ad_rejection_switches_profile_without_return(self):
+        self.journal.abandon(self.cycle_id)
+        with patch.dict(os.environ, {'ROLLOVER_PROFILES': 'default,2'}):
+            state = begin(self.journal, 'all')
+        stop = asyncio.Event()
+        profiles = []
+
+        async def trade(args, **_):
+            profiles.append(args.p2_profile)
+            cid = self.journal.create(dict(self.spec, automatic=True, p2_profile=args.p2_profile,
+                                           series={'count': 1}))
+            if args.p2_profile == 'default':
+                self.journal.transition(cid, 'forward_create', 'p2', 'rejected', 'MEXC 85010',
+                                        result={'rejected_code': 85010}, cycle_status='paused')
+            else:
+                self.journal.transition(cid, 'cycle', 'both', 'completed', 'done', cycle_status='completed')
+                stop.set()
+
+        with patch('rollover.choose_amount', new=AsyncMock(return_value='9000 RUB')), \
+                patch('rollover.run_command', side_effect=trade), \
+                patch('return_funds.finish_return', new_callable=AsyncMock) as transfer:
+            with self.assertRaises(OperatorStopped):
+                await run(self.journal, state, stop, None)
+        self.assertEqual(profiles, ['default', '2'])
+        transfer.assert_not_awaited()
+        self.assertEqual(state['ad_rejection_streaks']['default'], 1)
+        self.assertEqual(state['cooldowns']['default']['reason'], '85010')
+
+    async def test_success_resets_ad_rejection_streak(self):
+        self.journal.abandon(self.cycle_id)
+        with patch.dict(os.environ, {'ROLLOVER_PROFILES': 'default'}):
+            state = begin(self.journal, 'single', selected='default')
+        state['ad_rejection_streaks']['default'] = 2
+        stop = asyncio.Event()
+
+        async def complete(args, **_):
+            cid = self.journal.create(dict(self.spec, automatic=True, p2_profile='default',
+                                           series={'count': 1}))
+            self.journal.transition(cid, 'cycle', 'both', 'completed', 'done', cycle_status='completed')
+            stop.set()
+
+        with patch('rollover.choose_amount', new=AsyncMock(return_value='9000 RUB')), \
+                patch('rollover.run_command', side_effect=complete):
+            with self.assertRaises(OperatorStopped):
+                await run(self.journal, state, stop, None)
+        self.assertEqual(state['ad_rejection_streaks']['default'], 0)
+
+    async def test_three_consecutive_ad_rejections_alert_once_and_set_timer(self):
+        self.journal.abandon(self.cycle_id)
+        with patch.dict(os.environ, {'ROLLOVER_PROFILES': 'default'}):
+            state = begin(self.journal, 'single', selected='default')
+        stop = asyncio.Event()
+        ids = []
+
+        async def reject(args, **_):
+            cid = self.journal.create(dict(self.spec, automatic=True, p2_profile='default',
+                                           series={'count': 1}))
+            ids.append(cid)
+            self.journal.transition(cid, 'forward_create', 'p2', 'rejected', 'MEXC 85010',
+                                    result={'rejected_code': 85010}, cycle_status='paused')
+            if len(ids) == 3:
+                stop.set()
+
+        bot = type('Bot', (), {'enabled': True})()
+        bot.send = AsyncMock(return_value=True)
+        with patch('rollover.choose_amount', new=AsyncMock(return_value='9000 RUB')), \
+                patch('rollover.eligible', return_value='default'), \
+                patch('rollover.run_command', side_effect=reject):
+            with self.assertRaises(OperatorStopped):
+                await run(self.journal, state, stop, bot)
+
+        self.assertEqual(state['ad_rejection_streaks']['default'], 3)
+        self.assertEqual(state['ad_rejection_last_cycles']['default'], ids[-1])
+        self.assertTrue(all(self.journal.cycle(cid)['status'] == 'abandoned' for cid in ids))
+        self.assertEqual(sum(bool(self.journal.step(cid, 'ad_rejection_alert')) for cid in ids), 1)
+        self.assertEqual(bot.send.await_count, 1)
+        self.assertIn('85010', bot.send.await_args.args[0])
+        self.assertIn(p2_nickname('default'), bot.send.await_args.args[0])
+        until = datetime.fromisoformat(state['cooldowns']['default']['until'])
+        self.assertGreater(until, datetime.now(timezone.utc) + timedelta(hours=23))
+
+    async def test_reverse_ad_rejection_returns_funds_before_switching(self):
+        self.journal.abandon(self.cycle_id)
+        with patch.dict(os.environ, {'ROLLOVER_PROFILES': 'default,2'}):
+            state = begin(self.journal, 'all')
+        stop = asyncio.Event()
+        ids = []
+        profiles = []
+
+        async def trade(args, **_):
+            profiles.append(args.p2_profile)
+            cid = self.journal.create(dict(self.spec, automatic=True, p2_profile=args.p2_profile,
+                                           series={'count': 1}))
+            ids.append(cid)
+            if args.p2_profile == 'default':
+                self.journal.transition(cid, 'forward_create', 'p2', 'done', 'created')
+                self.journal.transition(cid, 'forward_complete', 'both', 'done', 'done',
+                    result={'quantity': '100'}, context={'amount': '9000', 'fiat': 'RUB', 'quantity': '100'})
+                self.journal.transition(cid, 'reverse_create', 'p2', 'rejected', 'MEXC 85010',
+                                        result={'rejected_code': 85010}, cycle_status='paused')
+            else:
+                self.journal.transition(cid, 'cycle', 'both', 'completed', 'done', cycle_status='completed')
+                stop.set()
+
+        async def returned(_, scheduler, __):
+            self.assertEqual(profiles, ['default'])
+            self.assertEqual(scheduler['pending_return']['profile'], 'default')
+            scheduler['pending_return']['stage'] = 'done'
+            scheduler['pending_return']['credited'] = '99.99'
+            save_state(self.journal, scheduler)
+
+        with patch('rollover.choose_amount', new=AsyncMock(return_value='9000 RUB')), \
+                patch('rollover.run_command', side_effect=trade), \
+                patch('return_funds.finish_return', side_effect=returned) as transfer:
+            with self.assertRaises(OperatorStopped):
+                await run(self.journal, state, stop, None)
+        transfer.assert_awaited_once()
+        self.assertEqual(profiles, ['default', '2'])
+        self.assertEqual(self.journal.cycle(ids[0])['status'], 'abandoned')
+        self.assertEqual(state['ad_rejection_streaks']['default'], 1)
+        notice = self.journal.db.execute(
+            "SELECT message FROM events WHERE cycle_id=? AND step='rollover_switch_notice'",
+            (ids[0],)).fetchone()[0]
+        self.assertIn('85010', notice)
 
     async def test_yesterday_third_trade_is_used_when_today_has_one(self):
         self.journal.abandon(self.cycle_id)

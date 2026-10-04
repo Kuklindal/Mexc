@@ -4,7 +4,8 @@ import httpx
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
-from adspower import AdsPower, AdsPowerError, AdsPowerTimeout, AdsPowerUnavailable, local_url
+from adspower import (AdsPower, AdsPowerClickUnknown, AdsPowerError, AdsPowerTimeout,
+                      AdsPowerUnavailable, local_url)
 
 
 ORDER = "d1823100470541552640"
@@ -19,6 +20,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             yield self.call
         self.browser.connection = connection
         self.browser.verification_state = AsyncMock(return_value="passed")
+        self.browser.server_verification_state = AsyncMock(return_value="ready")
 
     async def test_local_api_read_timeout_retries_without_browser_command(self):
         response = httpx.Response(200, json={'code': 0, 'data': {'status': 'Active',
@@ -40,6 +42,103 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(AdsPowerUnavailable):
                 await self.browser.endpoint()
         self.assertEqual(client.get.await_count, 3)
+
+    async def test_only_non_p1_local_profiles_are_closed(self):
+        stopped = []
+
+        async def handler(request):
+            self.assertEqual(request.headers['Authorization'], 'Bearer secret-test-key')
+            if request.url.path.endswith('/local-active'):
+                return httpx.Response(200, json={'code': 0, 'data': {'list': [
+                    {'user_id': 'P2'}, {'user_id': 'P1'}, {'user_id': 'P3'}]}})
+            self.assertTrue(request.url.path.endswith('/stop'))
+            stopped.append(request.url.params['user_id'])
+            return httpx.Response(200, json={'code': 0, 'data': {}})
+
+        original_client = httpx.AsyncClient
+        with patch('adspower.httpx.AsyncClient',
+                   side_effect=lambda **_: original_client(transport=httpx.MockTransport(handler))):
+            self.assertEqual(await self.browser.close_other_local_profiles(), 2)
+        self.assertEqual(stopped, ['P2', 'P3'])
+
+    async def test_active_maker_profile_is_not_closed(self):
+        stopped = []
+        async def handler(request):
+            if request.url.path.endswith('/local-active'):
+                return httpx.Response(200, json={'code': 0, 'data': {'list': [
+                    {'user_id': 'P1'}, {'user_id': 'P2'}, {'user_id': 'P3'}]}})
+            stopped.append(request.url.params['user_id'])
+            return httpx.Response(200, json={'code': 0, 'data': {}})
+        original_client = httpx.AsyncClient
+        with patch('adspower.httpx.AsyncClient',
+                   side_effect=lambda **_: original_client(transport=httpx.MockTransport(handler))):
+            self.assertEqual(await self.browser.close_other_local_profiles({'P2'}), 1)
+        self.assertEqual(stopped, ['P3'])
+
+    async def test_dynamic_p1_is_protected_when_static_p1_is_not_open(self):
+        stopped = []
+        async def handler(request):
+            if request.url.path.endswith('/local-active'):
+                return httpx.Response(200, json={'code': 0, 'data': {'list': [
+                    {'user_id': 'DYNAMIC-P1'}, {'user_id': 'MAKER-P2'}, {'user_id': 'OTHER'}]}})
+            stopped.append(request.url.params['user_id'])
+            return httpx.Response(200, json={'code': 0, 'data': {}})
+        original_client = httpx.AsyncClient
+        with patch('adspower.httpx.AsyncClient',
+                   side_effect=lambda **_: original_client(transport=httpx.MockTransport(handler))):
+            self.assertEqual(await self.browser.close_other_local_profiles(
+                {'DYNAMIC-P1', 'MAKER-P2'}), 1)
+        self.assertEqual(stopped, ['OTHER'])
+
+    async def test_ensure_mexc_page_reuses_existing_tab(self):
+        self.call.side_effect = [
+            {'targetInfos': [{'type': 'page',
+                'url': 'https://www.mexc.com/ru-RU/buy-crypto/', 'targetId': 'mexc'}]},
+            {'sessionId': 'session'},
+            {'result': {'value': {'ready': 'complete', 'bodyChars': 100}}},
+        ]
+        await self.browser.ensure_mexc_page()
+        self.assertEqual([call.args[0] for call in self.call.await_args_list],
+                         ['Target.getTargets', 'Target.attachToTarget', 'Runtime.evaluate'])
+
+    async def test_ensure_mexc_page_creates_one_tab(self):
+        self.call.side_effect = [
+            {'targetInfos': []}, {'targetId': 'new'},
+            {'targetInfos': [{'type': 'page', 'url': 'https://www.mexc.com/ru-RU/buy-crypto/',
+                               'targetId': 'new'}]},
+            {'sessionId': 'session'},
+            {'result': {'value': {'ready': 'interactive', 'bodyChars': 25}}},
+        ]
+        await self.browser.ensure_mexc_page()
+        self.assertEqual(self.call.await_count, 5)
+        self.assertEqual(self.call.call_args_list[1].args[0], 'Target.createTarget')
+
+    async def test_ensure_mexc_page_rejects_http_success_without_rendered_body(self):
+        async def call(method, *args, **kwargs):
+            if method == 'Target.getTargets':
+                return {'targetInfos': [{'type': 'page',
+                    'url': 'https://www.mexc.com/ru-RU/buy-crypto/', 'targetId': 'mexc'}]}
+            if method == 'Target.attachToTarget':
+                return {'sessionId': 'session'}
+            if method == 'Runtime.evaluate':
+                return {'result': {'value': {'ready': 'loading', 'bodyChars': 0}}}
+            self.fail(f'Unexpected browser call: {method}')
+        self.call.side_effect = call
+        with patch('adspower.asyncio.sleep', new=AsyncMock()) as sleep:
+            with self.assertRaisesRegex(AdsPowerUnavailable, 'не загрузила содержимое'):
+                await self.browser.ensure_mexc_page()
+        self.assertEqual(sleep.await_count, 15)
+
+    async def test_other_profiles_stay_open_if_p1_is_missing(self):
+        async def handler(request):
+            self.assertTrue(request.url.path.endswith('/local-active'))
+            return httpx.Response(200, json={'code': 0, 'data': {'list': [{'user_id': 'P2'}]}})
+
+        original_client = httpx.AsyncClient
+        with patch('adspower.httpx.AsyncClient',
+                   side_effect=lambda **_: original_client(transport=httpx.MockTransport(handler))):
+            with self.assertRaisesRegex(AdsPowerError, 'П1 не открыт'):
+                await self.browser.close_other_local_profiles()
 
     async def test_inspect_does_not_click(self):
         self.browser.locate = AsyncMock(return_value=("session", "ready"))
@@ -86,9 +185,49 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.call.side_effect = [{"targetInfos": [{"type": "page", "targetId": "existing",
             "url": "https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=" + ORDER}]}, {"sessionId": "s"}]
         self.browser.view = AsyncMock(return_value="missing")
+        self.browser.verification_state.side_effect = AdsPowerError('Сервер MEXC не подтвердил состояние')
         with patch("adspower.asyncio.sleep", new=AsyncMock()), self.assertRaises(AdsPowerError):
             await self.browser.open_order(ORDER)
         self.assertFalse(any(c.args[0] == "Target.createTarget" for c in self.call.call_args_list))
+
+    async def test_missing_standalone_button_checks_exact_server_order_without_click(self):
+        target = {"type": "page", "targetId": "existing",
+                  "url": "https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=" + ORDER}
+        for server_state in ('passed', 'not_required'):
+            self.call.reset_mock(side_effect=True)
+            self.call.side_effect = [{"targetInfos": [target]}, {"sessionId": "s"}]
+            self.browser.locate = AsyncMock(return_value=None)
+            self.browser.view = AsyncMock(return_value='missing')
+            self.browser.verification_state = AsyncMock(return_value=server_state)
+            with patch('adspower.asyncio.sleep', new=AsyncMock()):
+                self.assertEqual(await self.browser.open_order(ORDER), server_state)
+            self.browser.verification_state.assert_awaited_once_with(self.call, 's', ORDER)
+            self.assertTrue(all(not call.kwargs.get('click') for call in self.browser.view.call_args_list))
+
+    async def test_missing_standalone_button_opens_exact_merchant_order_if_required(self):
+        target = {"type": "page", "targetId": "existing",
+                  "url": "https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=" + ORDER}
+        self.call.side_effect = [{"targetInfos": [target]}, {"sessionId": "s"}]
+        self.browser.locate = AsyncMock(return_value=None)
+        self.browser.view = AsyncMock(return_value='missing')
+        self.browser.verification_state.return_value = 'ready'
+        self.browser.open_merchant_order = AsyncMock(return_value='ready')
+        with patch('adspower.asyncio.sleep', new=AsyncMock()):
+            self.assertEqual(await self.browser.open_order(ORDER), 'ready')
+        self.browser.open_merchant_order.assert_awaited_once_with(self.call, ORDER)
+
+    async def test_merchant_portal_is_opened_only_for_exact_order_row(self):
+        self.call.side_effect = [
+            {'targetInfos': []}, {'targetId': 'control'}, {'sessionId': 's'},
+            {'result': {'value': False}}, {'result': {'value': True}},
+        ]
+        self.browser.read_view = AsyncMock(return_value='ready')
+        with patch('adspower.asyncio.sleep', new=AsyncMock()):
+            self.assertEqual(await self.browser.open_merchant_order(self.call, ORDER), 'ready')
+        self.assertEqual(self.call.call_args_list[1].args[0], 'Target.createTarget')
+        self.assertIn('/buy-crypto/control', self.call.call_args_list[1].args[1]['url'])
+        self.assertEqual(self.call.call_args_list[4].args[2], 's')
+        self.assertIn(ORDER, self.call.call_args_list[4].args[1]['expression'])
 
     async def test_invalid_order_cannot_open_page(self):
         with self.assertRaises(AdsPowerError):
@@ -144,6 +283,45 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         with patch("adspower.asyncio.sleep", new=AsyncMock()):
             await self.browser.approve(ORDER)
         self.assertEqual(sum(c.kwargs.get("click", False) for c in self.browser.view.call_args_list), 1)
+
+    async def test_lost_click_response_is_reconciled_without_second_click(self):
+        self.browser.locate = AsyncMock(return_value=("session", "ready"))
+        self.browser.view = AsyncMock(side_effect=AdsPowerClickUnknown("reply lost"))
+        self.browser.server_verification_state = AsyncMock(return_value="passed")
+        await self.browser.approve(ORDER)
+        self.browser.view.assert_awaited_once()
+        self.browser.server_verification_state.assert_awaited_once_with(ORDER)
+
+    async def test_post_click_read_timeout_is_reconciled_without_second_click(self):
+        self.browser.locate = AsyncMock(return_value=("session", "ready"))
+        self.browser.view = AsyncMock(side_effect=["clicked", AdsPowerTimeout("read timeout")])
+        self.browser.server_verification_state = AsyncMock(return_value="passed")
+        with patch("adspower.asyncio.sleep", new=AsyncMock()):
+            await self.browser.approve(ORDER)
+        self.assertEqual(self.browser.view.await_count, 2)
+        self.assertEqual(sum(c.kwargs.get("click", False) for c in self.browser.view.call_args_list), 1)
+        self.browser.server_verification_state.assert_awaited_once_with(ORDER)
+
+    async def test_server_verification_uses_another_p1_tab_if_one_is_stalled(self):
+        pages = [
+            {'type': 'page', 'targetId': 'one',
+             'url': 'https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=' + ORDER},
+            {'type': 'page', 'targetId': 'two',
+             'url': 'https://www.mexc.com/ru-RU/buy-crypto/control'},
+        ]
+        self.call.side_effect = [{'targetInfos': pages}, {'sessionId': 's1'}, {'sessionId': 's2'}]
+        self.browser.verification_state.side_effect = [AdsPowerTimeout('stalled'), 'passed']
+        self.assertEqual(await AdsPower.server_verification_state(self.browser, ORDER), 'passed')
+        self.assertEqual(self.browser.verification_state.await_count, 2)
+
+    async def test_click_uses_longer_cdp_timeout_than_read(self):
+        self.call.return_value = {"result": {"value": {"state": "clicked"}}}
+        self.assertEqual(await AdsPower.view(self.browser, self.call, "s", ORDER, click=True), "clicked")
+        self.assertEqual(self.call.call_args.kwargs["timeout"], 30)
+        self.call.reset_mock()
+        self.call.return_value = {"result": {"value": {"state": "ready"}}}
+        self.assertEqual(await AdsPower.view(self.browser, self.call, "s", ORDER), "ready")
+        self.assertNotIn("timeout", self.call.call_args.kwargs)
 
     async def test_changed_order_or_button_blocks_click(self):
         self.browser.locate = AsyncMock(return_value=("session", "ready"))
@@ -210,11 +388,40 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         @asynccontextmanager
         async def connection(*args, **kwargs):
             yield ws
-        with patch("adspower.websockets.connect", new=connection):
+        with patch("adspower.websockets.connect", new=connection), \
+                patch("adspower.asyncio.timeout", None, create=True):
             async with browser.connection() as call:
                 with self.assertRaises(AdsPowerTimeout):
                     await call("Runtime.evaluate", session="s")
                 self.assertEqual(await call("Target.activateTarget", {"targetId": "tab"}), {"activated": True})
+
+    async def test_malformed_cdp_result_reports_command_instead_of_attribute_error(self):
+        browser = AdsPower("http://127.0.0.1:53152", "test-key", "P1")
+        browser.endpoint = AsyncMock(return_value="ws://127.0.0.1:1234/debug")
+        ws = AsyncMock()
+        ws.recv.return_value = json.dumps({"id": 1, "result": None})
+        @asynccontextmanager
+        async def connection(*args, **kwargs):
+            yield ws
+        with patch("adspower.websockets.connect", new=connection):
+            with self.assertRaisesRegex(AdsPowerError, "некорректный результат CDP для Target.getTargets"):
+                async with browser.connection() as call:
+                    await call("Target.getTargets")
+
+    async def test_unexpected_error_reports_safe_code_location(self):
+        browser = AdsPower("http://127.0.0.1:53152", "test-key", "P1")
+        browser.endpoint = AsyncMock(return_value="ws://127.0.0.1:1234/debug")
+        ws = AsyncMock()
+        ws.recv.return_value = json.dumps({"id": 1, "result": {}})
+        @asynccontextmanager
+        async def connection(*args, **kwargs):
+            yield ws
+        with patch("adspower.websockets.connect", new=connection):
+            with self.assertRaisesRegex(AdsPowerError, r"AttributeError, test_adspower.py:\d+") as caught:
+                async with browser.connection() as call:
+                    await call("Target.getTargets")
+                    raise AttributeError("secret-token")
+        self.assertNotIn("secret-token", str(caught.exception))
 
     async def test_duplicate_order_windows_block_approval(self):
         self.call.side_effect = [

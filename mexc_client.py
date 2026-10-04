@@ -122,6 +122,7 @@ class MexcP2PClient:
         base_url: str = "https://api.mexc.com",
         recv_window: int = 5000,
         proxy_url: str | None = None,
+        timeout_seconds: float = 20.0,
     ):
         self.api_key = api_key
         self.secret_key = secret_key.encode("utf-8")
@@ -129,9 +130,11 @@ class MexcP2PClient:
         self.recv_window = recv_window
         self.server_offset_ms = 0
         self.proxy_url = proxy_url
+        if not 1 <= float(timeout_seconds) <= 120:
+            raise ValueError('Таймаут MEXC должен быть от 1 до 120 секунд')
         self.logger = logging.getLogger("mexc_p2p.api")
         self.http = httpx.AsyncClient(
-            timeout=httpx.Timeout(20.0),
+            timeout=httpx.Timeout(float(timeout_seconds)),
             headers={"X-MEXC-APIKEY": self.api_key},
             proxy=proxy_url,
             trust_env=False,

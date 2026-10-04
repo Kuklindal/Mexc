@@ -32,6 +32,29 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
     def buttons(self, control):
         return [button['text'] for row in control.keyboard()['inline_keyboard'] for button in row]
 
+    def test_status_explains_connection_retry_when_profiles_have_no_timer(self):
+        from rollover import save_state
+
+        self.journal.abandon(self.cycle_id)
+        control = self.control()
+        control.task = SimpleNamespace(done=lambda: False)
+        state = {'mode': 'cash_volume', 'status': 'waiting', 'profiles': ['default'],
+                 'p1_profile': 'p1', 'completed_count': 0, 'cooldowns': {},
+                 'last_error': 'AdsPower Local API недоступен (ConnectError)'}
+        save_state(self.journal, state)
+        message = control.status()
+        self.assertIn('Повторяет подключение', message)
+        self.assertIn('AdsPower Local API недоступен', message)
+        self.assertNotIn('Ожидание следующего доступного П2', message)
+
+        state.pop('last_error')
+        save_state(self.journal, state)
+        self.assertIn('Ожидание следующего доступного П2', control.status())
+
+        state['status'] = 'running'
+        save_state(self.journal, state)
+        self.assertIn('Подготовка следующего цикла', control.status())
+
     def uncertain_chat(self, text='Здравствуйте'):
         self.journal.transition(self.cycle_id, 'forward_ad', 'p1', 'done', 'ad',
             result={'adv_no': 'AD-SELL'})
@@ -160,8 +183,9 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('🔄 Все профили', self.buttons(control))
         self.assertNotIn('⏹ Остановить', self.buttons(control))
         self.journal.abandon(self.cycle_id)
-        self.assertIn('🔄 Все профили', self.buttons(control))
-        self.assertIn('👤 Один профиль', self.buttons(control))
+        self.assertIn('💵 Объём наличка', self.buttons(control))
+        self.assertIn('📈 Объём Eflp', self.buttons(control))
+        self.assertIn('👥 Уникальные Eflp', self.buttons(control))
         self.assertNotIn('🗑 Сбросить цикл', self.buttons(control))
         self.assertNotIn('▶️ Продолжить', self.buttons(control))
         self.assertNotIn('default', self.buttons(control))
@@ -171,6 +195,66 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('↩️ Назад', self.buttons(control))
         await control.perform('back')
         self.assertNotIn('default', self.buttons(control))
+
+    async def test_cash_button_launches_configured_profiles_without_wizard(self):
+        from test_trade_modes import env_for
+        from rollover import load_state
+        self.journal.abandon(self.cycle_id)
+        env = env_for(2)
+        env.update({'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+                    'CASH_VOLUME_P1_PROFILE': 'p1',
+                    'CASH_VOLUME_P2_PROFILES': '2,1'})
+        with patch.dict(os.environ, env):
+            control = self.control()
+            with patch.object(control, 'work_rollover', new_callable=AsyncMock):
+                await control.perform('cash_volume')
+                await asyncio.sleep(0)
+            self.assertIsNone(control.menu)
+            self.assertEqual(load_state(self.journal)['profiles'], ['2', '1'])
+            self.assertEqual(load_state(self.journal)['p1_profile'], 'p1')
+
+    async def test_eflp_volume_chooses_only_p1_then_uses_configured_p2(self):
+        from test_trade_modes import env_for
+        from rollover import load_state
+        self.journal.abandon(self.cycle_id)
+        env = env_for(2) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+                            'MEXC_P2_2_BUY_ADV_NO': 'a1234567890123456787',
+                            'MEXC_P2_1_PAYMENT_ID': '1001',
+                            'MEXC_P2_2_PAYMENT_ID': '1002',
+                            'EFLP_VOLUME_P2_PROFILES': '2,1'}
+        with patch.dict(os.environ, env):
+            control = self.control()
+            await control.perform('eflp_volume')
+            self.assertEqual(control.menu, 'cash_p1')
+            self.assertEqual(control.selected_mode, 'eflp_volume')
+            self.assertFalse(any(button['callback_data'].endswith('cash_p1:2')
+                                 for row in control.keyboard()['inline_keyboard'] for button in row))
+            with patch.object(control, 'work_rollover', new_callable=AsyncMock):
+                await control.perform('cash_p1:p1')
+                await asyncio.sleep(0)
+            self.assertIsNone(control.menu)
+            self.assertEqual(load_state(self.journal)['profiles'], ['2', '1'])
+            self.assertEqual(load_state(self.journal)['p1_profile'], 'p1')
+
+    async def test_eflp_unique_keeps_manual_p1_and_p2_selection(self):
+        self.journal.abandon(self.cycle_id)
+        control = self.control()
+        await control.perform('eflp_unique')
+        self.assertIsNone(control.task)
+        self.assertEqual(control.menu, 'cash_p1')
+        self.assertEqual(control.selected_mode, 'eflp_unique')
+
+    async def test_unique_toggle_edits_same_telegram_menu(self):
+        from test_trade_modes import env_for
+        self.journal.abandon(self.cycle_id)
+        with patch.dict(os.environ, env_for(2)):
+            control = self.control()
+            control.menu = 'unique_p2'
+            control.unique_p1 = 'p1'
+            await control.perform('unique_p2:1', callback_message_id=17)
+        self.assertEqual(control.unique_p2, {'1'})
+        self.assertEqual(control.telegram.request.await_args.args[0], 'editMessageText')
+        control.telegram.send.assert_not_awaited()
 
     async def test_menu_shows_reset_during_return_and_only_stop_while_running(self):
         from rollover import save_state
@@ -295,6 +379,16 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                 await control.listen()
             run.assert_not_awaited()
         self.assertIsNone(control.task)
+
+    async def test_listener_closes_other_adspower_profiles(self):
+        control = self.control()
+        control.browser_guard = SimpleNamespace(
+            api_key='test', profile_id='P1',
+            close_other_local_profiles=AsyncMock(return_value=2))
+        control.telegram.request.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await control.listen()
+        control.browser_guard.close_other_local_profiles.assert_awaited_once()
 
     async def test_listener_retries_pending_google_sale(self):
         self.journal.transition(self.cycle_id, 'forward_complete', 'both', 'done', 'done',

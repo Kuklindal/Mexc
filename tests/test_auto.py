@@ -31,6 +31,73 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
             trusted_nicknames={"p2": "Trusted-P2"})
         return runner
 
+    async def test_p2_maker_return_uses_p2_ad_and_p1_as_buyer(self):
+        runner = self.runner()
+        self.spec.update(reverse_maker='p2', reverse_adv_no='AD-P2-SELL', buy_replenish=False)
+        self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?', (json.dumps(self.spec), self.cycle_id))
+        self.journal.db.commit()
+        p2_ad = copy.deepcopy(self.exchange.ad)
+        p2_ad.update(advNo='AD-P2-SELL', availableQuantity='0', advStatus='OPEN',
+                     overVerify=None)
+
+        async def p2_get_ad(adv_no):
+            self.assertEqual(adv_no, 'AD-P2-SELL')
+            return copy.deepcopy(p2_ad)
+
+        async def p2_ad_details(adv_no):
+            self.assertEqual(adv_no, 'AD-P2-SELL')
+            return {'id': adv_no, 'coinName': 'USDT', 'currency': 'RUB',
+                    'tradeType': 1, 'availableQuantity': p2_ad['availableQuantity'],
+                    'overVerify': {'types': [1]}}
+
+        async def p2_replenish(plan):
+            p2_ad['availableQuantity'] = str(Decimal(p2_ad['availableQuantity'])
+                                                 + Decimal(plan['quantity']))
+
+        maker_browser = type('Browser', (), {})()
+        maker_browser.ad_details = AsyncMock(side_effect=p2_ad_details)
+        maker_browser.replenish_ad = AsyncMock(side_effect=p2_replenish)
+        maker_browser.open_order = AsyncMock(return_value='ready')
+        maker_browser.inspect = AsyncMock(return_value='passed')
+        maker_browser.approve = AsyncMock()
+        maker_browser.close_order_tabs = AsyncMock(return_value=1)
+        maker_browser.profile_id = 'p2-browser'
+        maker_browser.stop_profile = AsyncMock()
+        runner.browser.profile_id = 'p1-browser'
+        runner.maker_browser = maker_browser
+        runner.clients['p2'].get_ad = AsyncMock(side_effect=p2_get_ad)
+        runner.delay_seconds = runner.delay_max_seconds = 0
+        with patch('cycle.asyncio.sleep', new=AsyncMock()):
+            await runner.run(self.cycle_id)
+        self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
+        self.assertEqual(maker_browser.replenish_ad.await_count, 1)
+        self.assertEqual(maker_browser.approve.await_count, 1)
+        maker_browser.stop_profile.assert_awaited_once()
+        reverse_create = next(call for call in self.exchange.calls
+                              if call[0] == 'p1' and call[1] == 'create')
+        self.assertEqual(reverse_create[2]['adv_no'], 'AD-P2-SELL')
+        self.assertEqual(reverse_create[2]['amount'], '10000.00')
+        self.assertEqual(reverse_create[2]['user_confirm_pay_method_id'], 578)
+        self.assertIsNone(self.journal.step(self.cycle_id, 'reverse_replenish_buy'))
+
+    async def test_p2_maker_records_sub_cent_rounding_without_overselling(self):
+        runner = self.runner()
+        runner.cycle_id = self.cycle_id
+        runner.spec = dict(self.spec, reverse_maker='p2')
+        self.journal.transition(self.cycle_id, 'forward_complete', 'both', 'done', 'sale',
+            result={'quantity': '100'}, context={'amount': '10000', 'quantity': '100'})
+        self.journal.transition(self.cycle_id, 'reverse_ad', 'p2', 'done', 'ad',
+            result={'adv_no': 'AD-P2-SELL'})
+        self.journal.transition(self.cycle_id, 'reverse_create', 'p1', 'done', 'order',
+            result={'order_no': 'ORDER-1'})
+        self.exchange.orders['ORDER-1'] = {'advOrderNo': 'ORDER-1', 'advNo': 'AD-P2-SELL',
+            'coinName': 'USDT', 'fiatUnit': 'RUB', 'state': 'NOT_PAID',
+            'amount': '9999.99', 'tradableQuantity': '99.9999'}
+        self.assertEqual((await runner.snapshot('reverse'))['residual_usdt'], '0.0001')
+        self.exchange.orders['ORDER-1']['tradableQuantity'] = '99.99'
+        with self.assertRaisesRegex(ValueError, 'не покрывает первую'):
+            await runner.snapshot('reverse')
+
     def outsider(self):
         self.exchange.orders["OUTSIDER"] = {"advOrderNo": "OUTSIDER", "advNo": "AD-SELL", "state": "NOT_PAID",
             "userInfo": {"memberId": "ANOTHER-USER", "nickName": "same nickname"}}

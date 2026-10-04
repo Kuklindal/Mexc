@@ -9,7 +9,7 @@ Type=simple
 User=mexc
 WorkingDirectory=/home/mexc
 EnvironmentFile=/etc/mexc/adspower.env
-ExecStart=/usr/bin/env adspower_global --headless=true --api-key=${ADSPOWER_API_KEY} --api-port=${ADSPOWER_API_PORT}
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1920x1080x24 -nolisten tcp" /usr/bin/env adspower_global --headless=true --api-key=${ADSPOWER_API_KEY} --api-port=${ADSPOWER_API_PORT}
 Restart=always
 RestartSec=10
 TimeoutStopSec=60

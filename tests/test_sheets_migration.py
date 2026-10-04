@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, patch
 from journal import Journal
 from datetime import datetime, timedelta, timezone
 
-from sheets import GoogleSheets, GoogleSheetsError, HEADER, Reporter, WEEKLY_MARKER, week_choices, weekly_formulas, weekly_start
+from sheets import (EFLP_MARKER, GoogleSheets, GoogleSheetsError, HEADER, Reporter,
+                    WEEKLY_MARKER, eflp_formulas, week_choices, weekly_formulas, weekly_start)
 
 
 class MigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -29,11 +30,15 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.sheets.get_sheet_id = AsyncMock(return_value=0)
         self.sheets.batch_update = AsyncMock(return_value={})
         self.existing_summary = []
+        self.existing_eflp = []
+        self.existing_eflp_meta = []
         async def request(method, cell_range, values=None):
             self.calls.append((method, cell_range, values))
             if method == 'GET':
-                return {'values': self.existing_summary if cell_range == 'F:J' else
-                                  [] if cell_range == 'E:E' else self.existing}
+                values_by_range = {'F:J': self.existing_summary, 'E:E': [],
+                                   'N:P': self.existing_eflp, 'Q:S': self.existing_eflp_meta,
+                                   'A:D': self.existing}
+                return {'values': values_by_range[cell_range]}
             return {}
         self.sheets.request = request
 
@@ -111,6 +116,23 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[3][1], '=I3*5%')
         self.assertEqual(rows[8][3], '=200-SUM(I7:I8)')
 
+    def test_eflp_formulas_use_selected_week_and_distinct_member_ids(self):
+        sales = [dict(p1_profile='p1', p1_nickname='Maker',
+                      scheduler_mode='eflp_volume', p2_member_id='buyer-1'),
+                 dict(p1_profile='p1', p1_nickname='Maker',
+                      scheduler_mode='eflp_unique', p2_member_id='buyer-2')]
+        rows = eflp_formulas(sales, 0)
+        self.assertEqual(rows[0][0], EFLP_MARKER)
+        self.assertEqual(rows[1][0], 'Maker')
+        self.assertIn('$E$1+7', rows[1][1])
+        self.assertIn('COUNTUNIQUEIFS($S$2:$S', rows[1][2])
+
+    async def test_eflp_summary_rejects_occupied_cells(self):
+        self.existing_eflp = [['custom data']]
+        with self.assertRaises(GoogleSheetsError):
+            await self.sheets.send_weekly(self.journal.sales())
+        self.sheets.batch_update.assert_not_awaited()
+
     async def test_weekly_summary_does_not_overwrite_occupied_neighbor_cells(self):
         async def request(method, area, values=None):
             self.calls.append((method, area, values))
@@ -127,7 +149,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         selected = requests[1]['updateCells']['rows'][0]['values'][1]['userEnteredValue']['stringValue']
         self.assertEqual(selected, '17.09.2026 18:50')
         self.assertIn(selected, [v['userEnteredValue'] for v in
-            requests[2]['setDataValidation']['rule']['condition']['values']])
+            requests[3]['setDataValidation']['rule']['condition']['values']])
 
     def test_legacy_journal_backfills_from_first_sale_event(self):
         self.journal.db.execute("UPDATE sales SET quantity='', completed_at=''")
@@ -158,7 +180,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         requests = self.sheets.batch_update.await_args.args[0]
         chosen = requests[1]['updateCells']['rows'][0]['values'][1]['userEnteredValue']['stringValue']
         options = [value['userEnteredValue']
-                   for value in requests[2]['setDataValidation']['rule']['condition']['values']]
+                   for value in requests[3]['setDataValidation']['rule']['condition']['values']]
         self.assertIn(chosen, options)
         self.assertEqual(requests[1]['updateCells']['rows'][2]['values'][1]['userEnteredValue']['formulaValue'][:7],
                          '=SUMIFS')

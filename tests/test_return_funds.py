@@ -159,6 +159,21 @@ class ReturnFundsTests(unittest.IsolatedAsyncioTestCase):
         p2.transfer_usdt.assert_not_awaited()
         p2.withdraw_usdt.assert_not_awaited()
 
+    async def test_selected_p1_uses_own_deposit_address_for_network_return(self):
+        returned, state, p1, p2, browser, _, _ = self.setup_return()
+        state['pending_return']['p1_profile'] = '2'
+        returned = ReturnFunds(self.journal, state, asyncio.Event(), p1, p2, browser)
+        address = '0x' + '1' * 40
+        with patch.dict(os.environ, {
+                'ROLLOVER_NETWORKS': 'PLASMA',
+                'MEXC_P1_DEPOSIT_ADDRESS_PLASMA': '0x' + '9' * 40,
+                'MEXC_P2_2_DEPOSIT_ADDRESS_PLASMA': address,
+                'MEXC_P2_2_DEPOSIT_MEMO_PLASMA': ''}):
+            await returned.plan()
+        self.assertEqual(state['pending_return']['address'], address)
+        p2.transfer_usdt.assert_not_awaited()
+        p2.withdraw_usdt.assert_not_awaited()
+
     async def test_lost_transfer_response_is_not_resent(self):
         returned, state, _, p2, browser, _, _ = self.setup_return()
         p2.transfer_usdt.side_effect = TimeoutError('lost')

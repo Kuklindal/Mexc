@@ -6,7 +6,9 @@ from contextlib import asynccontextmanager
 import json
 import os
 import re
+import traceback
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
 import httpx
@@ -24,6 +26,20 @@ class AdsPowerTimeout(AdsPowerError):
 class AdsPowerUnavailable(AdsPowerError):
     """Temporary failure reaching the local AdsPower API before a browser command."""
     pass
+
+
+class AdsPowerClickUnknown(AdsPowerError):
+    """The browser may have processed a click before its CDP reply was lost."""
+    pass
+
+
+def _safe_error_location(exc: Exception) -> str:
+    """Identify a failing code line without logging CDP payloads or signed URLs."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return "unknown"
+    frame = frames[-1]
+    return f"{Path(frame.filename).name}:{frame.lineno}"
 
 
 # The site's quantity endpoint changes only the available quantity. It does not
@@ -116,16 +132,142 @@ class AdsPower:
     def __init__(self, base_url: str, api_key: str, profile_id: str):
         self.base_url = local_url(base_url.rstrip('/'), {"http", "https"})
         self.api_key, self.profile_id = api_key.strip(), profile_id.strip()
+        self.command_timeout = 10
 
     @classmethod
     def from_env(cls):
         return cls(os.getenv("ADSPOWER_BASE_URL", "http://127.0.0.1:50325"),
                    os.getenv("ADSPOWER_API_KEY", ""), os.getenv("ADSPOWER_P1_PROFILE_ID", ""))
 
+    async def ensure_started(self) -> None:
+        """Start only this AdsPower profile, leaving other active roles open."""
+        if not self.api_key or not self.profile_id:
+            raise AdsPowerError('Для запуска профиля нужны ключ AdsPower и его ID')
+        headers = {'Authorization': 'Bearer ' + self.api_key}
+        async with httpx.AsyncClient(timeout=max(15, self.command_timeout), trust_env=False) as client:
+            started = False
+            for _ in range(24):
+                try:
+                    response = await client.get(self.base_url + '/api/v1/browser/active',
+                                                params={'user_id': self.profile_id}, headers=headers)
+                except httpx.RequestError as exc:
+                    raise AdsPowerUnavailable(f'AdsPower Local API недоступен ({type(exc).__name__})') from None
+                payload = response.json()
+                if response.status_code != 200 or payload.get('code') != 0:
+                    raise AdsPowerError('AdsPower отклонил проверку профиля')
+                if payload.get('data', {}).get('status') == 'Active':
+                    await self.endpoint()
+                    return
+                if not started:
+                    response = await client.get(self.base_url + '/api/v1/browser/start',
+                                                params={'user_id': self.profile_id, 'headless': 1}, headers=headers)
+                    payload = response.json()
+                    if response.status_code != 200 or payload.get('code') != 0:
+                        raise AdsPowerError('AdsPower не смог открыть профиль')
+                    started = True
+                await asyncio.sleep(5)
+        raise AdsPowerUnavailable('AdsPower не подтвердил запуск профиля за 120 секунд')
+
+    async def ensure_mexc_page(self) -> None:
+        """Require a rendered MEXC page, not merely a matching tab URL."""
+        async with self.connection() as call:
+            targets = (await call('Target.getTargets')).get('targetInfos', [])
+            def is_mexc(target):
+                url = urlsplit(target.get('url', ''))
+                return (target.get('type') == 'page' and url.scheme == 'https'
+                        and url.hostname in {'mexc.com', 'www.mexc.com'})
+            pages = [target for target in targets if is_mexc(target)]
+            if not pages:
+                created = await call('Target.createTarget', {
+                    'url': 'https://www.mexc.com/ru-RU/buy-crypto/', 'background': False}, timeout=30)
+                target_id = created.get('targetId')
+                if not target_id:
+                    raise AdsPowerError('AdsPower не подтвердил создание вкладки MEXC')
+            sessions = {}
+            for _ in range(15):
+                if not pages:
+                    targets = (await call('Target.getTargets')).get('targetInfos', [])
+                    pages = [target for target in targets
+                             if target.get('targetId') == target_id and is_mexc(target)]
+                for page in pages:
+                    page_id = page.get('targetId')
+                    if not page_id:
+                        continue
+                    if page_id not in sessions:
+                        attached = await call('Target.attachToTarget',
+                                              {'targetId': page_id, 'flatten': True})
+                        sessions[page_id] = attached.get('sessionId')
+                    if not sessions[page_id]:
+                        continue
+                    try:
+                        result = await call('Runtime.evaluate', {
+                            'expression': "({ready:document.readyState,bodyChars:(document.body?.innerText||'').trim().length})",
+                            'returnByValue': True}, sessions[page_id])
+                    except AdsPowerTimeout:
+                        continue
+                    value = result.get('result', {}).get('value', {})
+                    if (isinstance(value, dict) and value.get('ready') in {'interactive', 'complete'}
+                            and isinstance(value.get('bodyChars'), int) and value['bodyChars'] > 0):
+                        return
+                await asyncio.sleep(2)
+            raise AdsPowerUnavailable('Вкладка MEXC не загрузила содержимое страницы за 30 секунд; '
+                                      'проверьте браузер и прокси профиля')
+
+    async def stop_profile(self) -> None:
+        """Release a temporary maker profile after its completed cycle."""
+        if not self.api_key or not self.profile_id:
+            raise AdsPowerError('Для закрытия профиля нужны ключ AdsPower и его ID')
+        try:
+            async with httpx.AsyncClient(timeout=max(15, self.command_timeout), trust_env=False) as client:
+                response = await client.get(self.base_url + '/api/v1/browser/stop',
+                    params={'user_id': self.profile_id},
+                    headers={'Authorization': 'Bearer ' + self.api_key})
+                payload = response.json()
+        except (httpx.RequestError, ValueError) as exc:
+            raise AdsPowerUnavailable(f'Не удалось закрыть временный профиль AdsPower ({type(exc).__name__})') from None
+        if response.status_code != 200 or not isinstance(payload, dict) or payload.get('code') != 0:
+            raise AdsPowerError('AdsPower не подтвердил закрытие временного профиля')
+
+    async def close_other_local_profiles(self, keep_profile_ids=None) -> int:
+        """Keep the static P1 and any active trading-role browser profiles."""
+        if not self.api_key or not self.profile_id:
+            raise AdsPowerError("Для контроля профилей нужны ADSPOWER_API_KEY и ADSPOWER_P1_PROFILE_ID")
+        headers = {"Authorization": "Bearer " + self.api_key}
+        async with httpx.AsyncClient(timeout=max(10, self.command_timeout), trust_env=False) as client:
+            try:
+                response = await client.get(self.base_url + "/api/v1/browser/local-active", headers=headers)
+                payload = response.json()
+            except (httpx.RequestError, ValueError) as exc:
+                raise AdsPowerUnavailable(f"Не удалось прочитать открытые профили AdsPower ({type(exc).__name__})") from None
+            data = payload.get("data") if isinstance(payload, dict) else None
+            entries = data.get("list") if isinstance(data, dict) else None
+            if (response.status_code != 200 or not isinstance(payload, dict)
+                    or payload.get("code") != 0 or not isinstance(entries, list)):
+                raise AdsPowerError("AdsPower не вернул список открытых профилей")
+            if any(not isinstance(item, dict) or not isinstance(item.get("user_id"), str)
+                   or not item["user_id"] for item in entries):
+                raise AdsPowerError("AdsPower вернул некорректный список открытых профилей")
+            opened = {item["user_id"] for item in entries}
+            protected = {self.profile_id, *(keep_profile_ids or ())}
+            if not (opened & protected):
+                raise AdsPowerError("Профиль П1 не открыт в локальном AdsPower; другие профили не закрывались")
+            closed = 0
+            for profile_id in sorted(opened - protected):
+                try:
+                    stopped = await client.get(self.base_url + "/api/v1/browser/stop",
+                                               params={"user_id": profile_id}, headers=headers)
+                    body = stopped.json()
+                except (httpx.RequestError, ValueError) as exc:
+                    raise AdsPowerUnavailable(f"Не удалось закрыть лишний профиль AdsPower ({type(exc).__name__})") from None
+                if stopped.status_code != 200 or not isinstance(body, dict) or body.get("code") != 0:
+                    raise AdsPowerError("AdsPower не подтвердил закрытие лишнего профиля")
+                closed += 1
+            return closed
+
     async def endpoint(self) -> str:
         if not self.profile_id or not self.api_key:
             raise AdsPowerError("Заполните ADSPOWER_P1_PROFILE_ID и ADSPOWER_API_KEY в .env")
-        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=max(10, self.command_timeout), trust_env=False) as client:
             for attempt in range(3):
                 try:
                     response = await client.get(self.base_url + "/api/v1/browser/active",
@@ -149,43 +291,59 @@ class AdsPower:
     @asynccontextmanager
     async def connection(self):
         try:
-            async with websockets.connect(await self.endpoint(), open_timeout=10, close_timeout=3,
+            async with websockets.connect(await self.endpoint(), open_timeout=self.command_timeout, close_timeout=3,
                                           proxy=None) as ws:
                 seq = 0
 
-                async def call(method, params=None, session=None):
+                async def call(method, params=None, session=None, *, timeout=None):
                     nonlocal seq
+                    if timeout is None:
+                        timeout = self.command_timeout
                     seq += 1
                     request_id = seq
                     request = {"id": request_id, "method": method, "params": params or {}}
                     if session:
                         request["sessionId"] = session
+                    async def send_and_receive():
+                        await ws.send(json.dumps(request))
+                        while True:
+                            response = json.loads(await ws.recv())
+                            if not isinstance(response, dict):
+                                raise AdsPowerError(f"AdsPower: некорректный ответ CDP на {method}")
+                            if response.get("id") == request_id:
+                                if "error" in response:
+                                    raise AdsPowerError(f"Браузер отклонил команду {method}; проверьте открытую вкладку")
+                                result = response.get("result")
+                                if not isinstance(result, dict):
+                                    raise AdsPowerError(f"AdsPower: некорректный результат CDP для {method}")
+                                return result
                     try:
-                        async with asyncio.timeout(10):
-                            await ws.send(json.dumps(request))
-                            while True:
-                                response = json.loads(await ws.recv())
-                                if response.get("id") == request_id:
-                                    if "error" in response:
-                                        raise AdsPowerError(f"Браузер отклонил команду {method}; проверьте открытую вкладку")
-                                    return response.get("result", {})
-                    except TimeoutError:
-                        raise AdsPowerTimeout(f"AdsPower: команда {method} не ответила за 10 секунд") from None
+                        # asyncio.timeout is unavailable on the server's Python 3.10.
+                        return await asyncio.wait_for(send_and_receive(), timeout=timeout)
+                    except (asyncio.TimeoutError, TimeoutError):
+                        raise AdsPowerTimeout(f"AdsPower: команда {method} не ответила за {timeout} секунд") from None
                 yield call
         except AdsPowerError:
             raise
         except Exception as exc:
             # Never include raw websocket URLs, headers, tokens, page contents or cookies.
-            raise AdsPowerError(f"Ошибка подключения к AdsPower ({type(exc).__name__}); проверьте результат на MEXC") from None
+            location = _safe_error_location(exc)
+            raise AdsPowerError(f"Ошибка AdsPower ({type(exc).__name__}, {location}); "
+                                "проверьте результат на MEXC") from None
         # Closing this CDP connection detaches the automation; the browser stays open.
 
     async def view(self, call, session, order_no, *, click=False):
         expression = f"({ORDER_VIEW})({json.dumps(order_no)}, {json.dumps(click)})"
         try:
-            response = await call("Runtime.evaluate", {"expression": expression, "returnByValue": True}, session)
+            request = {"expression": expression, "returnByValue": True}
+            if click:
+                # A slow headless page may process the click before answering CDP.
+                response = await call("Runtime.evaluate", request, session, timeout=30)
+            else:
+                response = await call("Runtime.evaluate", request, session)
         except AdsPowerTimeout:
             if click:
-                raise AdsPowerError("AdsPower не ответил после команды нажатия. Результат неизвестен; повторного нажатия не будет") from None
+                raise AdsPowerClickUnknown("AdsPower не ответил после команды нажатия. Результат неизвестен; повторного нажатия не будет") from None
             raise
         if "exceptionDetails" in response:
             raise AdsPowerError("Не удалось проверить окно ордера MEXC")
@@ -264,7 +422,15 @@ class AdsPower:
                         return verified
                     return state
                 await asyncio.sleep(1)
-            raise AdsPowerError("Ордер открыт, но кнопка проверки недоступна. Проверьте вход П1 и состояние страницы MEXC; действие не выполнено")
+            # The standalone page can omit the merchant verification dialog.
+            # Read the exact order on MEXC before deciding whether a click is needed.
+            verified = await self.verification_state(call, session, order_no)
+            if verified in {"passed", "not_required"}:
+                return verified
+            if verified == "ready":
+                return await self.open_merchant_order(call, order_no)
+            raise AdsPowerError("MEXC не подтвердил, требуется ли проверка документов; "
+                                "кнопка не нажималась. Сверьте ордер в портале мерчанта П1")
 
     async def inspect(self, order_no: str) -> str:
         async with self.connection() as call:
@@ -365,14 +531,54 @@ class AdsPower:
         raise AdsPowerError("MEXC не сообщил однозначно, требуется ли проверка документов в этом ордере. "
                             "Статус 0 не доказывает ожидание проверки. Сверьте ордер в портале мерчанта П1")
 
+    async def server_verification_state(self, order_no: str) -> str:
+        """Read the exact order's server state even if its visible tab is stalled."""
+        async with self.connection() as call:
+            targets = (await call("Target.getTargets")).get("targetInfos", [])
+            pages = [target for target in targets if target.get("type") == "page"
+                     and urlsplit(target.get("url", "")).hostname in {"mexc.com", "www.mexc.com"}]
+            pages.sort(key=lambda target: (order_no not in target.get("url", ""),
+                                           "/buy-crypto/control" not in target.get("url", "")))
+            saw_ready = False
+            saw_not_required = False
+            for target in pages[:5]:
+                try:
+                    attached = await call("Target.attachToTarget", {
+                        "targetId": target["targetId"], "flatten": True})
+                    state = await self.verification_state(call, attached["sessionId"], order_no)
+                except AdsPowerError:
+                    continue
+                if state == "passed":
+                    return state
+                if state == "ready":
+                    saw_ready = True
+                if state == "not_required":
+                    saw_not_required = True
+            if saw_ready:
+                return "ready"
+            if saw_not_required:
+                return "not_required"
+            raise AdsPowerError("Не удалось прочитать состояние проверки ордера на MEXC через профиль П1")
+
     async def open_merchant_order(self, call, order_no: str) -> str:
         """The standalone page can hide pending verification. Open the exact maker row."""
-        for target in (await call("Target.getTargets")).get("targetInfos", []):
-            url = urlsplit(target.get("url", ""))
-            if (target.get("type") != "page" or url.scheme != "https"
-                    or url.hostname not in {"mexc.com", "www.mexc.com"}
-                    or not url.path.endswith('/buy-crypto/control')):
-                continue
+        def merchant_page(target):
+            url = urlsplit(target.get('url', ''))
+            return (target.get('type') == 'page' and url.scheme == 'https'
+                    and url.hostname in {'mexc.com', 'www.mexc.com'}
+                    and url.path.endswith('/buy-crypto/control'))
+
+        targets = [target for target in (await call('Target.getTargets')).get('targetInfos', [])
+                   if merchant_page(target)]
+        if not targets:
+            created = await call('Target.createTarget', {
+                'url': 'https://www.mexc.com/ru-RU/buy-crypto/control',
+                'background': False})
+            if not created.get('targetId'):
+                raise AdsPowerError('AdsPower не открыл портал мерчанта П1; кнопка не нажималась')
+            targets = [{'type': 'page', 'targetId': created['targetId'],
+                        'url': 'https://www.mexc.com/ru-RU/buy-crypto/control'}]
+        for target in targets:
             session = (await call("Target.attachToTarget", {"targetId": target["targetId"], "flatten": True}))["sessionId"]
             expression = r"""(orderNo => {
                 const rows = Array.from(document.querySelectorAll('[data-row-key]'))
@@ -382,8 +588,12 @@ class AdsPower:
                 if (icons.length !== 1) return false;
                 icons[0].dispatchEvent(new MouseEvent('click', {bubbles:true,cancelable:true})); return true;
             })""" + f"({json.dumps(order_no)})"
-            result = await call("Runtime.evaluate", {"expression": expression, "returnByValue": True}, session)
-            if result.get("result", {}).get("value") is not True:
+            for _ in range(15):
+                result = await call("Runtime.evaluate", {"expression": expression, "returnByValue": True}, session)
+                if result.get("result", {}).get("value") is True:
+                    break
+                await asyncio.sleep(1)
+            else:
                 continue
             for _ in range(10):
                 state = await self.read_view(call, session, target["targetId"], order_no)
@@ -395,19 +605,36 @@ class AdsPower:
                             "Не удалось подтвердить, требуется ли проверка; оплата не отправлена")
 
     async def approve(self, order_no: str) -> None:
-        async with self.connection() as call:
-            session, state = await self.locate(call, order_no)
-            if state == "passed":
-                if await self.verification_state(call, session, order_no) in {"passed", "not_required"}:
-                    return
-                raise AdsPowerError("Заголовок показывает ожидание оплаты, но проверка на сервере ещё не пройдена. Откройте ордер в портале мерчанта П1")
-            # Recheck the exact order and state in the same JS operation as the click.
-            if await self.view(call, session, order_no, click=True) != "clicked":
-                raise AdsPowerError("Окно ордера изменилось; нажатие не выполнено")
-            for _ in range(15):
-                await asyncio.sleep(1)
-                if (await self.view(call, session, order_no) == "passed"
-                        and await self.verification_state(call, session, order_no) == "passed"):
-                    return
-            raise AdsPowerError("Нажатие выполнено, но переход к ожиданию оплаты не подтверждён. "
-                                "Проверьте MEXC; автоматического повторного нажатия не будет")
+        click_attempted = False
+        try:
+            async with self.connection() as call:
+                session, state = await self.locate(call, order_no)
+                if state == "passed":
+                    if await self.verification_state(call, session, order_no) in {"passed", "not_required"}:
+                        return
+                    raise AdsPowerError("Заголовок показывает ожидание оплаты, но проверка на сервере ещё не пройдена. Откройте ордер в портале мерчанта П1")
+                # Recheck the exact order and state in the same JS operation as the click.
+                click_attempted = True
+                if await self.view(call, session, order_no, click=True) != "clicked":
+                    raise AdsPowerError("Окно ордера изменилось; нажатие не выполнено")
+                for _ in range(15):
+                    await asyncio.sleep(1)
+                    if (await self.view(call, session, order_no) == "passed"
+                            and await self.verification_state(call, session, order_no) == "passed"):
+                        return
+                raise AdsPowerClickUnknown("Нажатие выполнено, но переход к ожиданию оплаты не подтверждён. "
+                                           "Проверьте MEXC; автоматического повторного нажатия не будет")
+        except AdsPowerError:
+            if not click_attempted:
+                raise
+            # The click may already have succeeded. Reconnect and only read MEXC;
+            # never send another click while reconciling an unknown result.
+            for attempt in range(2):
+                if attempt:
+                    await asyncio.sleep(2)
+                try:
+                    if await self.server_verification_state(order_no) == "passed":
+                        return
+                except AdsPowerError:
+                    continue
+            raise

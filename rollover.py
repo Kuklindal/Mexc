@@ -127,6 +127,13 @@ def cooldown_after_limit(journal, profile, when=None):
             'third_trade': third, 'manual_block': until <= when}
 
 
+def cooldown_after_ad_rejection(when=None):
+    """85010 has no published reset time; use a local 24-hour retry delay."""
+    when = when or datetime.now(timezone.utc)
+    return {'anchor': when.isoformat(), 'until': (when + timedelta(days=1)).isoformat(),
+            'manual_block': False, 'reason': '85010'}
+
+
 def eligible(state, when=None):
     when = when or datetime.now(timezone.utc)
     names = state['profiles'] if state['mode'] == 'all' else [state['selected']]
@@ -162,6 +169,10 @@ def clear_cooldown(journal, profile):
     state = load_state(journal)
     if not state or profile not in state.get('profiles', []) or profile not in state.get('cooldowns', {}):
         raise ValueError('У этого профиля нет сохранённого таймера')
+    limit = state['cooldowns'][profile]
+    if (state.get('mode') == 'volume' and limit.get('reason') == 'volume'
+            and datetime.fromisoformat(limit['until']) > datetime.now(timezone.utc)):
+        raise ValueError('В режиме «Объём» 24 часа от третьей сделки ещё не прошли; таймер не сброшен')
     del state['cooldowns'][profile]
     save_state(journal, state)
 
@@ -227,6 +238,8 @@ def begin(journal, mode, selected=None, env=os.environ):
     state = {'status': 'ready', 'mode': mode, 'selected': selected, 'profiles': names,
              'completed_count': 0, 'active_cycle': None,
              'cooldowns': previous.get('cooldowns', {}) if previous else {},
+             'ad_rejection_streaks': previous.get('ad_rejection_streaks', {}) if previous else {},
+             'ad_rejection_last_cycles': previous.get('ad_rejection_last_cycles', {}) if previous else {},
              'archived_returns': previous.get('archived_returns', []) if previous else [],
              'cursor': 0, 'pending_return': None,
              'last_cycle_rowid': journal.db.execute('SELECT COALESCE(MAX(rowid),0) FROM cycles').fetchone()[0]}
@@ -236,6 +249,9 @@ def begin(journal, mode, selected=None, env=os.environ):
 
 async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
     """Launches only confirmed complete cycles. A limit holds the affected profile."""
+    if state.get('mode') in {'volume', 'unique', 'cash_volume', 'eflp_volume', 'eflp_unique'}:
+        from trade_modes import run_mode
+        return await run_mode(journal, state, stop_event, telegram, telegram_keyboard)
     from main import build_parser
     if 'last_cycle_rowid' not in state:
         known = set(state.pop('known_cycle_ids', []))
@@ -298,14 +314,16 @@ async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
             from mexc_client import MexcReadUnavailable
             ads_unavailable = False
             mexc_read_unavailable = False
+            mexc_read_error = None
             timestamp_rejected = False
             try:
                 await run_command(args, stop_event=stop_event, use_lock=False,
                                   notify_prepare_errors=False, telegram_keyboard=telegram_keyboard)
             except AdsPowerUnavailable:
                 ads_unavailable = True
-            except MexcReadUnavailable:
+            except MexcReadUnavailable as exc:
                 mexc_read_unavailable = True
+                mexc_read_error = str(exc)
             except MexcAPIError as exc:
                 if exc.code != 700003 or exc.http_status != 400:
                     raise
@@ -347,10 +365,14 @@ async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
                 first_failure = not state.get(waiting_key)
                 state[waiting_key] = True
                 state['status'] = 'waiting'
-                state['last_error'] = f'{service} временно не отвечает на чтение; повторная проверка через 30 секунд'
+                state['last_error'] = (f'{service} временно не отвечает на чтение: '
+                                       f'{mexc_read_error}; повторная проверка через 30 секунд'
+                                       if mexc_read_error else
+                                       f'{service} временно не отвечает на чтение; повторная проверка через 30 секунд')
                 save_state(journal, state)
                 if first_failure and telegram and getattr(telegram, 'enabled', False):
-                    await telegram.send(f'⚠️ {service} временно не отвечает на чтение. Серия ждёт 30 секунд '
+                    detail = f' {mexc_read_error}.' if mexc_read_error else ''
+                    await telegram.send(f'⚠️ {service} временно не отвечает на чтение.{detail} Серия ждёт 30 секунд '
                                         'и сверит сохранённый цикл снова; повторной операции без сверки не будет.',
                                         reply_markup=telegram_keyboard() if telegram_keyboard else None)
                 await wait_until(datetime.now(timezone.utc) + timedelta(seconds=30), stop_event)
@@ -366,19 +388,49 @@ async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
             cycle = journal.cycle(cycle_id)
             if cycle['status'] == 'completed':
                 state['completed_count'] += 1
+                state.setdefault('ad_rejection_streaks', {})[profile] = 0
                 state['last_cycle_rowid'] = cycle_rowid(journal, cycle_id)
                 state['active_cycle'] = None
                 # Keep using this P2 until MEXC reports a limit for that profile.
                 save_state(journal, state)
                 continue
-            rejected = any((s := journal.step(cycle_id, key)) and s['status'] == 'rejected'
-                           and s['result'].get('rejected_code') == 60085
-                           for key in ('forward_create', 'reverse_create'))
-            if not rejected:
+            rejection = next(((key, s['result']['rejected_code'])
+                              for key in ('forward_create', 'reverse_create')
+                              if (s := journal.step(cycle_id, key)) and s['status'] == 'rejected'
+                              and s['result'].get('rejected_code') in {60085, 85010}), None)
+            if not rejection:
                 raise Paused(f'Цикл {cycle_id} остановлен без подтверждённого лимита; требуется проверка ошибки')
-            state['cooldowns'][profile] = cooldown_after_limit(journal, profile)
+            rejected_step, rejected_code = rejection
+            if rejected_code == 85010:
+                last_cycles = state.setdefault('ad_rejection_last_cycles', {})
+                streaks = state.setdefault('ad_rejection_streaks', {})
+                if last_cycles.get(profile) != cycle_id:
+                    streaks[profile] = streaks.get(profile, 0) + 1
+                    last_cycles[profile] = cycle_id
+                    legacy = journal.create_rejection_details(cycle_id, rejected_step)
+                    if legacy and legacy[0] == 85010:
+                        rejected_at = datetime.fromisoformat(legacy[1])
+                    else:
+                        event = journal.db.execute(
+                            "SELECT time FROM events WHERE cycle_id=? AND step=? "
+                            "AND status='rejected' ORDER BY id DESC LIMIT 1",
+                            (cycle_id, rejected_step)).fetchone()
+                        rejected_at = datetime.fromisoformat(event['time']) if event else None
+                    state['cooldowns'][profile] = cooldown_after_ad_rejection(rejected_at)
+            else:
+                state.setdefault('ad_rejection_streaks', {})[profile] = 0
+                state['cooldowns'][profile] = cooldown_after_limit(journal, profile)
             state['pending_return'] = {'cycle_id': cycle_id, 'profile': profile} if journal.step(cycle_id, 'forward_complete') else None
             save_state(journal, state)
+            if rejected_code == 85010 and streaks[profile] == 3 and not journal.step(cycle_id, 'ad_rejection_alert'):
+                until = datetime.fromisoformat(state['cooldowns'][profile]['until']).astimezone(KRS)
+                journal.transition(cycle_id, 'ad_rejection_alert', 'system', 'done',
+                    f'🚨 MEXC 85010 третий раз подряд у П2 {p2_nickname(profile)}. '
+                    f'Отказ на шаге {rejected_step}; профиль на таймере до {until:%d.%m.%Y %H:%M} Красноярск. '
+                    'Проверьте причину отказа и возможность торговли по этому объявлению в MEXC.')
+                if telegram and getattr(telegram, 'enabled', False):
+                    from sheets import Reporter
+                    await Reporter(journal, telegram, None, keyboard=telegram_keyboard).flush()
             if state['pending_return']:
                 from return_funds import finish_return
                 await finish_return(journal, state, stop_event)
@@ -403,14 +455,18 @@ def finish_limited_cycle(journal, state):
         raise Paused('Возврат USDT ещё не завершён; другой профиль не запускается')
     if returned and not returned.get('credited'):
         raise Paused('Возврат отмечен завершённым без подтверждённой суммы депозита П1')
+    rejection_code = next((step['result'].get('rejected_code')
+                           for key in ('forward_create', 'reverse_create')
+                           if (step := journal.step(cycle_id, key)) and step['status'] == 'rejected'
+                           and step['result'].get('rejected_code') in {60085, 85010}), 60085)
     journal.transition(cycle_id, 'rollover', 'system', 'abandoned',
-                       'Цикл с лимитом 60085 закрыт после сверки возврата; обратной P2P-сделки нет',
+                       f'Цикл с отказом MEXC {rejection_code} закрыт после сверки возврата; обратной P2P-сделки нет',
                        cycle_status='abandoned')
     if returned:
         state['pending_switch_notice'] = {
             'cycle_id': cycle_id, 'profile': profile,
             'from_name': p2_nickname(profile, cycle['spec'].get('nicknames', {}).get('p2')),
-            'credited': returned['credited']}
+            'credited': returned['credited'], 'reason_code': rejection_code}
     state['active_cycle'] = None
     state['pending_return'] = None
     state['last_cycle_rowid'] = cycle_rowid(journal, cycle_id)
@@ -430,8 +486,10 @@ def enqueue_switch_notice(journal, state, next_profile):
         destination = (f"Следующий П2: {p2_nickname(next_profile)}" if next_profile != notice['profile']
                        else f"П2 остаётся {p2_nickname(next_profile)}; ждём окончания таймера")
         credited = format(Decimal(str(notice['credited'])).normalize(), 'f')
+        reason = ('лимита' if notice.get('reason_code', 60085) == 60085
+                  else 'отказа MEXC 85010')
         journal.transition(cycle_id, 'rollover_switch_notice', 'system', 'done',
-                           f"✅ Возврат после лимита завершён\n"
+                           f"✅ Возврат после {reason} завершён\n"
                            f"{notice['from_name']} → П1: {credited} USDT\n"
                            f"Объявление П1 пополнено.\n{destination}",
                            result={'next_profile': next_profile},
@@ -454,5 +512,7 @@ def status(state):
         lines.append(f"Возврат USDT: {p2_nickname(state['pending_return']['profile'])}; этап: {state['pending_return'].get('stage', 'подготовка')}")
     for name, limit in state['cooldowns'].items():
         suffix = ' / требует проверки' if limit['manual_block'] else ''
+        if limit.get('reason') == '85010':
+            suffix += f" / 85010 подряд: {state.get('ad_rejection_streaks', {}).get(name, 0)}"
         lines.append(f"{p2_nickname(name)}: таймер до {datetime.fromisoformat(limit['until']).astimezone(KRS):%d.%m %H:%M} (Красноярск){suffix}")
     return '\n'.join(lines)

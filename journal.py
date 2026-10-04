@@ -121,20 +121,30 @@ class Journal:
         row = self.db.execute("SELECT * FROM steps WHERE cycle_id=? AND name=?", (cycle_id, name)).fetchone()
         return dict(row) | {"result": json.loads(row["result"])} if row else None
 
-    def reverse_daily_limit_rejected(self, cycle_id: str) -> bool:
-        """Recover only an explicit server rejection of the latest legacy attempt."""
-        row = self.db.execute("""SELECT message FROM events WHERE cycle_id=? AND step='reverse_create'
+    def create_rejection_details(self, cycle_id: str, step: str) -> tuple[int, str] | None:
+        """Recover the code and original time of a legacy order-create rejection."""
+        if step not in {'forward_create', 'reverse_create'}:
+            return None
+        row = self.db.execute("""SELECT message,time FROM events WHERE cycle_id=? AND step=?
             AND status='error' AND id > COALESCE((SELECT MAX(id) FROM events WHERE cycle_id=?
-            AND step='reverse_create' AND status='in_flight'),0) ORDER BY id DESC LIMIT 1""",
-            (cycle_id, cycle_id)).fetchone()
+            AND step=? AND status='in_flight'),0) ORDER BY id DESC LIMIT 1""",
+            (cycle_id, step, cycle_id, step)).fetchone()
         marker = 'POST /api/v3/fiat/merchant/order/deal: MEXC error: '
-        if not row or marker not in row[0]:
-            return False
+        if not row or marker not in row['message']:
+            return None
         try:
-            data = json.loads(row[0].split(marker, 1)[1])
-            return isinstance(data, dict) and data.get('code') == 60085
+            data = json.loads(row['message'].split(marker, 1)[1])
+            code = data.get('code') if isinstance(data, dict) else None
+            return (code, row['time']) if code in {60085, 85010} else None
         except (ValueError, TypeError):
-            return False
+            return None
+
+    def create_rejection_code(self, cycle_id: str, step: str) -> int | None:
+        details = self.create_rejection_details(cycle_id, step)
+        return details[0] if details else None
+
+    def reverse_daily_limit_rejected(self, cycle_id: str) -> bool:
+        return self.create_rejection_code(cycle_id, 'reverse_create') == 60085
 
     def forward_paid_browser_preflight_timeout(self, cycle_id: str) -> bool:
         """Recognize only the legacy read timeout before the first mark-paid call."""
@@ -197,14 +207,22 @@ class Journal:
     def pending_sales(self) -> list[dict]:
         return [dict(r) for r in self.db.execute("""SELECT sales.*,
             COALESCE(json_extract(cycles.spec, '$.p2_profile'), 'default') AS p2_profile,
-            json_extract(cycles.spec, '$.nicknames.p2') AS p2_nickname
+            json_extract(cycles.spec, '$.nicknames.p2') AS p2_nickname,
+            COALESCE(json_extract(cycles.spec, '$.p1_profile'), 'p1') AS p1_profile,
+            json_extract(cycles.spec, '$.nicknames.p1') AS p1_nickname,
+            json_extract(cycles.spec, '$.members.p2') AS p2_member_id,
+            json_extract(cycles.spec, '$.scheduler_mode') AS scheduler_mode
             FROM sales JOIN cycles ON cycles.id=sales.cycle_id
             WHERE sales.sent=0 ORDER BY sales.id""")]
 
     def sales(self) -> list[dict]:
         return [dict(r) for r in self.db.execute("""SELECT sales.*,
             COALESCE(json_extract(cycles.spec, '$.p2_profile'), 'default') AS p2_profile,
-            json_extract(cycles.spec, '$.nicknames.p2') AS p2_nickname
+            json_extract(cycles.spec, '$.nicknames.p2') AS p2_nickname,
+            COALESCE(json_extract(cycles.spec, '$.p1_profile'), 'p1') AS p1_profile,
+            json_extract(cycles.spec, '$.nicknames.p1') AS p1_nickname,
+            json_extract(cycles.spec, '$.members.p2') AS p2_member_id,
+            json_extract(cycles.spec, '$.scheduler_mode') AS scheduler_mode
             FROM sales JOIN cycles ON cycles.id=sales.cycle_id ORDER BY sales.id""")]
 
     def sale_delivered(self, sale_id: int):

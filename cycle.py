@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import asyncio
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from getpass import getpass
 import hashlib
 import json
+import math
 import random
 import uuid
 from typing import Callable
@@ -31,6 +33,10 @@ PAYMENT_START_STATES = {"forward": {"NOT_PAID"}, "reverse": {"NOT_PAID", "PROCES
 
 class Paused(RuntimeError):
     pass
+
+
+class CashVolumeLimitReached(Paused):
+    """A cash first-order preflight rejected an order before submission."""
 
 
 class OperatorStopped(Paused):
@@ -159,15 +165,57 @@ def fingerprint(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
+def steps_for_spec(spec: dict) -> list[Step]:
+    if spec.get('scheduler_mode') == 'cash_volume' and spec.get('cash_return_route') == 'network':
+        # The scheduler performs the saved, reconciled wallet return after the
+        # confirmed first leg. No reverse P2P order is created on this route.
+        return STEPS[:9]
+    if spec.get('reverse_maker', 'p1') != 'p2':
+        if spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}:
+            result = []
+            for step in STEPS:
+                if step.key in {'forward_paid', 'reverse_paid'}:
+                    result.append(Step(step.key.replace('_paid', '_wait_paid'), 'both',
+                                       'Ожидание перед отметкой оплаты'))
+                if step.key in {'forward_release', 'reverse_release'}:
+                    result.append(Step(step.key.replace('_release', '_wait_release'), 'both',
+                                       'Ожидание перед подтверждением получения денег'))
+                result.append(step)
+            return result
+        return STEPS
+    steps = STEPS[:9] + [
+        Step('reverse_replenish_sell', 'p2', 'П2 пополняет своё объявление продажи USDT'),
+        Step('reverse_ad', 'p2', 'Проверка объявления продажи USDT у П2'),
+        Step('reverse_create', 'p1', 'П1 покупает USDT по объявлению П2'),
+        Step('reverse_verify', 'both', 'Сверка обратной сделки и участников'),
+        Step('reverse_message', 'p1', 'П1 пишет продавцу'),
+        Step('reverse_reply', 'p2', 'П2 отвечает покупателю'),
+    ]
+    steps.append(Step('reverse_check', 'p2', 'П2 проверяет документы покупателя'))
+    if spec.get('scheduler_mode') == 'cash_volume':
+        steps.append(Step('reverse_wait_paid', 'both', 'Ожидание перед оплатой обратного ордера'))
+    steps.append(Step('reverse_paid', 'p1', 'П1 оплачивает сделку и отмечает оплату'))
+    if spec.get('scheduler_mode') == 'cash_volume':
+        steps.append(Step('reverse_wait_release', 'both', 'Ожидание перед подтверждением получения денег'))
+    steps += [
+        Step('reverse_release', 'p2', 'П2 проверяет получение денег и выпускает USDT'),
+        Step('reverse_complete', 'both', 'Обратная сделка завершена, USDT получены П1'),
+        Step('reverse_replenish', 'p1', 'П1 пополняет исходное объявление продажи полученными USDT'),
+    ]
+    return steps
+
+
 def new_spec(console: Console, mode: str, profiles: dict[str, str], *,
-             sell_adv_no: str = "", buy_adv_no: str = "", amount_input: str = "", automatic: bool = False) -> dict:
+             sell_adv_no: str = "", buy_adv_no: str = "", amount_input: str = "", automatic: bool = False,
+             reverse_maker: str = 'p1', p1_profile: str = 'p1') -> dict:
     amount, fiat = purchase_amount(amount_input) if amount_input else console.ask(
         "Сумма покупки П2 (например 1000 RUB; без валюты — RUB)", validate=purchase_amount)
     console.write(f"П2 купит у П1 USDT на {amount} {fiat}.")
     adv_no = sell_adv_no.strip() or console.ask("Номер готового объявления П1 о продаже USDT (advNo)")
     return {"mode": mode, "amount": amount, "fiat": fiat, "profiles": profiles,
             "forward_adv_no": adv_no, "reverse_adv_no": buy_adv_no.strip(), "automatic": automatic,
-            "buy_replenish": True}
+            "buy_replenish": reverse_maker == 'p1', 'reverse_maker': reverse_maker,
+            'p1_profile': p1_profile}
 
 
 def auto_plan(args, env: dict) -> dict:
@@ -215,7 +263,8 @@ async def run_series(runner, cycle_id: str):
                                  f"Продолжение: cycle --resume {cycle_id}")
         await runner.run(cycle_id)
         if not runner.automatic or not series or series["index"] >= series["count"]:
-            if runner.automatic and series and series["index"] == series["count"]:
+            if (runner.automatic and series and series["index"] == series["count"]
+                    and runner.journal.cycle(cycle_id)['status'] == 'completed'):
                 runner.console.write(f"Серия завершена: {series['count']} циклов.")
             return
         if (runner.journal.cycle(cycle_id)["status"] != "completed"
@@ -236,7 +285,8 @@ class CycleRunner:
                  pay_method_id: str = "", automatic: bool = False, delay_seconds: float = 20,
                  trusted_members: dict | None = None, p1_over_verify: str = "",
                  trusted_nicknames: dict | None = None, delay_max_seconds: float | None = None,
-                 p2_profile: str = "default", stop_event: asyncio.Event | None = None):
+                 p2_profile: str = "default", stop_event: asyncio.Event | None = None,
+                 p1_profile: str = 'p1', maker_browser=None):
         self.journal = journal
         self.reporter = reporter
         self.clients = clients
@@ -245,6 +295,8 @@ class CycleRunner:
         self.p2_payment_id = p2_payment_id.strip()
         self.p2_profile = p2_profile
         self.browser = browser
+        self.maker_browser = maker_browser
+        self.p1_profile = p1_profile
         self.pay_method_id = positive_id(pay_method_id) if pay_method_id else None
         self.automatic = automatic
         self.delay_seconds = action_delay(str(delay_seconds))
@@ -258,6 +310,12 @@ class CycleRunner:
         self.spec: dict = {}
         self._last_reported: dict = {}
         self.stop_event = stop_event
+
+    def steps(self) -> list[Step]:
+        return steps_for_spec(self.spec)
+
+    def browser_for_step(self, step: Step):
+        return self.maker_browser if step.key == 'reverse_check' else self.browser
 
     def check_stop(self):
         if self.stop_event is not None and self.stop_event.is_set():
@@ -283,7 +341,73 @@ class CycleRunner:
         order = self.result(f"{leg}_create")
         return {"amount": detail.get("amount", self.spec["amount"] if leg == "forward" else ""),
                 "fiat": self.spec["fiat"], "quantity": detail.get("quantity", ""),
-                "order_no": order.get("order_no", "")}
+                 "order_no": order.get("order_no", "")}
+
+    def select_cash_reverse_route(self) -> bool:
+        """Freeze the return route after the exchange confirms the first sale."""
+        if self.spec.get('scheduler_mode') != 'cash_volume' or self.spec.get('cash_route_selected'):
+            return False
+        sale = self.result('forward_complete')
+        if not sale:
+            raise Paused('Нельзя выбрать обратный маршрут до подтверждения первой продажи')
+        from rollover import load_state, save_state
+        from volume_policy import (TARGET_USDT, CEILING_USDT, CASH_CEILING_USDT,
+                                   record_purchase, rolling_cash_purchases)
+        scheduler = load_state(self.journal)
+        if (not scheduler or scheduler.get('mode') != 'cash_volume'
+                or self.p2_profile not in scheduler.get('profiles', [])
+                or scheduler.get('p1_profile') != self.p1_profile):
+            raise Paused('Режим и участники сохранённой серии изменились; обратный маршрут не выбран')
+        row = self.journal.db.execute(
+            "SELECT time FROM events WHERE cycle_id=? AND step='forward_create' "
+            "AND status='done' ORDER BY id LIMIT 1", (self.cycle_id,)).fetchone()
+        at = datetime.fromisoformat(row['time']) if row else datetime.now(timezone.utc)
+        if self.spec.get('cash_policy') == 'rolling24_p1':
+            window = rolling_cash_purchases(self.journal, self.p2_profile,
+                                            member_id=self.trusted_members.get('p2'))
+            spec = dict(self.spec, cash_route_selected=True,
+                        cash_volume_at_route=window['quantity'],
+                        reverse_maker='p1', buy_replenish=True,
+                        cash_return_route='ordinary',
+                        reverse_adv_no=self.spec['cash_p1_buy_adv_no'])
+            with self.journal.db:
+                self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?',
+                                        (json.dumps(spec), self.cycle_id))
+            self.spec = spec
+            over_limit = Decimal(window['quantity']) > CASH_CEILING_USDT
+            self.journal.transition(self.cycle_id, 'cash_route', 'system', 'done',
+                ('⚠️ Скользящий объём превысил 70 000 USDT; обратную сделку завершить, '
+                 'новые покупки П2 заблокированы' if over_limit else
+                 'Обычный обратный ордер: П2 продаёт USDT в объявление покупки П1'),
+                result={'reverse_maker': 'p1', 'return_route': 'ordinary',
+                        'volume_usdt': window['quantity'], 'limit_breached': over_limit})
+            return True
+        window = record_purchase(scheduler, self.p2_profile, self.cycle_id, sale['quantity'], at)
+        save_state(self.journal, scheduler)
+        # Finish within the agreed 70–71k band, before the next ordinary
+        # order of this size could cross the hard ceiling.
+        total = Decimal(window['quantity'])
+        final = total >= TARGET_USDT or total + Decimal(sale['quantity']) > CEILING_USDT
+        network = final and self.spec.get('cash_final_return', 'p2p') == 'network'
+        spec = dict(self.spec, cash_route_selected=True,
+                     cash_volume_at_route=window['quantity'],
+                     cash_third_order_at=window.get('third_order_at'),
+                     reverse_maker='p2' if final and not network else 'p1',
+                     buy_replenish=not final,
+                     cash_return_route='network' if network else 'p2p' if final else 'ordinary',
+                     reverse_adv_no=(self.spec['cash_p2_sell_adv_no'] if final
+                                     and not network else self.spec['cash_p1_buy_adv_no']))
+        with self.journal.db:
+            self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?',
+                                    (json.dumps(spec), self.cycle_id))
+        self.spec = spec
+        self.journal.transition(self.cycle_id, 'cash_route', 'system', 'done',
+            ('Достигнут порог объёма; последний остаток вернётся через сеть после сверки вывода'
+             if network else 'Достигнут порог объёма; П1 выкупит последний ордер через объявление П2'
+             if final else 'Обычный цикл: П2 продаст USDT в объявление покупки П1'),
+            result={'reverse_maker': spec['reverse_maker'], 'return_route': spec['cash_return_route'],
+                    'volume_usdt': window['quantity']})
+        return True
 
     async def event(self, step: Step, status: str, message: str, result: dict | None = None,
                     cycle_status: str | None = None):
@@ -299,6 +423,8 @@ class CycleRunner:
         self._last_reported.clear()
         if self.spec.get("p2_profile", "default") != self.p2_profile:
             raise ValueError("Профиль П2 не совпадает с сохранённым циклом")
+        if self.spec.get('p1_profile', 'p1') != self.p1_profile:
+            raise ValueError('Профиль П1 не совпадает с сохранённым циклом')
         if "p2_payment_id" in self.spec and self.spec["p2_payment_id"] != self.p2_payment_id:
             raise ValueError("Реквизиты П2 изменились; верните настройки начатого цикла")
         if self.spec.get("members") and self.spec["members"] != self.trusted_members:
@@ -313,6 +439,13 @@ class CycleRunner:
             raise ValueError("Для проверки П2 нужен точный MEXC_P2_NICKNAME")
         if cycle["status"] == "abandoned":
             raise ValueError("Этот цикл сброшен. Для нового цикла используйте команду cycle.")
+        if self.spec.get('cash_return_route') == 'network' and self.result('forward_complete'):
+            returned = self.journal.step(cycle_id, 'cash_network_return')
+            if cycle['status'] == 'completed' and returned and returned['status'] == 'done':
+                self.console.write('Вывод через сеть уже завершён. Повторных операций не будет.')
+                return
+            raise Paused('Последняя покупка подтверждена; вывод через сеть выполняет сохранённая серия. '
+                         'Продолжите серию через Telegram, не повторяйте цикл отдельно.')
         if (cycle["status"] == "completed" and self.result("reverse_replenish")
                 and (not self.spec.get("buy_replenish") or self.result("reverse_replenish_buy"))):
             self.console.write("Этот цикл уже завершён. Повторных операций не будет.")
@@ -332,23 +465,45 @@ class CycleRunner:
         try:
             if self.automatic:
                 await self.guard_participants()
-            for step in STEPS:
+            for step in self.steps():
                 current = step
                 self.check_stop()
+                if step.key in {'forward_wait_paid', 'forward_wait_release',
+                                'reverse_wait_paid', 'reverse_wait_release'}:
+                    saved_wait = self.journal.step(cycle_id, step.key)
+                    if saved_wait and saved_wait['status'] == 'done':
+                        continue
+                    if saved_wait and saved_wait['status'] == 'pending' and saved_wait['result'].get('until'):
+                        until = datetime.fromisoformat(saved_wait['result']['until'])
+                    else:
+                        prefix = 'eflp' if self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'} else 'cash'
+                        lower = float(self.spec.get(prefix + '_wait_min_seconds', 75))
+                        upper = float(self.spec.get(prefix + '_wait_max_seconds', 105))
+                        until = datetime.now(timezone.utc) + timedelta(seconds=random.uniform(lower, upper))
+                        await self.event(step, 'pending', step.label, {'until': until.isoformat()})
+                    while (remaining := (until - datetime.now(timezone.utc)).total_seconds()) > 0:
+                        await self.wait_delay(min(5, remaining))
+                    await self.event(step, 'done', step.label + ': время истекло', {'until': until.isoformat()})
+                    continue
                 if step.key == "reverse_replenish_buy" and not self.spec.get("buy_replenish"):
                     continue
                 saved = self.journal.step(cycle_id, step.key)
-                if (step.key == 'reverse_create' and saved and saved['status'] == 'unknown'
-                        and not saved['result'].get('order_no') and self.journal.reverse_daily_limit_rejected(cycle_id)):
+                legacy_rejection = (self.journal.create_rejection_code(cycle_id, step.key)
+                                    if saved and saved['status'] == 'unknown'
+                                    and not saved['result'].get('order_no') else None)
+                if legacy_rejection:
                     self.journal.transition(cycle_id, step.key, step.actor, 'rejected',
-                        'Восстановлен явный отказ MEXC 60085 из журнала последней попытки',
-                        result={'rejected_code': 60085}, context=self.context(step.key))
+                        f'Восстановлен явный отказ MEXC {legacy_rejection} из журнала последней попытки',
+                        result={'rejected_code': legacy_rejection}, context=self.context(step.key))
                     saved = self.journal.step(cycle_id, step.key)
-                if saved and saved['status'] == 'rejected' and saved['result'].get('rejected_code') == 60085:
+                if (saved and saved['status'] == 'rejected'
+                        and saved['result'].get('rejected_code') in {60085, 85010}):
+                    rejection_message = (self.daily_limit_message() if saved['result']['rejected_code'] == 60085
+                                         else self.ad_rejection_message())
                     if self.automatic:
-                        raise Paused(self.daily_limit_message())
+                        raise Paused(rejection_message)
                     self.console.confirm(
-                        self.daily_limit_message() + "\nПодтвердите, что доступный лимит проверен на MEXC и позволяет эту сделку.",
+                        rejection_message + "\nПодтвердите, что MEXC теперь разрешает эту сделку.",
                         f"ЛИМИТ ПРОВЕРЕН {step.key}")
                     saved = None
                 if saved and saved['status'] == 'rejected' and saved['result'].get('rejected_code') == 700003:
@@ -356,17 +511,18 @@ class CycleRunner:
                     # A later resume may safely create a fresh signed request.
                     saved = None
                 leg, action = step.key.split("_", 1)
-                if step.key == "reverse_replenish_buy":
+                if step.key in {"reverse_replenish_buy", "reverse_replenish_sell"}:
                     action = "replenish"
                 remote = None
-                if (step.key == "forward_check" and saved and saved["status"] == "done"
-                        and self.browser and self.spec["mode"] == "api"
-                        and not self.result("forward_paid")):
+                check_browser = self.browser_for_step(step) if action == 'check' else None
+                if (action == 'check' and saved and saved["status"] == "done"
+                        and check_browser and self.spec["mode"] == "api"
+                        and not self.result(f'{leg}_paid')):
                     fresh = await self.snapshot(leg)
                     verification = None
                     if fresh["state"] == "NOT_PAID":
                         try:
-                            verification = await self.browser.inspect(fresh["order_no"])
+                            verification = await check_browser.inspect(fresh["order_no"])
                         except (AdsPowerTimeout, AdsPowerUnavailable) as exc:
                             raise AdsPowerPreflightUnavailable(str(exc)) from exc
                     if verification is not None and verification not in {"passed", "not_required"}:
@@ -395,6 +551,8 @@ class CycleRunner:
                             else:
                                 raise Paused(f"Состояние MEXC {remote['state']} противоречит сохранённому шагу {step.key}. Проверьте ордер на бирже.")
                 if saved and saved["status"] == "done":
+                    if step.key == 'forward_complete' and self.select_cash_reverse_route():
+                        return
                     continue
                 await self.event(step, "waiting", step.label, cycle_status="active" if action == "replenish" else None)
                 self.console.write(f"\n[{step.key}] {step.label}")
@@ -403,11 +561,11 @@ class CycleRunner:
                 already_applied = remote is not None and remote["state"] in (PAID_STATES if action == "paid" else COMPLETED_STATES)
                 if already_applied:
                     uncertain = True
-                if self.automatic and uncertain and step.key == 'forward_check':
-                    fresh = await self.snapshot('forward')
+                if self.automatic and uncertain and action == 'check':
+                    fresh = await self.snapshot(leg)
                     self.check_state(fresh, {'NOT_PAID'})
                     order_no = fresh['order_no']
-                    state = await self.browser.open_order(order_no)
+                    state = await check_browser.open_order(order_no)
                     if state in {'passed', 'not_required'}:
                         await self.event(step, 'done', 'Проверка документов подтверждена MEXC',
                                          {'order_no': order_no, 'verification': state})
@@ -419,7 +577,7 @@ class CycleRunner:
                     await self.event(step, 'in_flight', 'Повтор нажатия после сверки состояния кнопки',
                                      {'order_no': order_no, 'verification': 'adspower'})
                     try:
-                        await self.browser.approve(order_no)
+                        await check_browser.approve(order_no)
                     except BaseException as exc:
                         self.journal.transition(cycle_id, step.key, step.actor, 'unknown',
                             f'Результат нажатия требует сверки ({type(exc).__name__})',
@@ -433,17 +591,17 @@ class CycleRunner:
                     # against the saved absolute target; never add the increment twice.
                     plan = saved['result']
                     if plan.get('adv_no') and plan.get('target_available'):
-                        ad = await self.clients['p1'].get_ad(plan['adv_no'])
+                        ad = await self.clients[step.actor].get_ad(plan['adv_no'])
                         self.check_replenished(ad, plan)
                         if plan.get('method') == 'quantity_only':
-                            await self.check_browser_ad(plan)
+                            await self.check_browser_ad(plan, browser=self.maker_browser if step.actor == 'p2' else self.browser)
                         await self.event(step, 'done', 'Пополнение подтверждено текущим остатком MEXC', plan)
                         continue
                 if self.automatic and uncertain and not already_applied:
                     raise Paused("Результат предыдущей операции требует сверки. Автоматического повтора нет; продолжите с --interactive.")
                 if uncertain and action == "replenish" and saved["result"].get("rejected_code") in {700002, 60048, 60064}:
                     plan = {k: v for k, v in saved["result"].items() if k != "rejected_code"}
-                    ad = await self.clients["p1"].get_ad(plan["adv_no"])
+                    ad = await self.clients[step.actor].get_ad(plan["adv_no"])
                     if Decimal(str(ad["availableQuantity"])) != Decimal(plan["target_available"]):
                         if self.replenish_plan(ad, plan["adv_no"], plan["quantity"]) != plan:
                             raise Paused("После отказа MEXC объявление изменилось. Повтор пополнения остановлен; требуется сверка.")
@@ -476,7 +634,10 @@ class CycleRunner:
                                        "Предыдущая попытка имеет неизвестный результат. Повторного API-запроса не будет.\n"
                                        "Проверьте MEXC и при необходимости завершите ЭТОТ шаг вручную. "
                                        "Если завершить нельзя, введите STOP.")
-                if self.automatic and action in MUTATING_ACTIONS and not uncertain:
+                paced = (action in {'paid', 'release'}
+                         and (wait_step := self.journal.step(cycle_id, f'{leg}_wait_{action}'))
+                         and wait_step['status'] == 'done')
+                if self.automatic and action in MUTATING_ACTIONS and not uncertain and not paced:
                     remaining = random.uniform(self.delay_seconds, self.delay_max_seconds)
                     self.console.write(f"Пауза {remaining:.2f} сек. перед действием.")
                     while remaining > 0:
@@ -521,11 +682,12 @@ class CycleRunner:
                                    | {'rejected_code': 700003}, context=self.context(step.key))
                         raise
                     if (action == 'create' and isinstance(exc, MexcAPIError)
-                            and exc.code == 60085 and exc.http_status in {200, 400}):
+                            and exc.code in {60085, 85010} and exc.http_status in {200, 400}):
                         self.journal.transition(cycle_id, step.key, step.actor, 'rejected',
-                            'Создание ордера отклонено: дневной лимит MEXC 60085',
-                            result=dict(prepared, rejected_code=60085), context=self.context(step.key))
-                        raise Paused(self.daily_limit_message()) from exc
+                            f'Создание ордера отклонено MEXC: код {exc.code}',
+                            result=dict(prepared, rejected_code=exc.code), context=self.context(step.key))
+                        raise Paused(self.daily_limit_message() if exc.code == 60085
+                                     else self.ad_rejection_message()) from exc
                     # Do not log exception URLs, which may contain API signatures or listen keys.
                     if (action == "replenish" and isinstance(exc, MexcAPIError)
                             and ((exc.code == 700002 and exc.http_status == 400)
@@ -536,6 +698,8 @@ class CycleRunner:
                         context=self.context(step.key), result=payment_context)
                     raise
                 await self.event(step, "done", step.label + (" (сверено вручную)" if uncertain else ""), result)
+                if step.key == 'forward_complete' and self.select_cash_reverse_route():
+                    return
             await self.event(Step("cycle", "both", "Цикл"), "completed", "Цикл завершён", cycle_status="completed")
             await self.close_completed_tabs()
             self.console.write("Цикл завершён.")
@@ -544,7 +708,8 @@ class CycleRunner:
             transient_mexc_read = self.automatic and isinstance(exc, MexcReadUnavailable)
             timestamp_rejected = (self.automatic and isinstance(exc, MexcAPIError)
                                   and exc.code == 700003 and exc.http_status == 400)
-            status = ("waiting" if transient_adspower or transient_mexc_read or timestamp_rejected else
+            status = ("waiting" if transient_adspower or transient_mexc_read or timestamp_rejected
+                      or isinstance(exc, CashVolumeLimitReached) else
                       "stopped" if isinstance(exc, (OperatorStopped, KeyboardInterrupt)) else
                       "paused" if isinstance(exc, (Paused, KeyboardInterrupt)) else "error")
             reason = str(exc) if isinstance(exc, (Paused, MexcAPIError, ValueError)) else type(exc).__name__
@@ -553,7 +718,8 @@ class CycleRunner:
             self.journal.transition(cycle_id, current.key, current.actor, status,
                 f"{current.label}: {reason[:700]}",
                 context=self.context(current.key), cycle_status="paused")
-            if isinstance(exc, Exception) and not (transient_adspower or transient_mexc_read):
+            if isinstance(exc, Exception) and not (transient_adspower or transient_mexc_read
+                                                   or isinstance(exc, CashVolumeLimitReached)):
                 await self.reporter.flush()
             raise
 
@@ -566,6 +732,15 @@ class CycleRunner:
                 + detail + " Проверьте лимит/уровень KYC в MEXC. После снятия ограничения "
                 f"продолжите: cycle --resume {self.cycle_id} --interactive.")
 
+    def ad_rejection_message(self) -> str:
+        sale = self.result('forward_complete')
+        detail = (f' Первая продажа завершена: {sale["quantity"]} USDT; '
+                  'обратный P2P-ордер не создан, требуется сверенный возврат USDT.' if sale else
+                  ' Первая сделка не создана; возврат USDT не нужен.')
+        return (f'MEXC 85010: П2 ({self.p2_profile}) не может создать ордер '
+                'по объявлению П1. Это отказ по конкретному объявлению, а не подтверждённый '
+                'суточный лимит.' + detail)
+
     async def close_completed_tabs(self):
         if not self.browser or self.spec["mode"] != "api":
             return
@@ -575,12 +750,22 @@ class CycleRunner:
         if not all(self.result(key) for key in required):
             return
         try:
-            closed = await self.browser.close_order_tabs([
-                self.result(f"{leg}_create")["order_no"] for leg in ("forward", "reverse")])
+            orders = [self.result(f"{leg}_create")["order_no"] for leg in ("forward", "reverse")]
+            closed = await self.browser.close_order_tabs(orders)
+            if self.maker_browser and self.spec.get('reverse_maker') == 'p2':
+                closed += await self.maker_browser.close_order_tabs(orders)
             self.console.write(f"Закрыто вкладок завершённых ордеров: {closed}.")
         except Exception as exc:
             # Trading is already completed; tab cleanup must not cause a replay.
             self.console.write(f"Цикл завершён, но вкладки закрыть не удалось ({type(exc).__name__}).")
+        if (self.maker_browser and self.spec.get('reverse_maker') == 'p2'
+                and getattr(self.maker_browser, 'profile_id', None)
+                != getattr(self.browser, 'profile_id', None)):
+            try:
+                await self.maker_browser.stop_profile()
+                self.console.write('Временный профиль П2 AdsPower закрыт.')
+            except Exception as exc:
+                self.console.write(f'Цикл завершён, но профиль П2 закрыть не удалось ({type(exc).__name__}).')
 
     async def guard_participants(self):
         """Only our saved order IDs; unrelated orders never enter this workflow."""
@@ -606,7 +791,10 @@ class CycleRunner:
         if self.spec["mode"] == "api":
             details = {}
             for actor in ("p1", "p2"):
-                detail = await self.clients[actor].get_order_detail(order_no)
+                try:
+                    detail = await self.clients[actor].get_order_detail(order_no)
+                except MexcReadUnavailable as exc:
+                    raise MexcReadUnavailable(f'Чтение ордера через {actor}: {exc}') from exc
                 if str(detail.get("advOrderNo", "")) != order_no:
                     raise ValueError("API вернул другой номер ордера; продолжение заблокировано")
                 self.check_counterparty(detail, actor, order_no)
@@ -634,8 +822,18 @@ class CycleRunner:
                     previous.get("quantity", self.result("forward_complete").get("quantity", "")), money)}
         if leg == "forward" and Decimal(snapshot["amount"]) != Decimal(self.spec["amount"]):
             raise ValueError("Сумма первой сделки не совпадает с согласованной")
-        if leg == "reverse" and Decimal(snapshot["quantity"]) != Decimal(self.result("forward_complete")["quantity"]):
-            raise ValueError("Обратная сделка должна продавать количество USDT, полученное в первой")
+        if leg == "reverse":
+            expected_quantity = Decimal(self.result("forward_complete")["quantity"])
+            actual_quantity = Decimal(snapshot["quantity"])
+            residual = expected_quantity - actual_quantity
+            if self.spec.get('reverse_maker') == 'p2':
+                # A P1 BUY order is submitted in fiat cents; MEXC can round the
+                # resulting USDT down by a fraction of a cent's worth.
+                if residual < 0 or residual > Decimal('0.0003'):
+                    raise ValueError('Обратная сделка не покрывает первую; требуется сверка остатка USDT П2')
+                snapshot['residual_usdt'] = str(residual)
+            elif residual != 0:
+                raise ValueError("Обратная сделка должна продавать количество USDT, полученное в первой")
         prior = self.result(f"{leg}_verify")
         if prior and any(Decimal(snapshot[k]) != Decimal(prior[k]) for k in ("amount", "quantity")):
             raise ValueError("Параметры сделки изменились после сверки")
@@ -685,21 +883,24 @@ class CycleRunner:
 
     async def prepare(self, step: Step, *, recovery: bool) -> dict:
         leg, action = step.key.split("_", 1)
-        if step.key == "reverse_replenish_buy":
+        if step.key in {"reverse_replenish_buy", "reverse_replenish_sell"}:
             action = "replenish"
         manual = self.spec["mode"] == "manual" or recovery
         ctx = self.context(step.key)
         if action == "replenish":
-            snapshot = await self.snapshot("reverse")
+            maker_preparation = step.key == 'reverse_replenish_sell'
+            snapshot = await self.snapshot("forward" if maker_preparation else "reverse")
             self.check_state(snapshot, COMPLETED_STATES)
-            quantity = money(self.result("reverse_complete")["quantity"])
+            quantity = money(self.result("forward_complete" if maker_preparation else "reverse_complete")["quantity"])
             buy_ad = step.key == "reverse_replenish_buy"
-            adv_no = self.result("reverse_ad" if buy_ad else "forward_ad")["adv_no"]
+            adv_no = (self.spec['reverse_adv_no'] if maker_preparation else
+                      self.result("reverse_ad" if buy_ad else "forward_ad")["adv_no"])
+            browser = self.maker_browser if maker_preparation else self.browser
             if self.spec["mode"] == "manual":
                 self.console.confirm(f"На MEXC добавьте {quantity} USDT к остатку объявления {adv_no}. "
                                      "Если уже добавили, повторно не пополняйте.", f"ПОПОЛНЕНО {adv_no}")
                 return {"adv_no": adv_no, "quantity": quantity}
-            ad = await self.clients["p1"].get_ad(adv_no)
+            ad = await self.clients[step.actor].get_ad(adv_no)
             if recovery:
                 saved = self.journal.step(self.cycle_id, step.key)["result"]
                 # Old attempts stored the cumulative target; recover the available target
@@ -710,12 +911,12 @@ class CycleRunner:
                 saved.pop("target_quantity", None)
                 self.check_replenished(ad, saved)
                 if saved.get('method') == 'quantity_only':
-                    await self.check_browser_ad(saved)
+                    await self.check_browser_ad(saved, browser=browser)
                 self.console.write(f"Доступный остаток объявления соответствует цели {saved['target_available']} USDT. "
                                    "Проверьте пополнение на MEXC; повторного запроса не будет.")
                 return saved
-            plan = (await self.quantity_plan(ad, adv_no, quantity, side="BUY" if buy_ad else "SELL")
-                    if buy_ad or ad.get('overVerify') is None else self.replenish_plan(ad, adv_no, quantity))
+            plan = (await self.quantity_plan(ad, adv_no, quantity, side="BUY" if buy_ad else "SELL", browser=browser)
+                    if maker_preparation or buy_ad or ad.get('overVerify') is None else self.replenish_plan(ad, adv_no, quantity))
             self.console.write(f"Объявление {adv_no}: сейчас {plan['before_available']} USDT, добавить {quantity} USDT. "
                                f"Ожидаемый доступный остаток: {plan['target_available']} USDT.\n"
                                f"Статус объявления: {ad.get('advStatus', 'неизвестен')}; публикация этим шагом не выполняется.")
@@ -725,20 +926,24 @@ class CycleRunner:
                                    "Подтверждение ниже разрешает и пополнение, и изменение максимума. Минимальный лимит сохраняется.")
             return plan
         if action == "ad":
-            direction = "ПРОДАЖА USDT: П1 — продавец" if leg == "forward" else "ПОКУПКА USDT: П1 — покупатель"
-            self.console.write(f"Используем готовое объявление П1. {direction}.\n"
+            p2_maker = leg == 'reverse' and self.spec.get('reverse_maker') == 'p2'
+            direction = ("ПРОДАЖА USDT: П1 — продавец" if leg == "forward" else
+                         "ПРОДАЖА USDT: П2 — продавец" if p2_maker else
+                         "ПОКУПКА USDT: П1 — покупатель")
+            self.console.write(f"Используем готовое объявление {'П2' if p2_maker else 'П1'}. {direction}.\n"
                                "Проверьте владельца, валюту, цену, лимиты, доступный остаток и способ оплаты.")
             adv_no = self.spec.get(f"{leg}_adv_no")
             if not adv_no:
                 adv_no = self.console.ask("Номер готового объявления П1 (advNo)")
             if self.automatic:
-                ad = await self.clients["p1"].get_ad(adv_no)
-                if (ad.get("advNo") != adv_no or ad.get("side") != ("SELL" if leg == "forward" else "BUY")
+                ad = await self.clients[step.actor].get_ad(adv_no)
+                if (ad.get("advNo") != adv_no or ad.get("side") != ("SELL" if leg == "forward" or p2_maker else "BUY")
                         or ad.get("coinName") != "USDT" or ad.get("fiatUnit") != self.spec["fiat"]):
-                    raise Paused("Объявление П1 не соответствует стороне сделки, токену или валюте")
-                if leg == "forward":
+                    raise Paused("Объявление не соответствует владельцу, стороне сделки, токену или валюте")
+                if leg == "forward" or p2_maker:
                     # A configured fallback is not evidence that the live checkbox is on.
-                    actual = await self.browser.ad_details(adv_no) if ad.get('overVerify') is None else ad
+                    browser = self.maker_browser if p2_maker else self.browser
+                    actual = await browser.ad_details(adv_no) if ad.get('overVerify') is None else ad
                     ad_verification(actual)
             if leg == "forward":
                 self.console.write(f"Объявление: {adv_no}. Покупатель: П2. Сумма покупки: {self.spec['amount']} {self.spec['fiat']}.")
@@ -753,10 +958,42 @@ class CycleRunner:
                 return {"order_no": order_no}
             args = {"adv_no": self.result(f"{leg}_ad")["adv_no"]}
             if leg == "forward":
+                if self.spec.get('cash_policy') == 'rolling24_p1':
+                    from volume_policy import (CASH_TARGET_USDT, CASH_CEILING_USDT,
+                                               rolling_cash_purchases)
+                    live_ad = await self.clients['p1'].get_ad(args['adv_no'])
+                    price = Decimal(str(live_ad.get('price', 'NaN')))
+                    if (live_ad.get('advNo') != args['adv_no'] or live_ad.get('side') != 'SELL'
+                            or live_ad.get('advStatus') != 'OPEN' or not price.is_finite()
+                            or price <= 0):
+                        raise Paused('Объявление П1 изменилось; первая покупка не отправлена')
+                    window = rolling_cash_purchases(self.journal, self.p2_profile,
+                                                     member_id=self.trusted_members.get('p2'))
+                    projected = Decimal(self.spec['amount']) / price * Decimal('1.005')
+                    if (window.get('uncertain_until')
+                            or Decimal(window['quantity']) >= CASH_TARGET_USDT
+                            or Decimal(window['quantity']) + projected > CASH_CEILING_USDT):
+                        raise CashVolumeLimitReached('Скользящий объём П2 достиг лимита 69–70 тыс. USDT; '
+                                                     'новая покупка не отправлена')
                 self.console.write(f"После подтверждения П2 откроет сделку по объявлению {args['adv_no']} "
                                    f"на {self.spec['amount']} {self.spec['fiat']}.")
                 args.update(amount=self.spec["amount"], user_confirm_pay_method_id=self.pay_method_id or self.console.ask(
                     "ID способа оплаты из объявления (не номер карты)", validate=positive_id))
+            elif self.spec.get('reverse_maker') == 'p2':
+                ad = await self.clients['p2'].get_ad(args['adv_no'])
+                price = Decimal(str(ad.get('price', 'NaN')))
+                quantity = Decimal(self.result('forward_complete')['quantity'])
+                available = Decimal(str(ad.get('availableQuantity', 'NaN')))
+                if (not price.is_finite() or price <= 0 or not available.is_finite()
+                        or available < quantity):
+                    raise Paused('Объявление продажи П2 не покрывает количество обратной сделки')
+                amount = (price * quantity).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+                minimum = Decimal(str(ad.get('minSingleTransAmount', 'NaN')))
+                maximum = Decimal(str(ad.get('maxSingleTransAmount', 'NaN')))
+                if (not minimum.is_finite() or not maximum.is_finite()
+                        or not minimum <= amount <= maximum):
+                    raise Paused('Сумма обратной сделки вне лимитов объявления П2; настройте объявление или разделите возврат')
+                args.update(amount=str(amount), user_confirm_pay_method_id=self.pay_method_id)
             else:
                 if self.p2_payment_id:
                     payment_id = positive_id(self.p2_payment_id)
@@ -791,21 +1028,22 @@ class CycleRunner:
                 self.console.write(f"Отправьте этот текст в чат ордера {ctx['order_no']} от имени {step.actor}.")
             return {"order_no": ctx["order_no"], "text": text}
         if action == "check":
-            if self.browser and self.spec["mode"] == "api" and recovery:
-                if await self.browser.inspect(ctx["order_no"]) not in {"passed", "not_required"}:
+            browser = self.browser_for_step(step)
+            if browser and self.spec["mode"] == "api" and recovery:
+                if await browser.inspect(ctx["order_no"]) not in {"passed", "not_required"}:
                     raise Paused("Предыдущее нажатие не подтверждено страницей MEXC. Завершите проверку на сайте; повторного нажатия не будет.")
-            if self.browser and not manual:
+            if browser and not manual:
                 self.check_state(await self.snapshot(leg), {"NOT_PAID"})
-                state = await self.browser.open_order(ctx["order_no"])
+                state = await browser.open_order(ctx["order_no"])
                 if state == "not_required":
                     self.console.write("MEXC явно сообщает: дополнительная проверка для этого ордера не требуется.")
                     return {"order_no": ctx['order_no'], "verification": "not_required"}
                 self.console.confirm(f"Проверьте документы по ордеру {ctx['order_no']}. "
-                    "После подтверждения бот нажмёт «Проверка пройдена» в профиле П1 AdsPower.\n"
+                    f"После подтверждения бот нажмёт «Проверка пройдена» в профиле {step.actor.upper()} AdsPower.\n"
                     + ("На странице уже показано ожидание оплаты; повторного нажатия не будет." if state == "passed" else ""),
                     f"ДОКУМЕНТЫ ПРОВЕРЕНЫ {ctx['order_no']}")
                 return {"order_no": ctx["order_no"], "verification": "adspower"}
-            self.console.confirm(f"В аккаунте П1 выполните проверку продавца по ордеру {ctx['order_no']} "
+            self.console.confirm(f"В аккаунте {step.actor.upper()} выполните проверку продавца по ордеру {ctx['order_no']} "
                 "и нажмите на MEXC «Проверка пройдена».\nПодтвердите, что действие выполнено на бирже.",
                 f"ПРОВЕРКА ПРОЙДЕНА {ctx['order_no']}")
             return {"order_no": ctx["order_no"], "verification": "seller_check_completed_on_mexc"}
@@ -856,7 +1094,7 @@ class CycleRunner:
 
     async def execute(self, step: Step, data: dict, *, recovery: bool) -> dict:
         leg, action = step.key.split("_", 1)
-        if step.key == "reverse_replenish_buy":
+        if step.key in {"reverse_replenish_buy", "reverse_replenish_sell"}:
             action = "replenish"
         if self.spec["mode"] == "manual":
             return data
@@ -868,17 +1106,20 @@ class CycleRunner:
             if action in {"message", "reply"}:
                 await self.snapshot(leg)
         if action == "replenish":
-            self.check_state(await self.snapshot("reverse"), COMPLETED_STATES)
-            ad = await self.clients["p1"].get_ad(data["adv_no"])
+            maker_preparation = step.key == 'reverse_replenish_sell'
+            self.check_state(await self.snapshot("forward" if maker_preparation else "reverse"), COMPLETED_STATES)
+            client = self.clients[step.actor]
+            browser = self.maker_browser if maker_preparation else self.browser
+            ad = await client.get_ad(data["adv_no"])
             if recovery:
                 self.check_replenished(ad, data)
                 if data.get('method') == 'quantity_only':
-                    await self.check_browser_ad(data)
+                    await self.check_browser_ad(data, browser=browser)
                 return data
             if data.get('method') == 'quantity_only':
                 try:
                     current = await self.quantity_plan(ad, data['adv_no'], data['quantity'],
-                                                       side=data.get('side', 'SELL'))
+                                                       side=data.get('side', 'SELL'), browser=browser)
                 except AdsPowerUnavailable as exc:
                     raise AdsPowerPreflightUnavailable(str(exc)) from None
                 if ('target_total' in data and 'target_total' in current):
@@ -889,16 +1130,16 @@ class CycleRunner:
                 if not same:
                     raise Paused("Объявление изменилось после подтверждения; пополнение не отправлено")
                 try:
-                    await self.browser.replenish_ad(data)
+                    await browser.replenish_ad(data)
                 except AdsPowerUnavailable as exc:
                     raise AdsPowerPreflightUnavailable(str(exc)) from None
-                self.check_replenished(await self.clients['p1'].get_ad(data['adv_no']), data)
-                await self.check_browser_ad(data)
+                self.check_replenished(await client.get_ad(data['adv_no']), data)
+                await self.check_browser_ad(data, browser=browser)
                 return data
             if self.replenish_plan(ad, data["adv_no"], data["quantity"]) != data:
                 raise Paused("Объявление изменилось после подтверждения. Пополнение не отправлено; проверьте его на MEXC.")
-            await self.clients["p1"].replenish_ad(ad | {"overVerify": data["over_verify"]}, data["quantity"])
-            self.check_replenished(await self.clients["p1"].get_ad(data["adv_no"]), data)
+            await client.replenish_ad(ad | {"overVerify": data["over_verify"]}, data["quantity"])
+            self.check_replenished(await client.get_ad(data["adv_no"]), data)
             return data
         # Recheck after console input: the order may have changed while the operator was reading.
         if action in {"paid", "release", "complete"}:
@@ -906,18 +1147,19 @@ class CycleRunner:
             if recovery or action == "complete":
                 expected = PAID_STATES if action == "paid" else COMPLETED_STATES
             self.check_state(await self.snapshot(leg), expected)
-        if recovery and action == "check" and self.browser:
-            if await self.browser.inspect(data["order_no"]) not in {"passed", "not_required"}:
+        check_browser = self.browser_for_step(step) if action == 'check' else None
+        if recovery and action == "check" and check_browser:
+            if await check_browser.inspect(data["order_no"]) not in {"passed", "not_required"}:
                 raise Paused("Страница MEXC не подтверждает завершение проверки документов")
         if recovery:
             return data
         if action == "check" and data.get("verification") == "not_required":
-            if await self.browser.inspect(data['order_no']) != 'not_required':
+            if await check_browser.inspect(data['order_no']) != 'not_required':
                 raise Paused("Требование проверки изменилось; продолжение остановлено")
             return data
         if action == "check" and data.get("verification") == "adspower":
             self.check_state(await self.snapshot(leg), {"NOT_PAID"})
-            await self.browser.approve(data["order_no"])
+            await check_browser.approve(data["order_no"])
             return {"order_no": data["order_no"], "verification": "seller_check_completed_on_mexc"}
         client = self.clients[step.actor] if step.actor != "both" else None
         if action == "create":
@@ -928,9 +1170,11 @@ class CycleRunner:
             # Placeholder until a verified read-receipt mechanism is configured.
             data["chat_read"] = await self.clients[receiver].mark_chat_read(data["order_no"])
         elif action == "paid":
-            if leg == "forward" and self.browser:
+            seller_browser = (self.browser if leg == 'forward' else self.maker_browser
+                              if self.spec.get('reverse_maker') == 'p2' else None)
+            if seller_browser:
                 try:
-                    verification = await self.browser.inspect(data["order_no"])
+                    verification = await seller_browser.inspect(data["order_no"])
                 except (AdsPowerTimeout, AdsPowerUnavailable) as exc:
                     raise AdsPowerPreflightUnavailable(str(exc)) from exc
                 if verification not in {"passed", "not_required"}:
@@ -942,10 +1186,11 @@ class CycleRunner:
             self.check_state(await self.snapshot(leg), COMPLETED_STATES)
         return {k: v for k, v in data.items() if k != "notify_code"}
 
-    async def check_browser_ad(self, plan: dict):
-        if not self.browser:
+    async def check_browser_ad(self, plan: dict, browser=None):
+        browser = browser or self.browser
+        if not browser:
             raise Paused("Для пополнения без сброса настроек нужен открытый профиль П1 AdsPower")
-        actual = await self.browser.ad_details(plan['adv_no'])
+        actual = await browser.ad_details(plan['adv_no'])
         verification = (json.dumps(actual.get('overVerify'), sort_keys=True, ensure_ascii=False)
                         if plan.get('side') == 'BUY' else ad_verification(actual))
         if 'target_total' in plan:
@@ -957,10 +1202,11 @@ class CycleRunner:
         if str(actual.get('id')) != plan['adv_no'] or verification != plan['over_verify'] or not matched:
             raise Paused("Остаток или дополнительная проверка не совпадают с планом; повторное пополнение запрещено")
 
-    async def quantity_plan(self, ad: dict, adv_no: str, quantity: str, side: str = 'SELL') -> dict:
-        if not self.browser:
+    async def quantity_plan(self, ad: dict, adv_no: str, quantity: str, side: str = 'SELL', browser=None) -> dict:
+        browser = browser or self.browser
+        if not browser:
             raise Paused("API не возвращает настройки проверки. Для пополнения без их сброса нужен AdsPower П1")
-        actual = await self.browser.ad_details(adv_no)
+        actual = await browser.ad_details(adv_no)
         api_frozen = ad.get('frozenQuantity')
         browser_frozen = actual.get('frozenQuantity')
         if api_frozen is not None and browser_frozen is not None:
@@ -1032,7 +1278,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
     import os
     from pathlib import Path
     from contextlib import nullcontext
-    from config import PROJECT_DIR, Settings, p2_prefix, select_p2_profile
+    from config import PROJECT_DIR, Settings, p2_prefix, p2_profile_name, select_p2_profile
     from journal import process_lock
     from logger_setup import setup_logging
     from mexc_client import MexcP2PClient
@@ -1060,7 +1306,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                         print(f"  Серия: цикл {series['index']} из {series['count']}")
                     if row["status"] in {"completed", "abandoned"}:
                         continue
-                    pending = next((s for s in STEPS if not journal.step(row['id'], s.key)
+                    pending = next((s for s in steps_for_spec(spec) if not journal.step(row['id'], s.key)
                                     or journal.step(row['id'], s.key)['status'] != 'done'), None)
                     if pending:
                         print(f"  Следующий шаг: {pending.key} — {pending.label}")
@@ -1104,7 +1350,27 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 return 0 if (not telegram.enabled or not pending['telegram']) and (not sheets or not pending['sales']) else 1
             existing = journal.cycle(args.resume) if args.resume else None
             p2_profile = select_p2_profile(args.p2_profile, existing["spec"] if existing else None, os.environ)
-            prefixes = {"p1": "MEXC_P1", "p2": p2_prefix(p2_profile)}
+            p1_profile = (existing['spec'].get('p1_profile', 'p1') if existing else
+                          getattr(args, 'p1_profile', None) or 'p1')
+            scheduler_mode = (existing['spec'].get('scheduler_mode') if existing else
+                               getattr(args, 'scheduler_mode', None))
+            if scheduler_mode == 'cash_volume':
+                cash_route_setting = (existing['spec'].get('cash_final_return', 'p2p') if existing else
+                                      'ordinary')
+            else:
+                cash_route_setting = None
+            reverse_maker = (existing['spec'].get('reverse_maker', 'p1') if existing else
+                             getattr(args, 'reverse_maker', None) or 'p1')
+            if existing and (getattr(args, 'p1_profile', None) not in {None, p1_profile}
+                             or getattr(args, 'reverse_maker', None) not in {None, reverse_maker}):
+                raise ValueError('Роли участников начатого цикла менять нельзя')
+            if existing and getattr(args, 'scheduler_mode', None) not in {
+                    None, existing['spec'].get('scheduler_mode')}:
+                raise ValueError('Режим сохранённого цикла менять нельзя')
+            if p1_profile != 'p1':
+                p1_profile = p2_profile_name(p1_profile)
+            prefixes = {"p1": "MEXC_P1" if p1_profile == 'p1' else p2_prefix(p1_profile),
+                        "p2": p2_prefix(p2_profile)}
             p2_payment_id = os.getenv(f"{prefixes['p2']}_PAYMENT_ID", "").strip()
             if p2_payment_id:
                 positive_id(p2_payment_id)
@@ -1135,10 +1401,13 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 if not settings.enable_state_changes:
                     raise ValueError("Для API-цикла установите ENABLE_STATE_CHANGES=true в .env")
                 for actor in ("p1", "p2"):
-                    profile = Settings.from_env(actor, p2_profile=p2_profile if actor == "p2" else None)
+                    selected = p1_profile if actor == 'p1' else p2_profile
+                    profile = (Settings.from_env('p1') if selected == 'p1' else
+                               Settings.from_env('p2', p2_profile=selected))
                     profiles[actor] = fingerprint(profile.api_key)
                     clients[actor] = MexcP2PClient(profile.api_key, profile.secret_key, profile.base_url,
-                                                   profile.recv_window, proxy_url=profile.proxy_url)
+                                                   profile.recv_window, proxy_url=profile.proxy_url,
+                                                   timeout_seconds=45 if scheduler_mode == 'cash_volume' and reverse_maker == 'p2' else 20)
                 if profiles["p1"] == profiles["p2"]:
                     raise ValueError("Для П1 и П2 указаны одинаковые API-ключи")
                 if existing and profiles != existing["spec"]["profiles"]:
@@ -1148,39 +1417,108 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
             if not sheets:
                 console.write("Google Таблица не настроена: суммы продаж сохраняются локально до подключения.")
             browser = None
+            maker_browser = None
             if mode == "api" and os.getenv("SELLER_CHECK_MODE", "manual").strip() == "adspower":
                 from adspower import AdsPower
-                browser = AdsPower.from_env()
+                browser = (AdsPower.from_env() if p1_profile == 'p1' else
+                           AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
+                                    os.getenv('ADSPOWER_API_KEY', ''),
+                                    os.getenv(f"{prefixes['p1']}_ADSPOWER_PROFILE_ID", '')))
+                if reverse_maker == 'p2' or (scheduler_mode == 'cash_volume' and cash_route_setting == 'p2p'):
+                    maker_browser = AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
+                                             os.getenv('ADSPOWER_API_KEY', ''),
+                                             os.getenv(f"{prefixes['p2']}_ADSPOWER_PROFILE_ID", ''))
+                if scheduler_mode == 'cash_volume' and reverse_maker == 'p2':
+                    browser.command_timeout = 30
+                    maker_browser.command_timeout = 30
+            browser_ids = ({'p1': browser.profile_id, 'p2': maker_browser.profile_id if maker_browser else ''}
+                           if browser else {})
+            if existing and existing['spec'].get('adspower_profiles') and (
+                    existing['spec']['adspower_profiles'] != browser_ids):
+                raise ValueError('AdsPower-профили участников изменились; продолжение остановлено')
             if automatic:
                 from phrases import PHRASES
                 if not browser:
                     raise ValueError("Для авторежима установите SELLER_CHECK_MODE=adspower")
                 if not all(members.values()) or members["p1"] == members["p2"]:
                     raise ValueError("Для авторежима нужны разные MEXC_P1_MEMBER_ID и MEXC_P2_MEMBER_ID")
-                if not os.getenv("MEXC_P1_SELL_ADV_NO") or not os.getenv("MEXC_P1_BUY_ADV_NO") or not p2_payment_id:
-                    raise ValueError(f"Для авторежима заполните оба номера объявлений и {prefixes['p2']}_PAYMENT_ID")
+                if not os.getenv(f"{prefixes['p1']}_SELL_ADV_NO"):
+                    raise ValueError(f"Заполните {prefixes['p1']}_SELL_ADV_NO")
+                if reverse_maker == 'p1' and (not os.getenv(f"{prefixes['p1']}_BUY_ADV_NO") or not p2_payment_id):
+                    raise ValueError(f"Для старого маршрута нужны {prefixes['p1']}_BUY_ADV_NO и {prefixes['p2']}_PAYMENT_ID")
+                if reverse_maker == 'p2' and (not os.getenv(f"{prefixes['p2']}_SELL_ADV_NO")
+                                               or not maker_browser or not maker_browser.profile_id):
+                    raise ValueError(f"Для нового маршрута заполните {prefixes['p2']}_SELL_ADV_NO и {prefixes['p2']}_ADSPOWER_PROFILE_ID")
+                if scheduler_mode == 'cash_volume' and not os.getenv(f"{prefixes['p1']}_BUY_ADV_NO"):
+                    raise ValueError('Для «Объём наличка» нужно объявление покупки П1')
+                if scheduler_mode == 'cash_volume' and cash_route_setting == 'p2p' and (
+                      not os.getenv(f"{prefixes['p2']}_SELL_ADV_NO")
+                      or not maker_browser or not maker_browser.profile_id):
+                    raise ValueError('Для P2P-возврата нужны объявление продажи П2 и AdsPower П2')
                 for key in ("forward_message", "forward_reply", "reverse_message", "reverse_reply"):
                     if not PHRASES.get(key) or any(not isinstance(t, str) or not t.strip() or len(t) > 2000 for t in PHRASES[key]):
                         raise ValueError(f"Проверьте список фраз {key} в phrases.py")
+                if p1_profile != 'p1':
+                    await browser.ensure_started()
+                await browser.ensure_mexc_page()
                 async with browser.connection() as call:
                     await call("Target.getTargets")
+                if maker_browser and reverse_maker == 'p2':
+                    await maker_browser.ensure_started()
+                    await maker_browser.ensure_mexc_page()
+                    async with maker_browser.connection() as call:
+                        await call('Target.getTargets')
+            cash_wait_min, cash_wait_max = 75.0, 105.0
+            if scheduler_mode == 'cash_volume' and not existing:
+                cash_wait_min = float(os.getenv('CASH_REVERSE_WAIT_MIN_SECONDS', '75'))
+                cash_wait_max = float(os.getenv('CASH_REVERSE_WAIT_MAX_SECONDS', '105'))
+            if scheduler_mode == 'cash_volume' and not existing and (
+                    not math.isfinite(cash_wait_min) or not math.isfinite(cash_wait_max)
+                    or not 1 <= cash_wait_min <= cash_wait_max <= 600):
+                raise ValueError('CASH_REVERSE_WAIT_MIN_SECONDS/MAX_SECONDS: укажите интервал от 1 до 600 секунд')
+            eflp_wait_min, eflp_wait_max = 75.0, 105.0
+            if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing:
+                eflp_wait_min = float(os.getenv('EFLP_WAIT_MIN_SECONDS', '75'))
+                eflp_wait_max = float(os.getenv('EFLP_WAIT_MAX_SECONDS', '105'))
+                if (not math.isfinite(eflp_wait_min) or not math.isfinite(eflp_wait_max)
+                        or not 1 <= eflp_wait_min <= eflp_wait_max <= 600):
+                    raise ValueError('EFLP_WAIT_MIN_SECONDS/MAX_SECONDS: укажите интервал от 1 до 600 секунд')
             amount_input = f"{random_amount(plan)} {plan['fiat']}" if plan else (args.amount or "")
             cycle_id = args.resume or journal.create(new_spec(console, mode, profiles,
-                sell_adv_no=os.getenv("MEXC_P1_SELL_ADV_NO", ""),
-                buy_adv_no=os.getenv("MEXC_P1_BUY_ADV_NO", ""), amount_input=amount_input, automatic=automatic)
+                sell_adv_no=os.getenv(f"{prefixes['p1']}_SELL_ADV_NO", ""),
+                buy_adv_no=os.getenv(f"{prefixes['p2']}_SELL_ADV_NO" if reverse_maker == 'p2'
+                                     else f"{prefixes['p1']}_BUY_ADV_NO", ""),
+                amount_input=amount_input, automatic=automatic,
+                reverse_maker=reverse_maker, p1_profile=p1_profile)
                 | ({"members": members} if all(members.values()) else {})
                 | ({"nicknames": nicknames} if nicknames["p2"] else {})
                 | {"p2_profile": p2_profile, "p2_payment_id": p2_payment_id}
+                | ({'scheduler_mode': args.scheduler_mode} if getattr(args, 'scheduler_mode', None) else {})
+                | ({'cash_route_selected': False,
+                     'cash_final_return': cash_route_setting,
+                    'cash_policy': 'rolling24_p1',
+                    'cash_p1_buy_adv_no': os.getenv(f"{prefixes['p1']}_BUY_ADV_NO", '').strip(),
+                    'cash_p2_sell_adv_no': os.getenv(f"{prefixes['p2']}_SELL_ADV_NO", '').strip(),
+                    'cash_wait_min_seconds': cash_wait_min,
+                    'cash_wait_max_seconds': cash_wait_max}
+                   if scheduler_mode == 'cash_volume' and not existing else {})
+                | ({'eflp_wait_min_seconds': eflp_wait_min,
+                    'eflp_wait_max_seconds': eflp_wait_max}
+                   if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing else {})
+                | ({'adspower_profiles': browser_ids} if browser_ids else {})
                 | ({"series": plan} if plan else {}))
             runner = CycleRunner(journal, reporter, clients, console, state_changes=settings.enable_state_changes,
                                  p2_payment_id=p2_payment_id, p2_profile=p2_profile, browser=browser,
+                                 p1_profile=p1_profile, maker_browser=maker_browser,
                                  pay_method_id=os.getenv("MEXC_PAY_METHOD_ID", "578"), automatic=automatic, delay_seconds=delay_seconds,
                                  trusted_members=members if all(members.values()) else {},
                                  trusted_nicknames=nicknames, delay_max_seconds=delay_max_seconds,
-                                 p1_over_verify=os.getenv("MEXC_P1_OVER_VERIFY", "").strip(), stop_event=stop_event)
+                                 p1_over_verify=os.getenv(f"{prefixes['p1']}_OVER_VERIFY", "").strip(), stop_event=stop_event)
             runner_started = True
             await run_series(runner, cycle_id)
             return 0
+        except CashVolumeLimitReached:
+            raise
         except Paused as exc:
             print(exc)
             return 0

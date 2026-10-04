@@ -23,7 +23,7 @@ headless режим нельзя запускать одновременно. С
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
+sudo apt install -y python3 python3-venv python3-pip xvfb xauth libasound2t64
 python3 --version
 sudo useradd --create-home --shell /bin/bash mexc
 sudo install -d -o mexc -g mexc -m 750 /opt/mexc
@@ -164,6 +164,12 @@ sudo systemctl status mexc@a.service mexc@b.service
 отдельные статусы. После ручной остановки на Windows нажмите «Продолжить» один
 раз на сервере. При следующих рестартах работавшая серия возобновится сама;
 явная остановка кнопкой Telegram сохранит паузу.
+
+Шаблон AdsPower запускает браузер под `xvfb-run`: режим `--headless=true`
+убирает интерфейс приложения, но SunBrowser на сервере без рабочего стола
+может требовать X-дисплей для графического процесса. Проверьте, что `xvfb`
+и `xauth` установлены, а профиль открывается командой
+`.venv/bin/python deploy/start_adspower_profile.py` до запуска бота.
 
 ## 5. Логи не старше двух суток
 
