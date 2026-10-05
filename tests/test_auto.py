@@ -4,9 +4,9 @@ from decimal import Decimal
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from cycle import (AdsPowerPreflightUnavailable, AutoConsole, CycleRunner, Paused,
+from cycle import (AdsPowerPreflightUnavailable, AutoConsole, CycleRunner, Paused, Step,
                    STEPS, MUTATING_ACTIONS, action_delay, delay_bounds)
-from mexc_client import MexcAPIError, MexcReadUnavailable
+from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, MexcReadUnavailable
 from adspower import AdsPowerTimeout, AdsPowerUnavailable
 import test_cycle as fixtures
 
@@ -30,6 +30,20 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
             automatic=True, delay_seconds=20, trusted_members={"p1": "MEMBER-P1", "p2": "MEMBER-P2"},
             trusted_nicknames={"p2": "Trusted-P2"})
         return runner
+
+    async def test_eflp_payment_does_not_require_document_check_button(self):
+        runner = self.runner()
+        runner.spec = dict(self.spec, scheduler_mode='eflp_volume', mode='api')
+        runner.clients['p2'].mark_paid = AsyncMock()
+        with patch.object(runner, 'result', return_value={'order_no': 'ORDER-1'}), \
+                patch.object(runner, 'guard_participants', new=AsyncMock()), \
+                patch.object(runner, 'snapshot', new=AsyncMock(side_effect=[
+                    {'order_no': 'ORDER-1', 'state': 'NOT_PAID'},
+                    {'order_no': 'ORDER-1', 'state': 'PAID'}])):
+            await runner.execute(Step('forward_paid', 'p2', 'paid'),
+                                 {'order_no': 'ORDER-1', 'payment_account_id': 123}, recovery=False)
+        runner.clients['p2'].mark_paid.assert_awaited_once_with('ORDER-1', 123)
+        runner.browser.inspect.assert_not_called()
 
     async def test_p2_maker_return_uses_p2_ad_and_p1_as_buyer(self):
         runner = self.runner()
@@ -165,6 +179,29 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         from phrases import PHRASES
         self.assertIn(saved['result']['text'], PHRASES['forward_message'])
 
+    async def test_reverse_reply_retries_same_text_and_continues_after_proxy_reset(self):
+        runner = self.runner()
+        runner.delay_seconds = runner.delay_max_seconds = 0
+        original = runner.clients['p1'].send_chat_text
+        attempts = []
+
+        async def send(order_no, text):
+            if order_no == 'ORDER-2':
+                attempts.append((order_no, text))
+                if len(attempts) == 1:
+                    raise MexcChatUnavailable('Chat proxy connection failed (ConnectionResetError)')
+            await original(order_no, text)
+
+        runner.clients['p1'].send_chat_text = send
+        with self.assertRaises(MexcChatUnavailable):
+            await runner.run(self.cycle_id)
+        saved = self.journal.step(self.cycle_id, 'reverse_reply')
+        self.assertEqual(saved['status'], 'unknown')
+        self.assertEqual(attempts, [('ORDER-2', saved['result']['text'])])
+        await runner.run(self.cycle_id)
+        self.assertEqual(attempts, [('ORDER-2', saved['result']['text'])] * 2)
+        self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
+
     async def test_auto_resume_uses_verified_document_check_without_second_click(self):
         runner = self.runner()
         runner.delay_seconds = runner.delay_max_seconds = 0
@@ -236,16 +273,26 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.journal.step(self.cycle_id, 'forward_paid')['status'], 'pending')
         self.assertFalse(any(op == 'paid' for _, op, _ in self.exchange.calls))
 
-    async def test_uncertain_mark_paid_request_is_never_retried_automatically(self):
+    async def test_uncertain_mark_paid_retries_when_order_is_still_unpaid(self):
         runner = self.runner()
         runner.delay_seconds = runner.delay_max_seconds = 0
-        runner.clients['p2'].mark_paid = AsyncMock(side_effect=TimeoutError('mark-paid response lost'))
-        with self.assertRaises(TimeoutError):
+        original = runner.clients['p2'].mark_paid
+        attempts = 0
+
+        async def mark_paid(*args):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise MexcMutationUnknown('MEXC network error (ReadTimeout)')
+            await original(*args)
+
+        runner.clients['p2'].mark_paid = mark_paid
+        with self.assertRaises(MexcMutationUnknown):
             await runner.run(self.cycle_id)
         self.assertEqual(self.journal.step(self.cycle_id, 'forward_paid')['status'], 'unknown')
-        with self.assertRaises(Paused):
-            await runner.run(self.cycle_id)
-        self.assertEqual(runner.clients['p2'].mark_paid.await_count, 1)
+        await runner.run(self.cycle_id)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
 
     async def test_order_read_timeout_before_release_resumes_without_duplicate_release(self):
         runner = self.runner()
@@ -366,7 +413,7 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
         self.assertEqual(len(self.exchange.ad_calls), 1)
 
-    async def test_auto_resume_does_not_repeat_unconfirmed_replenishment(self):
+    async def test_auto_resume_retries_replenishment_if_balance_remains_unchanged(self):
         runner = self.runner()
         runner.delay_seconds = runner.delay_max_seconds = 0
         self.exchange.fail = 'replenish_no_change'
@@ -375,7 +422,7 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.journal.step(self.cycle_id, 'reverse_replenish')['status'], 'unknown')
         with self.assertRaises(Paused):
             await runner.run(self.cycle_id)
-        self.assertEqual(len(self.exchange.ad_calls), 1)
+        self.assertEqual(len(self.exchange.ad_calls), 2)
 
     async def test_explicit_timestamp_rejection_can_resume_without_duplicate_order(self):
         runner = self.runner()
@@ -400,23 +447,54 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 3)  # Forward retry, then reverse creation.
         self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
 
-    async def test_http_504_during_order_creation_stays_unknown_and_is_not_retried(self):
+    async def test_http_504_retries_creation_only_after_empty_order_history(self):
         runner = self.runner()
         runner.delay_seconds = runner.delay_max_seconds = 0
+        original = runner.clients['p2'].create_order
         attempts = 0
 
         async def timeout(**kwargs):
             nonlocal attempts
             attempts += 1
-            raise MexcAPIError('HTTP 504', code=504, http_status=504)
+            if attempts == 1:
+                raise MexcMutationUnknown('HTTP 504', code=504, http_status=504)
+            return await original(**kwargs)
 
         runner.clients['p2'].create_order = timeout
-        with self.assertRaises(MexcAPIError):
+        runner.clients['p2'].list_orders = AsyncMock(return_value=[])
+        with self.assertRaises(MexcMutationUnknown):
             await runner.run(self.cycle_id)
         self.assertEqual(self.journal.step(self.cycle_id, 'forward_create')['status'], 'unknown')
-        with self.assertRaises(Paused):
+        with patch.object(runner, 'wait_delay', new=AsyncMock()):
             await runner.run(self.cycle_id)
+        self.assertEqual(attempts, 3)  # Forward retry, then reverse creation.
+        self.assertEqual(runner.clients['p2'].list_orders.await_count, 2)
+        self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
+
+    async def test_lost_create_response_uses_found_order_without_second_create(self):
+        runner = self.runner()
+        runner.delay_seconds = runner.delay_max_seconds = 0
+        original = runner.clients['p2'].create_order
+        attempts = 0
+
+        async def created_but_lost(**kwargs):
+            nonlocal attempts
+            order_no = await original(**kwargs)
+            if kwargs.get('amount') is not None:
+                attempts += 1
+                if attempts == 1:
+                    raise MexcMutationUnknown('MEXC network error (ReadTimeout)')
+            return order_no
+
+        runner.clients['p2'].create_order = created_but_lost
+        runner.clients['p2'].list_orders = AsyncMock(return_value=[
+            {'advOrderNo': 'ORDER-1', 'advNo': 'AD-SELL', 'amount': '10000'}])
+        with self.assertRaises(MexcMutationUnknown):
+            await runner.run(self.cycle_id)
+        await runner.run(self.cycle_id)
         self.assertEqual(attempts, 1)
+        self.assertEqual(self.journal.step(self.cycle_id, 'forward_create')['result']['order_no'], 'ORDER-1')
+        self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
 
     async def test_outsider_is_ignored_and_cycle_completes(self):
         runner = self.runner(); self.outsider()
@@ -446,8 +524,9 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         runner.browser.approve.assert_not_called()
         self.assertFalse(any(op in {"paid", "release"} for _, op, _ in self.exchange.calls))
 
-    async def test_unknown_create_is_never_repeated_automatically(self):
+    async def test_unknown_create_is_not_repeated_when_history_is_truncated(self):
         runner = self.runner(); self.exchange.fail = "create"
+        runner.clients['p2'].list_orders = AsyncMock(return_value=[{}] * 50)
         with patch("cycle.asyncio.sleep", new=AsyncMock()), self.assertRaises(TimeoutError):
             await runner.run(self.cycle_id)
         with self.assertRaises(Paused):
@@ -488,11 +567,11 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         async def real_approval(_):
             runner.browser.inspect.return_value = "passed"
         runner.browser.approve.side_effect = real_approval
-        with patch("cycle.asyncio.sleep", new=AsyncMock()), self.assertRaises(Paused):
+        with patch("cycle.asyncio.sleep", new=AsyncMock()):
             await runner.run(self.cycle_id)
-        # Verification is repaired, but uncertain payment still requires interactive recovery.
+        # Verification is repaired, then the still-unpaid order can continue.
         self.assertEqual(runner.browser.approve.await_count, 2)
-        self.assertFalse(any(op == 'paid' for _, op, _ in self.exchange.calls))
+        self.assertTrue(any(op == 'paid' for _, op, _ in self.exchange.calls))
 
     def test_delay_validation(self):
         self.assertEqual(action_delay("20"), 20)

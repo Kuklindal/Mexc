@@ -236,13 +236,26 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(load_state(self.journal)['profiles'], ['2', '1'])
             self.assertEqual(load_state(self.journal)['p1_profile'], 'p1')
 
-    async def test_eflp_unique_keeps_manual_p1_and_p2_selection(self):
+    async def test_eflp_unique_chooses_only_p1_then_uses_configured_p2(self):
+        from test_trade_modes import env_for
+        from rollover import load_state
         self.journal.abandon(self.cycle_id)
-        control = self.control()
-        await control.perform('eflp_unique')
-        self.assertIsNone(control.task)
-        self.assertEqual(control.menu, 'cash_p1')
-        self.assertEqual(control.selected_mode, 'eflp_unique')
+        env = env_for(21) | {
+            'MEXC_P2_21_BUY_ADV_NO': 'a1234567890123456788',
+            'EFLP_UNIQUE_P2_PROFILES': ','.join(str(i) for i in range(1, 21))}
+        with patch.dict(os.environ, env):
+            control = self.control()
+            await control.perform('eflp_unique')
+            self.assertEqual(control.menu, 'cash_p1')
+            self.assertEqual(control.selected_mode, 'eflp_unique')
+            self.assertFalse(any(button['callback_data'].endswith('cash_p1:1')
+                                 for row in control.keyboard()['inline_keyboard'] for button in row))
+            with patch.object(control, 'work_rollover', new_callable=AsyncMock):
+                await control.perform('cash_p1:21')
+                await asyncio.sleep(0)
+            self.assertIsNone(control.menu)
+            self.assertEqual(load_state(self.journal)['p1_profile'], '21')
+            self.assertEqual(load_state(self.journal)['profiles'], [str(i) for i in range(1, 21)])
 
     async def test_unique_toggle_edits_same_telegram_menu(self):
         from test_trade_modes import env_for

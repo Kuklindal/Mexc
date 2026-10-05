@@ -14,8 +14,8 @@ import random
 
 from config import Settings, p2_nickname, p2_profile_name
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, run_command
-from mexc_client import MexcAPIError, MexcP2PClient, MexcReadUnavailable
-from adspower import AdsPowerUnavailable
+from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, MexcP2PClient, MexcReadUnavailable
+from adspower import AdsPowerClickUnknown, AdsPowerUnavailable
 from rollover import (STATE_KEY, amount_from_ad, cycle_rowid, load_state, profiles_from_env,
                       save_state, wait_until)
 from trade_profiles import profile_from_env, profile_prefix, validate_unique_profiles
@@ -27,7 +27,8 @@ from volume_policy import (TARGET_USDT, CEILING_USDT, CASH_TARGET_USDT, CASH_CEI
 def configured_mode_profiles(mode: str, env=os.environ) -> tuple[str | None, list[str]]:
     """Read ordered profile keys for Telegram modes with fixed P2 selection."""
     fields = {'cash_volume': ('CASH_VOLUME_P1_PROFILE', 'CASH_VOLUME_P2_PROFILES'),
-              'eflp_volume': (None, 'EFLP_VOLUME_P2_PROFILES')}
+              'eflp_volume': (None, 'EFLP_VOLUME_P2_PROFILES'),
+              'eflp_unique': (None, 'EFLP_UNIQUE_P2_PROFILES')}
     if mode not in fields:
         raise ValueError('Для этого режима профили выбираются в Telegram')
     p1_field, p2_field = fields[mode]
@@ -41,6 +42,8 @@ def configured_mode_profiles(mode: str, env=os.environ) -> tuple[str | None, lis
     unknown = [name for name in profiles if name not in known]
     if unknown:
         raise ValueError(f'{p2_field}: нет в ROLLOVER_PROFILES: ' + ', '.join(unknown))
+    if mode == 'eflp_unique' and len(profiles) < 20:
+        raise ValueError(f'{p2_field}: укажите не менее 20 разных профилей П2')
     p1 = None
     if p1_field:
         raw_p1 = (env.get(p1_field) or '').strip()
@@ -701,7 +704,8 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None)
                 _defer_cash_limit(journal, state, profile, limited)
                 limit_skipped = True
                 continue
-            except (MexcReadUnavailable, AdsPowerUnavailable) as exc:
+            except (MexcReadUnavailable, MexcChatUnavailable, MexcMutationUnknown,
+                    AdsPowerClickUnknown, AdsPowerUnavailable) as exc:
                 state['status'] = 'waiting'
                 state['last_error'] = str(exc)[:300]
                 save_state(journal, state)

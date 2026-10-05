@@ -230,6 +230,8 @@ class AdsPower:
 
     async def close_other_local_profiles(self, keep_profile_ids=None) -> int:
         """Keep the static P1 and any active trading-role browser profiles."""
+        if os.getenv('ADSPOWER_CLOSE_OTHER_PROFILES', 'true').strip().lower() in {'0', 'false', 'no', 'off'}:
+            return 0
         if not self.api_key or not self.profile_id:
             raise AdsPowerError("Для контроля профилей нужны ADSPOWER_API_KEY и ADSPOWER_P1_PROFILE_ID")
         headers = {"Authorization": "Bearer " + self.api_key}

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from adspower import AdsPower  # noqa: E402
+from config import ENV_FILE  # noqa: E402
 
 
 def api_error(response: httpx.Response, api_key: str) -> str:
@@ -25,7 +26,7 @@ def api_error(response: httpx.Response, api_key: str) -> str:
 
 
 async def main() -> None:
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ENV_FILE)
     browser = AdsPower.from_env()
     if not browser.api_key or not browser.profile_id:
         raise RuntimeError("ADSPOWER_API_KEY и ADSPOWER_P1_PROFILE_ID обязательны")

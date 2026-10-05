@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, Step, steps_for_spec
+from mexc_client import MexcChatUnavailable
 from trade_modes import (_finish_cash_network_return, _finish_completed_cycle,
                           _handle_forward_rejection, _record_forward,
                           begin_mode, choose_mode_amount, configured_mode_profiles,
@@ -49,9 +50,12 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
     def test_fixed_mode_profiles_use_env_keys_and_preserve_order(self):
         env = env_for(3) | {'CASH_VOLUME_P1_PROFILE': 'P1',
                             'CASH_VOLUME_P2_PROFILES': '3,1',
-                            'EFLP_VOLUME_P2_PROFILES': '2,3'}
+                            'EFLP_VOLUME_P2_PROFILES': '2,3',
+                            'EFLP_UNIQUE_P2_PROFILES': '1,2,3'}
         self.assertEqual(configured_mode_profiles('cash_volume', env), ('p1', ['3', '1']))
         self.assertEqual(configured_mode_profiles('eflp_volume', env), (None, ['2', '3']))
+        with self.assertRaisesRegex(ValueError, 'не менее 20'):
+            configured_mode_profiles('eflp_unique', env)
         env['CASH_VOLUME_P1_PROFILE'] = '2'
         self.assertEqual(configured_mode_profiles('cash_volume', env), ('2', ['3', '1']))
         env['CASH_VOLUME_P2_PROFILES'] = '2,3'
@@ -63,6 +67,11 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         env['CASH_VOLUME_P2_PROFILES'] = '5'
         with self.assertRaisesRegex(ValueError, 'ROLLOVER_PROFILES'):
             configured_mode_profiles('cash_volume', env)
+
+    def test_unique_eflp_profiles_come_from_env_in_order(self):
+        env = env_for(21) | {'EFLP_UNIQUE_P2_PROFILES': ','.join(str(i) for i in range(20, 0, -1))}
+        self.assertEqual(configured_mode_profiles('eflp_unique', env),
+                         (None, [str(i) for i in range(20, 0, -1)]))
 
     def test_cash_mode_uses_ordinary_return_without_p2_maker_or_deposit(self):
         self.journal.abandon(self.cycle_id)
@@ -204,10 +213,13 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state['cooldowns']['1']['anchor'], anchor)
 
     def test_eflp_pauses_cover_both_orders_and_cash_only_final_return(self):
-        eflp = [step.key for step in steps_for_spec({'scheduler_mode': 'eflp_volume'})]
-        for key in ('forward_wait_paid', 'forward_wait_release',
-                    'reverse_wait_paid', 'reverse_wait_release'):
-            self.assertIn(key, eflp)
+        for mode in ('eflp_volume', 'eflp_unique'):
+            eflp = [step.key for step in steps_for_spec({'scheduler_mode': mode})]
+            for key in ('forward_wait_paid', 'forward_wait_release',
+                        'reverse_wait_paid', 'reverse_wait_release'):
+                self.assertIn(key, eflp)
+            self.assertNotIn('forward_check', eflp)
+            self.assertNotIn('reverse_check', eflp)
         cash = [step.key for step in steps_for_spec({
             'scheduler_mode': 'cash_volume', 'reverse_maker': 'p2'})]
         self.assertNotIn('forward_wait_paid', cash)
@@ -385,6 +397,35 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                 await run_mode(self.journal, state, stop, None)
         self.assertEqual(state['completed_count'], 1)
         self.assertEqual(state['volume_windows']['1']['quantity'], '1800')
+
+    async def test_chat_proxy_reset_waits_and_resumes_same_cycle(self):
+        self.journal.abandon(self.cycle_id)
+        state = begin_mode(self.journal, 'volume', env=env_for(1))
+        stop = asyncio.Event()
+        calls = []
+
+        async def trade(args, **_):
+            calls.append(args)
+            if len(calls) == 1:
+                cid = self.journal.create(dict(self.spec, automatic=True, reverse_maker='p2',
+                    scheduler_mode='volume', p1_profile='p1', p2_profile='1', series={'count': 1}))
+                self.journal.transition(cid, 'reverse_reply', 'p1', 'unknown', 'chat connection reset',
+                                        result={'order_no': 'ORDER-2', 'text': 'Сохранённая фраза'})
+                raise MexcChatUnavailable('Chat proxy connection failed (ConnectionResetError)')
+            self.assertEqual(args.resume, state['active_cycle'])
+            self.journal.transition(args.resume, 'forward_complete', 'both', 'done', 'sale',
+                                    result={'quantity': '1800'}, context={'amount': '180000', 'quantity': '1800'})
+            self.complete(args.resume)
+            stop.set()
+
+        with patch('trade_modes.choose_mode_amount', new=AsyncMock(return_value='180000 RUB')), \
+                patch('trade_modes.run_command', side_effect=trade), \
+                patch('trade_modes.wait_until', new=AsyncMock()) as wait:
+            with self.assertRaises(OperatorStopped):
+                await run_mode(self.journal, state, stop, None)
+        self.assertEqual(len(calls), 2)
+        wait.assert_awaited_once()
+        self.assertEqual(state['completed_count'], 1)
 
     async def test_three_consecutive_explicit_85010_rejections_raise_one_alert(self):
         self.journal.abandon(self.cycle_id)

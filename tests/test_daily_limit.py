@@ -104,9 +104,11 @@ class DailyLimitTests(unittest.IsolatedAsyncioTestCase):
         with patch('cycle.asyncio.sleep', new=AsyncMock()), self.assertRaises(MexcAPIError):
             await runner.run(self.cycle_id)
         self.assertEqual(self.journal.step(self.cycle_id, 'reverse_create')['status'], 'unknown')
-        with self.assertRaisesRegex(Paused, 'сверки'):
+        runner.clients['p2'].list_orders = AsyncMock(return_value=[])
+        with patch.object(runner, 'wait_delay', new=AsyncMock()), self.assertRaises(MexcAPIError):
             await runner.run(self.cycle_id)
-        self.assertEqual(create.await_count, 2)
+        self.assertEqual(runner.clients['p2'].list_orders.await_count, 2)
+        self.assertEqual(create.await_count, 3)
 
     async def test_legacy_rejection_is_restored_without_repeating_request(self):
         runner = self.runner()

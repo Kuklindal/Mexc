@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
-from mexc_client import MexcAPIError, MexcP2PClient, MexcReadUnavailable
+from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, MexcP2PClient, MexcReadUnavailable
 
 
 class SigningTests(unittest.IsolatedAsyncioTestCase):
@@ -24,9 +24,22 @@ class SigningTests(unittest.IsolatedAsyncioTestCase):
                 self.client.http = httpx.AsyncClient(transport=httpx.MockTransport(timeout))
                 with self.assertRaises(MexcReadUnavailable):
                     await self.client._request('GET', '/api/v3/fiat/order/detail')
-                with self.assertRaises(MexcAPIError) as caught:
+                with self.assertRaises(MexcMutationUnknown) as caught:
                     await self.client._request('POST', '/api/v3/fiat/release_coin')
                 self.assertNotIsInstance(caught.exception, MexcReadUnavailable)
+
+    async def test_chat_proxy_reset_is_classified_for_automatic_retry(self):
+        await self.client.close()
+        client = MexcP2PClient('test-key', 'test-secret', proxy_url='http://proxy.example:8080')
+        try:
+            client.generate_listen_key = AsyncMock(return_value='KEY')
+            client.get_conversation_id = AsyncMock(return_value=12)
+            with patch('mexc_client.Proxy.from_url') as proxy:
+                proxy.return_value.connect = AsyncMock(side_effect=ConnectionResetError())
+                with self.assertRaises(MexcChatUnavailable):
+                    await client.send_chat_text('ORDER', 'Hello')
+        finally:
+            await client.close()
 
     def test_spaces_unicode_literal_plus_and_json_are_encoded_before_signing(self):
         params = {"tradeTerms": "А Б + & 💵", "overVerify": '{"types":[1,3]}',

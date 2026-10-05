@@ -61,6 +61,12 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.browser.close_other_local_profiles(), 2)
         self.assertEqual(stopped, ['P2', 'P3'])
 
+    async def test_parallel_instances_do_not_close_each_others_profiles(self):
+        with patch.dict('os.environ', {'ADSPOWER_CLOSE_OTHER_PROFILES': 'false'}), \
+                patch('adspower.httpx.AsyncClient') as client:
+            self.assertEqual(await self.browser.close_other_local_profiles(), 0)
+        client.assert_not_called()
+
     async def test_active_maker_profile_is_not_closed(self):
         stopped = []
         async def handler(request):

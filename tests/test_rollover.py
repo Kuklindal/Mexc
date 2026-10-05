@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 from cycle import OperatorStopped, Paused
 from config import p2_nickname
 from adspower import AdsPowerUnavailable
-from mexc_client import MexcAPIError, MexcReadUnavailable
+from mexc_client import MexcAPIError, MexcChatUnavailable, MexcReadUnavailable
 from rollover import (amount_from_ad, begin, cooldown_after_ad_rejection,
                       cooldown_after_limit, eligible,
                       enqueue_switch_notice, finish_limited_cycle, load_state, next_wait, run, save_state)
@@ -309,6 +309,36 @@ class RolloverTests(unittest.IsolatedAsyncioTestCase):
                 raise MexcReadUnavailable('MEXC read request failed (ReadTimeout); no action was sent')
             self.assertEqual(args.resume, state['active_cycle'])
             self.journal.transition(state['active_cycle'], 'cycle', 'both', 'completed',
+                                    'done', cycle_status='completed')
+            stop.set()
+
+        with patch('rollover.choose_amount', new=AsyncMock(return_value='9000 RUB')), \
+                patch('rollover.run_command', side_effect=trade), \
+                patch('rollover.wait_until', new=AsyncMock()) as wait:
+            with self.assertRaises(OperatorStopped):
+                await run(self.journal, state, stop, None)
+        self.assertEqual(calls, 2)
+        wait.assert_awaited_once()
+        self.assertEqual(state['completed_count'], 1)
+
+    async def test_scheduler_retries_chat_reset_on_same_cycle(self):
+        self.journal.abandon(self.cycle_id)
+        with patch.dict(os.environ, {'ROLLOVER_PROFILES': 'default'}):
+            state = begin(self.journal, 'all')
+        stop = asyncio.Event()
+        calls = 0
+
+        async def trade(args, **_):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                cid = self.journal.create(dict(self.spec, automatic=True, p2_profile='default',
+                    series={'count': 1}))
+                self.journal.transition(cid, 'reverse_reply', 'p1', 'unknown',
+                                        'Chat proxy connection failed', cycle_status='paused')
+                raise MexcChatUnavailable('Chat proxy connection failed (ConnectionResetError)')
+            self.assertEqual(args.resume, state['active_cycle'])
+            self.journal.transition(args.resume, 'cycle', 'both', 'completed',
                                     'done', cycle_status='completed')
             stop.set()
 

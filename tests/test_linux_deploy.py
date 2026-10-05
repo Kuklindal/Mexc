@@ -1,5 +1,9 @@
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -11,6 +15,22 @@ from main import build_parser
 
 
 class LinuxDeployTests(unittest.IsolatedAsyncioTestCase):
+    def test_parallel_instances_load_only_the_selected_env_file(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            selected = Path(directory) / 'eflp.env'
+            selected.write_text('TELEGRAM_BOT_TOKEN=selected-bot\nCYCLE_DB=data/eflp.sqlite3\n',
+                                encoding='utf-8')
+            env = os.environ.copy()
+            env['MEXC_ENV_FILE'] = str(selected)
+            env.pop('TELEGRAM_BOT_TOKEN', None)
+            env.pop('CYCLE_DB', None)
+            result = subprocess.run([sys.executable, '-c',
+                'import config, os; print(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["CYCLE_DB"])'],
+                cwd=root, env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'selected-bot data/eflp.sqlite3')
+
     async def test_open_mexc_command_requires_rendered_page(self):
         browser = SimpleNamespace(ensure_mexc_page=AsyncMock())
         with patch.object(open_adspower_mexc, 'load_dotenv'), \

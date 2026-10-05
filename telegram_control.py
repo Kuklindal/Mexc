@@ -149,8 +149,8 @@ class TelegramControl:
                 from trade_profiles import ready_p1_profiles, profile_prefix
                 from trade_modes import configured_mode_profiles
                 try:
-                    fixed_p2 = (set(configured_mode_profiles('eflp_volume')[1])
-                                if self.selected_mode == 'eflp_volume' else set())
+                    fixed_p2 = (set(configured_mode_profiles(self.selected_mode)[1])
+                                if self.selected_mode in {'eflp_volume', 'eflp_unique'} else set())
                 except ValueError:
                     fixed_p2 = set()
                 choices = [item for item in ready_p1_profiles(profiles_from_env(), os.environ)
@@ -501,8 +501,7 @@ class TelegramControl:
             saved = load_state(self.journal)
             if self.running or self.unfinished() or (saved and saved['status'] not in {'done', 'stopped'}):
                 return await self.reply('Сначала заверши или продолжи сохранённую серию.')
-            fixed_p2 = (set(configured_mode_profiles('eflp_volume')[1])
-                        if action == 'eflp_volume' else set())
+            fixed_p2 = set(configured_mode_profiles(action)[1])
             choices = [item for item in ready_p1_profiles(profiles_from_env(), os.environ)
                        if item.key not in fixed_p2
                        and os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()]
@@ -515,8 +514,9 @@ class TelegramControl:
             self.cash_p2.clear()
             labels = {'cash_volume': 'Объём наличка', 'eflp_volume': 'Объём Eflp',
                       'eflp_unique': 'Уникальные Eflp'}
-            suffix = (' П2 возьму из EFLP_VOLUME_P2_PROFILES в .env и сразу запущу серию.'
-                      if action == 'eflp_volume' else '')
+            source = ('EFLP_VOLUME_P2_PROFILES' if action == 'eflp_volume'
+                      else 'EFLP_UNIQUE_P2_PROFILES')
+            suffix = f' П2 возьму из {source} в .env и сразу запущу серию.'
             return await self.reply(f'Выбери П1 для режима «{labels[action]}».{suffix}')
         if action.startswith('cash_p1:'):
             from rollover import profiles_from_env
@@ -524,14 +524,14 @@ class TelegramControl:
             name = action.split(':', 1)[1]
             ready = {item.key for item in ready_p1_profiles(profiles_from_env(), os.environ)
                      if os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()}
-            if self.selected_mode == 'eflp_volume':
+            if self.selected_mode in {'eflp_volume', 'eflp_unique'}:
                 from trade_modes import configured_mode_profiles
-                fixed_p2 = configured_mode_profiles('eflp_volume')[1]
+                fixed_p2 = configured_mode_profiles(self.selected_mode)[1]
                 ready -= set(fixed_p2)
             if self.menu != 'cash_p1' or self.running or name not in ready:
                 return await self.reply('Этот П1 недоступен; открой выбор заново.')
-            if self.selected_mode == 'eflp_volume':
-                return await self.launch_trade_mode('eflp_volume', name, fixed_p2)
+            if self.selected_mode in {'eflp_volume', 'eflp_unique'}:
+                return await self.launch_trade_mode(self.selected_mode, name, fixed_p2)
             self.cash_p1 = name
             self.cash_p2.clear()
             self.menu = 'cash_p2'

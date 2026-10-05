@@ -6,7 +6,12 @@ from urllib.parse import urlsplit
 from dotenv import load_dotenv
 
 PROJECT_DIR = Path(__file__).resolve().parent
-load_dotenv(PROJECT_DIR / ".env")
+ENV_FILE = Path(os.getenv('MEXC_ENV_FILE') or PROJECT_DIR / '.env')
+if not ENV_FILE.is_absolute():
+    ENV_FILE = PROJECT_DIR / ENV_FILE
+if os.getenv('MEXC_ENV_FILE') and not ENV_FILE.is_file():
+    raise RuntimeError(f'Файл настроек не найден: {ENV_FILE}')
+load_dotenv(ENV_FILE)
 
 
 def p2_profile_name(value: str) -> str:

@@ -26,6 +26,14 @@ class MexcReadUnavailable(MexcAPIError):
     """A read-only request failed; no exchange state change was requested."""
 
 
+class MexcMutationUnknown(MexcAPIError):
+    """A write request lost its result and must be reconciled before retry."""
+
+
+class MexcChatUnavailable(MexcAPIError):
+    """Chat transport failed; sending the same text again may duplicate it."""
+
+
 def counterparty_identity(detail: dict) -> tuple[str, str]:
     info = detail.get("userInfo") or detail.get("merchantInfo") or {}
     if not isinstance(info, dict):
@@ -182,13 +190,14 @@ class MexcP2PClient:
                 if method.upper() == "GET":
                     raise MexcReadUnavailable(
                         f"MEXC read request failed ({type(exc).__name__}); no action was sent") from None
-                raise MexcAPIError(f"MEXC network error ({type(exc).__name__}); execution may be unknown") from None
+                raise MexcMutationUnknown(f"MEXC network error ({type(exc).__name__}); execution may be unknown") from None
 
             # Never retry a network/5xx failure on a state-changing endpoint.
             try:
                 payload = response.json()
             except Exception:
-                raise MexcAPIError(f"Non-JSON response: HTTP {response.status_code}")
+                error_type = (MexcReadUnavailable if method.upper() == "GET" else MexcMutationUnknown) if response.status_code >= 500 else MexcAPIError
+                raise error_type(f"Non-JSON response: HTTP {response.status_code}")
             if (attempt == 0 and response.status_code < 500 and isinstance(payload, dict)
                     and payload.get('code') == 700003):
                 try:
@@ -200,7 +209,8 @@ class MexcP2PClient:
             break
 
         if response.status_code >= 400:
-            raise MexcAPIError(
+            error_type = (MexcReadUnavailable if method.upper() == "GET" else MexcMutationUnknown) if response.status_code >= 500 else MexcAPIError
+            raise error_type(
                 f"{method.upper()} {path}: HTTP {response.status_code}: {json.dumps(payload, ensure_ascii=False)}",
                 code=payload.get("code") if isinstance(payload, dict) else None, http_status=response.status_code,
             )
@@ -450,7 +460,7 @@ class MexcP2PClient:
                 sock = await Proxy.from_url(self.proxy_url).connect(
                     dest_host='fiat.mexc.com', dest_port=443, timeout=15)
             except Exception as exc:
-                raise MexcAPIError(f"Chat proxy connection failed ({type(exc).__name__})") from None
+                raise MexcChatUnavailable(f"Chat proxy connection failed ({type(exc).__name__})") from None
         try:
             async with websockets.connect(ws_url, open_timeout=15, close_timeout=5,
                                           proxy=None, **({'sock': sock} if sock else {})) as ws:
@@ -459,6 +469,8 @@ class MexcP2PClient:
                 response = json.loads(raw)
                 if not response.get("success"):
                     raise MexcAPIError(f"Chat send failed: {response}")
+        except (OSError, asyncio.TimeoutError, websockets.exceptions.ConnectionClosed) as exc:
+            raise MexcChatUnavailable(f"Chat connection failed ({type(exc).__name__})") from None
         finally:
             if sock is not None:
                 sock.close()

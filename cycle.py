@@ -13,9 +13,9 @@ import random
 import uuid
 from typing import Callable
 
-from adspower import AdsPowerError, AdsPowerTimeout, AdsPowerUnavailable
+from adspower import AdsPowerClickUnknown, AdsPowerError, AdsPowerTimeout, AdsPowerUnavailable
 from journal import Journal
-from mexc_client import MexcAPIError, MexcReadUnavailable, ad_replenish_params, ad_verification, counterparty_identity
+from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, MexcReadUnavailable, ad_replenish_params, ad_verification, counterparty_identity
 from sheets import Reporter
 
 
@@ -174,6 +174,8 @@ def steps_for_spec(spec: dict) -> list[Step]:
         if spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}:
             result = []
             for step in STEPS:
+                if step.key == 'forward_check':
+                    continue  # These order flows go straight to payment.
                 if step.key in {'forward_paid', 'reverse_paid'}:
                     result.append(Step(step.key.replace('_paid', '_wait_paid'), 'both',
                                        'Ожидание перед отметкой оплаты'))
@@ -513,6 +515,11 @@ class CycleRunner:
                 leg, action = step.key.split("_", 1)
                 if step.key in {"reverse_replenish_buy", "reverse_replenish_sell"}:
                     action = "replenish"
+                if (self.automatic and action == 'create' and saved
+                        and saved['status'] in {'in_flight', 'unknown'}):
+                    if await self.reconcile_unknown_create(step, saved['result']):
+                        continue
+                    saved = None
                 remote = None
                 check_browser = self.browser_for_step(step) if action == 'check' else None
                 if (action == 'check' and saved and saved["status"] == "done"
@@ -558,6 +565,15 @@ class CycleRunner:
                 self.console.write(f"\n[{step.key}] {step.label}")
                 uncertain = bool(saved and saved["status"] in {"in_flight", "unknown"})
                 retry = False
+                chat_retry = self.automatic and uncertain and action in {"message", "reply"}
+                if chat_retry:
+                    previous = saved["result"]
+                    if (not isinstance(previous.get("text"), str) or not previous["text"]
+                            or previous.get("order_no") != self.result(f"{leg}_create")["order_no"]):
+                        raise Paused("Нельзя автоматически повторить сообщение: в журнале нет точного текста и ордера")
+                    # The operator allows duplicate chat text. Keep the saved
+                    # phrase, but never apply this exception to trade actions.
+                    retry, uncertain = True, False
                 already_applied = remote is not None and remote["state"] in (PAID_STATES if action == "paid" else COMPLETED_STATES)
                 if already_applied:
                     uncertain = True
@@ -592,11 +608,25 @@ class CycleRunner:
                     plan = saved['result']
                     if plan.get('adv_no') and plan.get('target_available'):
                         ad = await self.clients[step.actor].get_ad(plan['adv_no'])
-                        self.check_replenished(ad, plan)
-                        if plan.get('method') == 'quantity_only':
-                            await self.check_browser_ad(plan, browser=self.maker_browser if step.actor == 'p2' else self.browser)
-                        await self.event(step, 'done', 'Пополнение подтверждено текущим остатком MEXC', plan)
-                        continue
+                        try:
+                            self.check_replenished(ad, plan)
+                        except Paused:
+                            browser = self.maker_browser if step.actor == 'p2' else self.browser
+                            current_plan = (await self.quantity_plan(ad, plan['adv_no'], plan['quantity'],
+                                        side=plan.get('side', 'SELL'), browser=browser)
+                                       if plan.get('method') == 'quantity_only' else
+                                       self.replenish_plan(ad, plan['adv_no'], plan['quantity']))
+                            if current_plan != plan:
+                                raise Paused('Остаток или параметры объявления изменились; автоматический повтор пополнения остановлен')
+                            retry, uncertain = True, False
+                        else:
+                            if plan.get('method') == 'quantity_only':
+                                await self.check_browser_ad(plan, browser=self.maker_browser if step.actor == 'p2' else self.browser)
+                            await self.event(step, 'done', 'Пополнение подтверждено текущим остатком MEXC', plan)
+                            continue
+                if self.automatic and uncertain and remote is not None and not already_applied:
+                    self.check_state(remote, PAYMENT_START_STATES[leg] if action == 'paid' else {'PAID'})
+                    retry, uncertain = True, False
                 if self.automatic and uncertain and not already_applied:
                     raise Paused("Результат предыдущей операции требует сверки. Автоматического повтора нет; продолжите с --interactive.")
                 if uncertain and action == "replenish" and saved["result"].get("rejected_code") in {700002, 60048, 60064}:
@@ -645,13 +675,13 @@ class CycleRunner:
                         remaining -= min(5, remaining)
                         await self.guard_participants()
                 self.check_stop()
-                prepared = await self.prepare(step, recovery=uncertain)
+                prepared = dict(saved["result"]) if chat_retry else await self.prepare(step, recovery=uncertain)
                 if uncertain:
                     self.console.confirm("Подтверждаю, что результат этого шага проверен на MEXC.", f"СВЕРЕНО {step.key}")
                 else:
                     self.console.confirm(step.label + "\n" + json.dumps(
                         {k: v for k, v in prepared.items() if k not in {"notify_code", "settings_fingerprint"}}, ensure_ascii=False, indent=2),
-                        f"ПОВТОРИТЬ {step.key}" if retry else "ДА")
+                        f"ПОВТОРИТЬ {step.key}" if retry and not self.automatic else "ДА")
                 # Durable intent is committed before any mutating network request.
                 self.check_stop()
                 payment_context = ({"payment_account_id": prepared["payment_account_id"]}
@@ -660,6 +690,8 @@ class CycleRunner:
                     # Preserve the exact phrase before the network call, so an
                     # uncertain send can be reconciled without changing text.
                     payment_context = {"order_no": prepared["order_no"], "text": prepared["text"]}
+                if action == 'create':
+                    payment_context = dict(prepared)
                 if action == 'check':
                     payment_context = {'order_no': prepared['order_no'],
                                        'verification': prepared.get('verification')}
@@ -706,9 +738,18 @@ class CycleRunner:
         except BaseException as exc:
             transient_adspower = self.automatic and isinstance(exc, AdsPowerUnavailable)
             transient_mexc_read = self.automatic and isinstance(exc, MexcReadUnavailable)
+            transient_chat = self.automatic and isinstance(exc, MexcChatUnavailable)
+            transient_mutation = (self.automatic and isinstance(exc, MexcMutationUnknown)
+                                  and (current.key.split('_', 1)[-1] in
+                                       {'create', 'message', 'reply', 'paid', 'release', 'replenish'}
+                                       or current.key in {'reverse_replenish_buy', 'reverse_replenish_sell'}))
+            transient_click = (self.automatic and isinstance(exc, AdsPowerClickUnknown)
+                               and (current.key.split('_', 1)[-1] in {'check', 'replenish'}
+                                    or current.key in {'reverse_replenish_buy', 'reverse_replenish_sell'}))
             timestamp_rejected = (self.automatic and isinstance(exc, MexcAPIError)
                                   and exc.code == 700003 and exc.http_status == 400)
-            status = ("waiting" if transient_adspower or transient_mexc_read or timestamp_rejected
+            status = ("waiting" if transient_adspower or transient_mexc_read or transient_chat
+                      or transient_mutation or transient_click or timestamp_rejected
                       or isinstance(exc, CashVolumeLimitReached) else
                       "stopped" if isinstance(exc, (OperatorStopped, KeyboardInterrupt)) else
                       "paused" if isinstance(exc, (Paused, KeyboardInterrupt)) else "error")
@@ -718,7 +759,8 @@ class CycleRunner:
             self.journal.transition(cycle_id, current.key, current.actor, status,
                 f"{current.label}: {reason[:700]}",
                 context=self.context(current.key), cycle_status="paused")
-            if isinstance(exc, Exception) and not (transient_adspower or transient_mexc_read
+            if isinstance(exc, Exception) and not (transient_adspower or transient_mexc_read or transient_chat
+                                                   or transient_mutation or transient_click
                                                    or isinstance(exc, CashVolumeLimitReached)):
                 await self.reporter.flush()
             raise
@@ -785,6 +827,65 @@ class CycleRunner:
         if (expected_actor == "p2" or expected_nickname) and (
                 not nickname or not expected_nickname or nickname != expected_nickname):
             raise Paused(f"Ордер {order_no}, ответ {actor}: ник контрагента не совпал или отсутствует. Действие заблокировано.")
+
+    async def reconcile_unknown_create(self, step: Step, plan: dict) -> bool:
+        """Find a lost taker order before allowing another create request."""
+        leg = step.key.split('_', 1)[0]
+        if (not isinstance(plan, dict) or not plan.get('adv_no')
+                or not (plan.get('amount') or plan.get('tradable_quantity'))
+                or plan['adv_no'] != self.result(f'{leg}_ad')['adv_no']):
+            raise Paused('Неизвестный результат создания ордера: параметры прежнего запроса не сохранены')
+        row = self.journal.db.execute(
+            "SELECT time FROM events WHERE cycle_id=? AND step=? AND status='in_flight' ORDER BY id LIMIT 1",
+            (self.cycle_id, step.key)).fetchone()
+        if not row:
+            raise Paused('В журнале нет времени отправки ордера; автоматическое создание дубля запрещено')
+        start_ms = int(datetime.fromisoformat(row[0]).timestamp() * 1000) - 30000
+        for attempt in range(2):
+            orders = await self.clients[step.actor].list_orders(
+                start_time_ms=start_ms, end_time_ms=int(datetime.now(timezone.utc).timestamp() * 1000), limit=50)
+            if len(orders) >= 50:
+                raise Paused('История ордеров MEXC обрезана; отсутствие предыдущего ордера не доказано')
+            matches = []
+            for order in orders:
+                if not isinstance(order, dict) or not order.get('advOrderNo') or not order.get('advNo'):
+                    raise Paused('MEXC вернул неполную историю ордеров; повтор создания запрещён')
+                if order['advNo'] != plan['adv_no']:
+                    continue
+                key = 'amount' if plan.get('amount') else 'tradableQuantity'
+                try:
+                    if Decimal(str(order[key])) == Decimal(str(plan.get('amount') or plan['tradable_quantity'])):
+                        matches.append(str(order['advOrderNo']))
+                except (KeyError, InvalidOperation, TypeError):
+                    raise Paused('MEXC не вернул сумму ордера для сверки; повтор создания запрещён') from None
+            if len(set(matches)) > 1:
+                raise Paused('Найдено несколько одинаковых ордеров; автоматический выбор запрещён')
+            if matches:
+                order_no = matches[0]
+                states = set()
+                for actor in ('p1', 'p2'):
+                    detail = await self.clients[actor].get_order_detail(order_no)
+                    if (str(detail.get('advOrderNo')) != order_no
+                            or str(detail.get('advNo')) != plan['adv_no']
+                            or str(detail.get('coinName')).upper() != 'USDT'
+                            or str(detail.get('fiatUnit')).upper() != self.spec['fiat']):
+                        raise Paused('Найденный ордер не совпадает с сохранённым запросом')
+                    self.check_counterparty(detail, actor, order_no)
+                    key = 'amount' if plan.get('amount') else 'tradableQuantity'
+                    try:
+                        if Decimal(str(detail[key])) != Decimal(str(plan.get('amount') or plan['tradable_quantity'])):
+                            raise Paused('Сумма найденного ордера не совпадает с сохранённым запросом')
+                    except (KeyError, InvalidOperation, TypeError):
+                        raise Paused('MEXC не вернул сумму найденного ордера') from None
+                    states.add(str(detail.get('state')))
+                if len(states) != 1:
+                    raise Paused('Статусы найденного ордера различаются между П1 и П2')
+                await self.event(step, 'done', 'Созданный ордер найден на MEXC после потери ответа',
+                                 {'order_no': order_no})
+                return True
+            if attempt == 0:
+                await self.wait_delay(3)
+        return False
 
     async def snapshot(self, leg: str) -> dict:
         order_no = self.result(f"{leg}_create")["order_no"]
@@ -1104,7 +1205,7 @@ class CycleRunner:
         if self.automatic and action in MUTATING_ACTIONS and not recovery:
             await self.guard_participants()
             if action in {"message", "reply"}:
-                await self.snapshot(leg)
+                self.check_state(await self.snapshot(leg), PAYMENT_START_STATES[leg])
         if action == "replenish":
             maker_preparation = step.key == 'reverse_replenish_sell'
             self.check_state(await self.snapshot("forward" if maker_preparation else "reverse"), COMPLETED_STATES)
@@ -1170,7 +1271,8 @@ class CycleRunner:
             # Placeholder until a verified read-receipt mechanism is configured.
             data["chat_read"] = await self.clients[receiver].mark_chat_read(data["order_no"])
         elif action == "paid":
-            seller_browser = (self.browser if leg == 'forward' else self.maker_browser
+            seller_browser = (None if self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}
+                              else self.browser if leg == 'forward' else self.maker_browser
                               if self.spec.get('reverse_maker') == 'p2' else None)
             if seller_browser:
                 try:
@@ -1458,8 +1560,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 for key in ("forward_message", "forward_reply", "reverse_message", "reverse_reply"):
                     if not PHRASES.get(key) or any(not isinstance(t, str) or not t.strip() or len(t) > 2000 for t in PHRASES[key]):
                         raise ValueError(f"Проверьте список фраз {key} в phrases.py")
-                if p1_profile != 'p1':
-                    await browser.ensure_started()
+                await browser.ensure_started()
                 await browser.ensure_mexc_page()
                 async with browser.connection() as call:
                     await call("Target.getTargets")

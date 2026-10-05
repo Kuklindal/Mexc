@@ -1,0 +1,20 @@
+[Unit]
+Description=MEXC Telegram control (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/mexc_auto/rep
+Environment=MEXC_ENV_FILE=%h/mexc_auto/rep/.env.%i
+Environment=PYTHONUNBUFFERED=1
+Environment=LOG_TO_FILE=false
+Environment=AUTO_RESUME_ON_BOOT=true
+ExecStart=%h/mexc_auto/rep/.venv/bin/python %h/mexc_auto/rep/main.py telegram-control
+Restart=always
+RestartSec=10
+TimeoutStopSec=300
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -11,7 +11,8 @@ import uuid
 
 from config import Settings, p2_profile_name, p2_nickname
 from cycle import OperatorStopped, Paused, fingerprint, run_command
-from mexc_client import MexcAPIError, MexcP2PClient
+from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, MexcP2PClient
+from adspower import AdsPowerClickUnknown
 
 KRS = timezone(timedelta(hours=7))
 STATE_KEY = 'rollover_scheduler_v1'
@@ -314,6 +315,8 @@ async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
             from mexc_client import MexcReadUnavailable
             ads_unavailable = False
             mexc_read_unavailable = False
+            chat_unavailable = False
+            mutation_unknown = False
             mexc_read_error = None
             timestamp_rejected = False
             try:
@@ -324,6 +327,10 @@ async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
             except MexcReadUnavailable as exc:
                 mexc_read_unavailable = True
                 mexc_read_error = str(exc)
+            except MexcChatUnavailable:
+                chat_unavailable = True
+            except (MexcMutationUnknown, AdsPowerClickUnknown):
+                mutation_unknown = True
             except MexcAPIError as exc:
                 if exc.code != 700003 or exc.http_status != 400:
                     raise
@@ -359,21 +366,36 @@ async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
                 save_state(journal, state)
                 continue
             state.pop('timestamp_retry', None)
-            if ads_unavailable or mexc_read_unavailable:
-                waiting_key = 'adspower_waiting' if ads_unavailable else 'mexc_read_waiting'
-                service = 'AdsPower' if ads_unavailable else 'MEXC'
+            if ads_unavailable or mexc_read_unavailable or chat_unavailable or mutation_unknown:
+                waiting_key = ('adspower_waiting' if ads_unavailable else
+                               'mexc_read_waiting' if mexc_read_unavailable else
+                               'chat_waiting' if chat_unavailable else 'mutation_waiting')
+                service = ('AdsPower' if ads_unavailable else 'MEXC' if mexc_read_unavailable else
+                           'Чат MEXC' if chat_unavailable else 'Операция MEXC')
                 first_failure = not state.get(waiting_key)
                 state[waiting_key] = True
                 state['status'] = 'waiting'
-                state['last_error'] = (f'{service} временно не отвечает на чтение: '
+                state['last_error'] = (f'Результат операции MEXC неизвестен; сверю сохранённый шаг через 30 секунд'
+                                       if mutation_unknown else
+                                       f'Связь с чатом MEXC прервалась; повторю сохранённое сообщение через 30 секунд'
+                                       if chat_unavailable else
+                                       f'{service} временно не отвечает на чтение: '
                                        f'{mexc_read_error}; повторная проверка через 30 секунд'
                                        if mexc_read_error else
                                        f'{service} временно не отвечает на чтение; повторная проверка через 30 секунд')
                 save_state(journal, state)
                 if first_failure and telegram and getattr(telegram, 'enabled', False):
-                    detail = f' {mexc_read_error}.' if mexc_read_error else ''
-                    await telegram.send(f'⚠️ {service} временно не отвечает на чтение.{detail} Серия ждёт 30 секунд '
-                                        'и сверит сохранённый цикл снова; повторной операции без сверки не будет.',
+                    if mutation_unknown:
+                        message = ('⚠️ Ответ MEXC на действие не получен. Через 30 секунд бот сверит '
+                                   'сохранённый шаг и продолжит только по подтверждённому состоянию.')
+                    elif chat_unavailable:
+                        message = ('⚠️ Связь с чатом MEXC прервалась. Через 30 секунд бот повторит '
+                                   'сохранённое сообщение и продолжит тот же цикл. Сообщение может продублироваться.')
+                    else:
+                        detail = f' {mexc_read_error}.' if mexc_read_error else ''
+                        message = (f'⚠️ {service} временно не отвечает на чтение.{detail} Серия ждёт 30 секунд '
+                                   'и сверит сохранённый цикл снова; повторной операции без сверки не будет.')
+                    await telegram.send(message,
                                         reply_markup=telegram_keyboard() if telegram_keyboard else None)
                 await wait_until(datetime.now(timezone.utc) + timedelta(seconds=30), stop_event)
                 state['status'] = 'running'
@@ -382,6 +404,8 @@ async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
             state.pop('last_error', None)
             state.pop('adspower_waiting', None)
             state.pop('mexc_read_waiting', None)
+            state.pop('chat_waiting', None)
+            state.pop('mutation_waiting', None)
             cycle_id = state.get('active_cycle')
             if not cycle_id:
                 raise RuntimeError('MEXC-цикл не был сохранён; следующая сделка не запущена')
