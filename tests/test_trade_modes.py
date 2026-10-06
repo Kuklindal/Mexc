@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, Step, steps_for_spec
+from adspower import AdsPowerTimeout
 from mexc_client import MexcChatUnavailable
 from trade_modes import (_finish_cash_network_return, _finish_completed_cycle,
                           _handle_forward_rejection, _record_forward,
@@ -415,6 +416,36 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args.resume, state['active_cycle'])
             self.journal.transition(args.resume, 'forward_complete', 'both', 'done', 'sale',
                                     result={'quantity': '1800'}, context={'amount': '180000', 'quantity': '1800'})
+            self.complete(args.resume)
+            stop.set()
+
+        with patch('trade_modes.choose_mode_amount', new=AsyncMock(return_value='180000 RUB')), \
+                patch('trade_modes.run_command', side_effect=trade), \
+                patch('trade_modes.wait_until', new=AsyncMock()) as wait:
+            with self.assertRaises(OperatorStopped):
+                await run_mode(self.journal, state, stop, None)
+        self.assertEqual(len(calls), 2)
+        wait.assert_awaited_once()
+        self.assertEqual(state['completed_count'], 1)
+
+    async def test_cash_ads_runtime_timeout_waits_and_resumes_same_cycle(self):
+        self.journal.abandon(self.cycle_id)
+        state = begin_mode(self.journal, 'cash_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env_for(1) | {
+                               'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'})
+        stop = asyncio.Event()
+        calls = []
+
+        async def trade(args, **_):
+            calls.append(args)
+            if len(calls) == 1:
+                cid = self.journal.create(dict(self.spec, automatic=True, reverse_maker='p1',
+                    scheduler_mode='cash_volume', p1_profile='p1', p2_profile='1', series={'count': 1}))
+                self.journal.transition(cid, 'reverse_replenish_buy', 'p1', 'unknown',
+                    'AdsPower Runtime.evaluate timed out', result={'adv_no': 'AD-BUY',
+                    'quantity': '100', 'target_available': '120'})
+                raise AdsPowerTimeout('AdsPower: команда Runtime.evaluate не ответила за 10 секунд')
+            self.assertEqual(args.resume, state['active_cycle'])
             self.complete(args.resume)
             stop.set()
 

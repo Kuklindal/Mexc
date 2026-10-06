@@ -45,6 +45,40 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         runner.clients['p2'].mark_paid.assert_awaited_once_with('ORDER-1', 123)
         runner.browser.inspect.assert_not_called()
 
+    async def test_eflp_first_order_uses_p1_card_method_and_cash_keeps_its_method(self):
+        runner = self.runner()
+        for mode in ('eflp_volume', 'eflp_unique'):
+            runner.spec = dict(self.spec, scheduler_mode=mode, eflp_p1_pay_method_id=999)
+            self.exchange.ad['paymentInfo'] = [{'id': 2604184, 'payMethod': 999}]
+            self.exchange.ad['overVerify'] = None
+            await runner.prepare(Step('forward_ad', 'p1', 'ad'), recovery=False)
+            with patch.object(runner, 'result', return_value={'adv_no': 'AD-SELL'}):
+                prepared = await runner.prepare(Step('forward_create', 'p2', 'create'), recovery=False)
+            self.assertEqual(prepared['user_confirm_pay_method_id'], 999)
+        runner.spec = dict(self.spec, scheduler_mode='cash_volume')
+        with patch.object(runner, 'result', return_value={'adv_no': 'AD-SELL'}):
+            prepared = await runner.prepare(Step('forward_create', 'p2', 'create'), recovery=False)
+        self.assertEqual(prepared['user_confirm_pay_method_id'], 578)
+
+    async def test_eflp_rejects_card_method_missing_from_p1_ad(self):
+        runner = self.runner()
+        runner.spec = dict(self.spec, scheduler_mode='eflp_unique', eflp_p1_pay_method_id=999)
+        with self.assertRaisesRegex(Paused, 'не найден в объявлении П1'):
+            await runner.prepare(Step('forward_ad', 'p1', 'ad'), recovery=False)
+
+    async def test_eflp_uses_card_for_forward_payment_selection_only(self):
+        runner = self.runner()
+        runner.spec = dict(self.spec, scheduler_mode='eflp_volume', eflp_p1_pay_method_id=999)
+        self.exchange.orders['ORDER-METHOD'] = {'advOrderNo': 'ORDER-METHOD', 'paymentInfo': [
+            {'id': 2642995, 'payMethod': 578}, {'id': 222, 'payMethod': 999}]}
+        self.assertEqual(await runner.payment_account('p2', 'ORDER-METHOD'), 222)
+        self.assertEqual(await runner.payment_account('p1', 'ORDER-METHOD'), 2642995)
+        self.exchange.orders['ORDER-METHOD']['paymentInfo'] = [{'id': 111, 'payMethod': 578}]
+        with self.assertRaisesRegex(Paused, 'реквизитов карты П1'):
+            await runner.payment_account('p2', 'ORDER-METHOD')
+        with self.assertRaisesRegex(Paused, 'реквизитов П2'):
+            await runner.payment_account('p1', 'ORDER-METHOD')
+
     async def test_p2_maker_return_uses_p2_ad_and_p1_as_buyer(self):
         runner = self.runner()
         self.spec.update(reverse_maker='p2', reverse_adv_no='AD-P2-SELL', buy_replenish=False)
@@ -147,6 +181,42 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(buy['availableQuantity'], '120')
         self.assertEqual(self.exchange.ad['availableQuantity'], '109')
         self.assertEqual(self.journal.step(self.cycle_id, 'reverse_replenish_buy')['result']['quantity'], '100')
+
+    async def test_buy_ad_runtime_timeout_reconciles_without_second_replenishment(self):
+        runner = self.runner()
+        runner.delay_seconds = runner.delay_max_seconds = 0
+        self.spec['buy_replenish'] = True
+        self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?', (json.dumps(self.spec), self.cycle_id))
+        self.journal.db.commit()
+        buy = copy.deepcopy(self.exchange.ad)
+        buy.update(advNo='AD-BUY', side='BUY', availableQuantity='20')
+
+        async def get_ad(adv_no):
+            return copy.deepcopy(buy if adv_no == 'AD-BUY' else self.exchange.ad)
+
+        async def ad_details(adv_no):
+            ad = buy if adv_no == 'AD-BUY' else self.exchange.ad
+            return {'id': adv_no, 'coinName': 'USDT', 'currency': 'RUB',
+                    'tradeType': 0 if adv_no == 'AD-BUY' else 1,
+                    'availableQuantity': ad['availableQuantity'], 'overVerify': ad['overVerify']}
+
+        async def replenish(plan):
+            buy['availableQuantity'] = str(Decimal(buy['availableQuantity']) + Decimal(plan['quantity']))
+            raise AdsPowerTimeout('AdsPower: команда Runtime.evaluate не ответила за 10 секунд')
+
+        runner.clients['p1'].get_ad = AsyncMock(side_effect=get_ad)
+        runner.browser.ad_details = AsyncMock(side_effect=ad_details)
+        runner.browser.replenish_ad = AsyncMock(side_effect=replenish)
+        with patch('cycle.asyncio.sleep', new=AsyncMock()):
+            with self.assertRaises(AdsPowerTimeout):
+                await runner.run(self.cycle_id)
+            self.assertEqual(self.journal.step(self.cycle_id, 'reverse_replenish_buy')['status'], 'unknown')
+            self.assertEqual(self.journal.db.execute('SELECT status FROM cycles WHERE id=?',
+                             (self.cycle_id,)).fetchone()[0], 'paused')
+            await runner.run(self.cycle_id)
+        self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
+        runner.browser.replenish_ad.assert_awaited_once()
+        self.assertEqual(buy['availableQuantity'], '120')
 
     async def test_full_auto_cycle_delays_phrases_receipts_and_one_notification(self):
         runner = self.runner()

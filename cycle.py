@@ -736,7 +736,7 @@ class CycleRunner:
             await self.close_completed_tabs()
             self.console.write("Цикл завершён.")
         except BaseException as exc:
-            transient_adspower = self.automatic and isinstance(exc, AdsPowerUnavailable)
+            transient_adspower = self.automatic and isinstance(exc, (AdsPowerUnavailable, AdsPowerTimeout))
             transient_mexc_read = self.automatic and isinstance(exc, MexcReadUnavailable)
             transient_chat = self.automatic and isinstance(exc, MexcChatUnavailable)
             transient_mutation = (self.automatic and isinstance(exc, MexcMutationUnknown)
@@ -952,6 +952,13 @@ class CycleRunner:
                          f"для этого шага нужен {' / '.join(sorted(expected))}. "
                          "Подтверждение в консоли не меняет статус на бирже. Продолжение остановлено.")
 
+    def forward_pay_method_id(self) -> int | None:
+        if self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}:
+            configured = self.spec.get('eflp_p1_pay_method_id')
+            if configured:
+                return positive_id(str(configured))
+        return self.pay_method_id
+
     async def payment_account(self, actor: str, order_no: str) -> int:
         detail = await self.clients[actor].get_order_detail(order_no)
         if str(detail.get("advOrderNo", "")) != order_no:
@@ -965,11 +972,25 @@ class CycleRunner:
                 raise ValueError("Неожиданный формат paymentInfo")
             # The account ID is paymentInfo.id; payMethod is the method type (e.g. 578).
             ids.append(positive_id(str(payment.get("id", ""))))
+        if (actor == 'p2' and self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}
+                and self.spec.get('eflp_p1_pay_method_id')):
+            selected = [ids[i] for i, payment in enumerate(payments)
+                        if str(payment.get('payMethod')) == str(self.forward_pay_method_id())]
+            if len(selected) != 1:
+                raise Paused('Первый ордер Eflp не содержит однозначных реквизитов карты П1 с выбранным payMethod')
+            return selected[0]
+        if (actor == 'p1' and self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}
+                and self.p2_payment_id):
+            selected = [account_id for account_id in ids if account_id == positive_id(self.p2_payment_id)]
+            if len(selected) != 1:
+                raise Paused('Обратный ордер Eflp не содержит выбранных реквизитов П2 из .env')
+            return selected[0]
         if len(ids) == 1:
             self.console.write(f"ID платёжных реквизитов получен из ордера: {ids[0]}")
             return ids[0]
         if self.automatic:
-            selected = [ids[i] for i, payment in enumerate(payments) if str(payment.get("payMethod")) == str(self.pay_method_id)]
+            method_id = self.forward_pay_method_id() if actor == 'p2' else self.pay_method_id
+            selected = [ids[i] for i, payment in enumerate(payments) if str(payment.get("payMethod")) == str(method_id)]
             if len(selected) == 1:
                 return selected[0]
             raise Paused("Для оплаты найдено несколько реквизитов; нужен однозначный выбор. Продолжите с --interactive.")
@@ -1041,7 +1062,14 @@ class CycleRunner:
                 if (ad.get("advNo") != adv_no or ad.get("side") != ("SELL" if leg == "forward" or p2_maker else "BUY")
                         or ad.get("coinName") != "USDT" or ad.get("fiatUnit") != self.spec["fiat"]):
                     raise Paused("Объявление не соответствует владельцу, стороне сделки, токену или валюте")
-                if leg == "forward" or p2_maker:
+                if leg == 'forward' and self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}:
+                    configured_method = self.forward_pay_method_id()
+                    payments = ad.get('paymentInfo')
+                    if not isinstance(payments, list) or not payments or not all(isinstance(p, dict) for p in payments):
+                        raise Paused('MEXC не вернул способы оплаты объявления П1; первый ордер Eflp не открыт')
+                    if str(configured_method) not in {str(p.get('payMethod')) for p in payments}:
+                        raise Paused(f'Способ оплаты {configured_method} не найден в объявлении П1; первый ордер Eflp не открыт')
+                if (leg == "forward" or p2_maker) and self.spec.get('scheduler_mode') not in {'eflp_volume', 'eflp_unique'}:
                     # A configured fallback is not evidence that the live checkbox is on.
                     browser = self.maker_browser if p2_maker else self.browser
                     actual = await browser.ad_details(adv_no) if ad.get('overVerify') is None else ad
@@ -1078,7 +1106,7 @@ class CycleRunner:
                                                      'новая покупка не отправлена')
                 self.console.write(f"После подтверждения П2 откроет сделку по объявлению {args['adv_no']} "
                                    f"на {self.spec['amount']} {self.spec['fiat']}.")
-                args.update(amount=self.spec["amount"], user_confirm_pay_method_id=self.pay_method_id or self.console.ask(
+                args.update(amount=self.spec["amount"], user_confirm_pay_method_id=self.forward_pay_method_id() or self.console.ask(
                     "ID способа оплаты из объявления (не номер карты)", validate=positive_id))
             elif self.spec.get('reverse_maker') == 'p2':
                 ad = await self.clients['p2'].get_ad(args['adv_no'])
@@ -1359,7 +1387,9 @@ class CycleRunner:
     def check_replenished(self, ad: dict, plan: dict):
         # Only compare an actual exchange field. The fallback is not remote evidence.
         if plan.get("over_verify") and ad.get("overVerify") is not None:
-            if ad_verification(ad) != plan["over_verify"]:
+            verification = (json.dumps(ad['overVerify'], sort_keys=True, ensure_ascii=False)
+                            if plan.get('side') == 'BUY' else ad_verification(ad))
+            if verification != plan["over_verify"]:
                 raise Paused("Настройка дополнительной проверки после пополнения изменилась; повтор пополнения запрещён. Проверьте объявление на MEXC")
         if 'target_total' in plan:
             matched = (Decimal(str(ad.get('availableQuantity', 'NaN')))
@@ -1456,6 +1486,15 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                           getattr(args, 'p1_profile', None) or 'p1')
             scheduler_mode = (existing['spec'].get('scheduler_mode') if existing else
                                getattr(args, 'scheduler_mode', None))
+            eflp_p1_pay_method_id = None
+            if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing:
+                raw_method = os.getenv('EFLP_P1_PAY_METHOD_ID', '').strip()
+                if not raw_method:
+                    raise ValueError('Для Eflp задайте EFLP_P1_PAY_METHOD_ID — payMethod карты П1 из объявления продажи')
+                try:
+                    eflp_p1_pay_method_id = positive_id(raw_method)
+                except ValueError:
+                    raise ValueError('EFLP_P1_PAY_METHOD_ID должен быть положительным числовым payMethod') from None
             if scheduler_mode == 'cash_volume':
                 cash_route_setting = (existing['spec'].get('cash_final_return', 'p2p') if existing else
                                       'ordinary')
@@ -1604,7 +1643,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                     'cash_wait_max_seconds': cash_wait_max}
                    if scheduler_mode == 'cash_volume' and not existing else {})
                 | ({'eflp_wait_min_seconds': eflp_wait_min,
-                    'eflp_wait_max_seconds': eflp_wait_max}
+                    'eflp_wait_max_seconds': eflp_wait_max,
+                    'eflp_p1_pay_method_id': eflp_p1_pay_method_id}
                    if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing else {})
                 | ({'adspower_profiles': browser_ids} if browser_ids else {})
                 | ({"series": plan} if plan else {}))

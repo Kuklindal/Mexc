@@ -15,7 +15,7 @@ import random
 from config import Settings, p2_nickname, p2_profile_name
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, run_command
 from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, MexcP2PClient, MexcReadUnavailable
-from adspower import AdsPowerClickUnknown, AdsPowerUnavailable
+from adspower import AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable
 from rollover import (STATE_KEY, amount_from_ad, cycle_rowid, load_state, profiles_from_env,
                       save_state, wait_until)
 from trade_profiles import profile_from_env, profile_prefix, validate_unique_profiles
@@ -705,7 +705,7 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None)
                 limit_skipped = True
                 continue
             except (MexcReadUnavailable, MexcChatUnavailable, MexcMutationUnknown,
-                    AdsPowerClickUnknown, AdsPowerUnavailable) as exc:
+                    AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable) as exc:
                 state['status'] = 'waiting'
                 state['last_error'] = str(exc)[:300]
                 save_state(journal, state)
