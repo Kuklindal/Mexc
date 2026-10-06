@@ -307,6 +307,32 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(clients), 4)
         self.assertTrue(all(client.close.await_count == 1 for client in clients))
 
+    async def test_eflp_volume_has_no_200_usdt_minimum_and_uses_100_to_150_offset(self):
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        sell = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL',
+                'coinName': 'USDT', 'fiatUnit': 'RUB', 'advStatus': 'OPEN',
+                'price': '100', 'maxSingleTransAmount': '18000',
+                'minSingleTransAmount': '1000', 'availableQuantity': '180'}
+        buy = dict(sell, advNo=env['MEXC_P1_BUY_ADV_NO'], side='BUY')
+        client = type('Client', (), {})()
+        client.get_ad = AsyncMock(side_effect=lambda ad_no: sell if ad_no == sell['advNo'] else buy)
+        client.close = AsyncMock()
+        with (patch.dict(os.environ, env),
+              patch('trade_modes.MexcP2PClient', return_value=client),
+              patch('trade_modes.random.randint', return_value=125) as draw):
+            amount = await choose_mode_amount('eflp_volume', 'p1', '1', {}, env)
+            quantity = Decimal(amount.split()[0]) / Decimal('100')
+            self.assertLess(quantity, 200)
+            self.assertGreaterEqual(Decimal('180') - quantity, 100)
+            self.assertLessEqual(Decimal('180') - quantity, 150)
+            draw.assert_called_once_with(100, 150)
+            sell['maxSingleTransAmount'] = buy['maxSingleTransAmount'] = '8000'
+            sell['availableQuantity'] = buy['availableQuantity'] = '80'
+            amount = await choose_mode_amount('eflp_volume', 'p1', '1', {}, env)
+            self.assertGreaterEqual(Decimal(amount.split()[0]), Decimal('1000'))
+            self.assertLess(Decimal(amount.split()[0]), Decimal('8000'))
+            draw.assert_called_once()
+
     async def test_cash_amount_uses_journal_across_runs_and_stops_before_70k(self):
         self.journal.abandon(self.cycle_id)
         env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}

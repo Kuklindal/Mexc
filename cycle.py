@@ -1148,7 +1148,8 @@ class CycleRunner:
         if action in {"message", "reply"}:
             if self.automatic:
                 from phrases import PHRASES
-                text = random.choice(PHRASES[step.key])
+                selected = self.spec.get('eflp_phrases') or PHRASES
+                text = random.choice(selected[step.key])
             else:
                 text = self.console.ask("Текст сообщения", "Здравствуйте! Готов к сделке." if action == "message" else "Здравствуйте! Вижу ваш ордер.")
             if len(text) > 2000:
@@ -1623,6 +1624,10 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 if (not math.isfinite(eflp_wait_min) or not math.isfinite(eflp_wait_max)
                         or not 1 <= eflp_wait_min <= eflp_wait_max <= 600):
                     raise ValueError('EFLP_WAIT_MIN_SECONDS/MAX_SECONDS: укажите интервал от 1 до 600 секунд')
+            eflp_phrases = None
+            if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing:
+                from phrases import phrases_for_mode
+                eflp_phrases = phrases_for_mode(scheduler_mode, os.environ)
             amount_input = f"{random_amount(plan)} {plan['fiat']}" if plan else (args.amount or "")
             cycle_id = args.resume or journal.create(new_spec(console, mode, profiles,
                 sell_adv_no=os.getenv(f"{prefixes['p1']}_SELL_ADV_NO", ""),
@@ -1644,7 +1649,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                    if scheduler_mode == 'cash_volume' and not existing else {})
                 | ({'eflp_wait_min_seconds': eflp_wait_min,
                     'eflp_wait_max_seconds': eflp_wait_max,
-                    'eflp_p1_pay_method_id': eflp_p1_pay_method_id}
+                    'eflp_p1_pay_method_id': eflp_p1_pay_method_id,
+                    'eflp_phrases': eflp_phrases}
                    if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing else {})
                 | ({'adspower_profiles': browser_ids} if browser_ids else {})
                 | ({"series": plan} if plan else {}))

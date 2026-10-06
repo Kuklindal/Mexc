@@ -237,6 +237,28 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.journal.sales()[0]["quantity"], "100")
         self.assertTrue(self.journal.sales()[0]["completed_at"])
 
+    async def test_eflp_uses_its_saved_chat_phrases_not_cash_phrases(self):
+        from phrases import PHRASES, phrases_for_mode
+
+        selected = phrases_for_mode('eflp_volume', {
+            'EFLP_FORWARD_MESSAGE_PHRASES': 'Банковская карта|Оплата по карте',
+            'EFLP_FORWARD_REPLY_PHRASES': 'Жду оплату',
+            'EFLP_REVERSE_MESSAGE_PHRASES': 'Продаю USDT',
+            'EFLP_REVERSE_REPLY_PHRASES': 'Оплачу ордер',
+        })
+        runner = self.runner()
+        runner.cycle_id = self.cycle_id
+        runner.spec = dict(self.spec, scheduler_mode='eflp_volume', eflp_phrases=selected)
+        result = await runner.prepare(Step('forward_reply', 'p1', 'reply'), recovery=False)
+        self.assertEqual(result['text'], 'Жду оплату')
+        self.assertNotIn(result['text'], PHRASES['forward_reply'])
+        with patch('cycle.random.choice', return_value='Оплата по карте'):
+            result = await runner.prepare(Step('forward_message', 'p2', 'message'), recovery=False)
+        self.assertEqual(result['text'], 'Оплата по карте')
+        self.assertEqual(phrases_for_mode('cash_volume'), PHRASES)
+        with self.assertRaisesRegex(ValueError, 'EFLP_FORWARD_MESSAGE_PHRASES'):
+            phrases_for_mode('eflp_unique', {'EFLP_FORWARD_MESSAGE_PHRASES': 'текст||текст'})
+
     async def test_unknown_chat_keeps_exact_phrase_for_telegram_recovery(self):
         runner = self.runner()
         runner.delay_seconds = runner.delay_max_seconds = 0

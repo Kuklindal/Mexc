@@ -16,6 +16,7 @@ from config import Settings, p2_nickname, p2_profile_name
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, run_command
 from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, MexcP2PClient, MexcReadUnavailable
 from adspower import AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable
+from phrases import phrases_for_mode
 from rollover import (STATE_KEY, amount_from_ad, cycle_rowid, load_state, profiles_from_env,
                       save_state, wait_until)
 from trade_profiles import (eflp_p1_profiles, profile_from_env, profile_prefix,
@@ -100,6 +101,7 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
             members.add(member)
             keys.add(key)
     elif mode in {'eflp_volume', 'eflp_unique'}:
+        phrases_for_mode(mode, env)
         chosen = list(p2_profiles or [])
         minimum = 20 if mode == 'eflp_unique' else 1
         if p1_profile not in eflp_p1_profiles(env):
@@ -225,6 +227,38 @@ def _fiat_amount(low_usdt, high_usdt, price, fiat):
     return f'{Decimal(random.randint(low_cents, high_cents)) / 100:.2f} {fiat}'
 
 
+def _eflp_volume_amount(sell, price, fiat, buy_min_usdt, buy_max_usdt):
+    """Trade near the live ad cap without the legacy 200 USDT bot minimum."""
+    try:
+        maximum = Decimal(str(sell['maxSingleTransAmount']))
+        minimum = Decimal(str(sell['minSingleTransAmount']))
+        available = Decimal(str(sell['availableQuantity']))
+    except (KeyError, ValueError, ArithmeticError):
+        raise Paused('Не удалось прочитать лимиты объявления продажи П1') from None
+    if (not all(value.is_finite() for value in (maximum, minimum, available))
+            or maximum <= 0 or minimum < 0 or available <= 0):
+        raise Paused('Некорректные лимиты объявления продажи П1')
+    # Leave a cent and a small quantity buffer for exchange rounding.
+    upper = min((maximum - Decimal('0.01')) / price,
+                available - Decimal('0.0001'),
+                buy_max_usdt - Decimal('0.0001'))
+    lower = max(minimum / price, buy_min_usdt) + Decimal('0.0001')
+    low_cents = int((lower * price * 100).to_integral_value(rounding='ROUND_CEILING'))
+    high_cents = int((upper * price * 100).to_integral_value(rounding=ROUND_DOWN))
+    if low_cents > high_cents or high_cents <= 0:
+        raise Paused('У объявлений П1 нет пересечения лимитов для нового ордера')
+    headroom = upper - lower
+    if headroom >= 100:
+        offset = Decimal(random.randint(100, min(150, int(headroom))))
+        selected = upper - offset
+        cents = int((selected * price * 100).to_integral_value(rounding=ROUND_DOWN))
+    else:
+        # A 100 USDT offset would make the order invalid; use the available cap.
+        cents = high_cents
+    cents = min(high_cents, max(low_cents, cents))
+    return f'{Decimal(cents) / 100:.2f} {fiat}'
+
+
 async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journal=None):
     """Re-read the advertisements needed by this mode before every cycle."""
     p1 = profile_from_env(p1_key, env)
@@ -274,7 +308,9 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
                 raise Paused('Некорректная цена, лимит или остаток объявления покупки П1')
             buy_max_usdt = min((buy_max - Decimal('0.01')) / buy_price, buy_available)
             buy_min_usdt = buy_min / buy_price
-        if mode in {'volume', 'cash_volume', 'eflp_volume'}:
+        if mode == 'eflp_volume':
+            amount = _eflp_volume_amount(sell, p1_price, fiat, buy_min_usdt, buy_max_usdt)
+        elif mode in {'volume', 'cash_volume'}:
             _, high_fiat, _ = amount_from_ad(sell)
             high_usdt = min(high_fiat / p1_price, reverse_max_usdt, buy_max_usdt)
             p1_min_usdt = Decimal(str(sell['minSingleTransAmount'])) / p1_price
@@ -282,13 +318,14 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
                            reverse_min_usdt, buy_min_usdt)
             if high_usdt < 200:
                 raise Paused(f'🚨 Доступный новый ордер меньше 200 USDT ({high_usdt:.2f}); проверьте объявления')
+            amount = _fiat_amount(low_usdt, high_usdt, p1_price, fiat)
         else:
             p1_min = Decimal(str(sell['minSingleTransAmount'])) / p1_price
             p1_max = min(Decimal(str(sell['maxSingleTransAmount'])) / p1_price,
                          Decimal(str(sell['availableQuantity'])))
             low_usdt = max(Decimal(50), p1_min, reverse_min_usdt, buy_min_usdt)
             high_usdt = min(Decimal(100), p1_max, reverse_max_usdt, buy_max_usdt)
-        amount = _fiat_amount(low_usdt, high_usdt, p1_price, fiat)
+            amount = _fiat_amount(low_usdt, high_usdt, p1_price, fiat)
         if mode in {'volume', 'cash_volume'}:
             projected = Decimal(amount.split()[0]) / p1_price
             window = (rolling_cash_purchases(journal, p2_key,
