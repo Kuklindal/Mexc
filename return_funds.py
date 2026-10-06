@@ -306,8 +306,8 @@ async def finish_return(journal, state, stop_event):
     from adspower import AdsPower
     pending = state['pending_return']
     p1_key = pending.get('p1_profile', 'p1')
-    p1_settings = (Settings.from_env('p1') if p1_key == 'p1'
-                   else Settings.from_env('p2', p2_profile=p1_key))
+    from trade_profiles import settings_for_profile
+    p1_settings = settings_for_profile(p1_key)
     p2_settings = Settings.from_env('p2', p2_profile=pending['profile'])
     p1 = MexcP2PClient(p1_settings.api_key, p1_settings.secret_key, p1_settings.base_url,
                        p1_settings.recv_window, proxy_url=p1_settings.proxy_url)

@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Mapping
 
-from config import p2_prefix, p2_profile_name
+from config import Settings, p2_prefix, p2_profile_name
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,28 @@ class TradeProfile:
 
 
 def profile_prefix(key: str) -> str:
-    return 'MEXC_P1' if key == 'p1' else p2_prefix(p2_profile_name(key))
+    if key == 'p1':
+        return 'MEXC_P1'
+    if re.fullmatch(r'p1_[a-z0-9_]{1,29}', key):
+        return 'MEXC_' + key.upper()
+    return p2_prefix(p2_profile_name(key))
+
+
+def eflp_p1_profiles(env: Mapping[str, str]) -> list[str]:
+    """Dedicated Eflp maker accounts; never infer them from the P2 pool."""
+    raw = (env.get('EFLP_P1_PROFILES') or 'p1').strip()
+    keys = [part.strip().lower() for part in raw.split(',')]
+    if (not all(key == 'p1' or re.fullmatch(r'p1_[a-z0-9_]{1,29}', key)
+                for key in keys) or len(keys) != len(set(keys))):
+        raise ValueError('EFLP_P1_PROFILES: укажите разные ключи p1,p1_2,p1_3 через запятую')
+    return keys
+
+
+def settings_for_profile(key: str) -> Settings:
+    """Resolve a saved account key, including legacy P2 accounts used as P1."""
+    if key == 'p1' or re.fullmatch(r'p1_[a-z0-9_]{1,29}', key):
+        return Settings.from_env('p1', p1_profile=key)
+    return Settings.from_env('p2', p2_profile=key)
 
 
 def profile_from_env(key: str, env: Mapping[str, str]) -> TradeProfile:
@@ -42,10 +63,11 @@ def profile_from_env(key: str, env: Mapping[str, str]) -> TradeProfile:
                         env[ads_field].strip())
 
 
-def ready_p1_profiles(p2_names: list[str], env: Mapping[str, str]) -> list[TradeProfile]:
+def ready_p1_profiles(p2_names: list[str], env: Mapping[str, str], *,
+                      include_main: bool = True) -> list[TradeProfile]:
     """Show only accounts with credentials, a sell ad and an AdsPower profile."""
     ready = []
-    for key in ['p1', *p2_names]:
+    for key in (['p1', *p2_names] if include_main else p2_names):
         try:
             ready.append(profile_from_env(key, env))
         except ValueError:

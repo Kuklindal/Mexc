@@ -18,7 +18,8 @@ from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, 
 from adspower import AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable
 from rollover import (STATE_KEY, amount_from_ad, cycle_rowid, load_state, profiles_from_env,
                       save_state, wait_until)
-from trade_profiles import profile_from_env, profile_prefix, validate_unique_profiles
+from trade_profiles import (eflp_p1_profiles, profile_from_env, profile_prefix,
+                            settings_for_profile, validate_unique_profiles)
 from volume_policy import (TARGET_USDT, CEILING_USDT, CASH_TARGET_USDT, CASH_CEILING_USDT,
                            cooldown_until, record_purchase, rolling_cash_purchases,
                            rolling_cash_retry_at, window_for)
@@ -36,6 +37,8 @@ def configured_mode_profiles(mode: str, env=os.environ) -> tuple[str | None, lis
     if not raw or any(not item.strip() for item in raw.split(',')):
         raise ValueError(f'{p2_field}: укажите ключи П2 через запятую, например default,2,3')
     profiles = [p2_profile_name(item) for item in raw.split(',')]
+    if mode in {'eflp_volume', 'eflp_unique'} and any(name.startswith('p1_') for name in profiles):
+        raise ValueError(f'{p2_field}: ключи p1_2, p1_3 зарезервированы для отдельных П1')
     if len(profiles) != len(set(profiles)):
         raise ValueError(f'{p2_field}: один профиль П2 указан несколько раз')
     known = set(profiles_from_env(env))
@@ -99,6 +102,8 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
     elif mode in {'eflp_volume', 'eflp_unique'}:
         chosen = list(p2_profiles or [])
         minimum = 20 if mode == 'eflp_unique' else 1
+        if p1_profile not in eflp_p1_profiles(env):
+            raise ValueError('Выбранного П1 нет в EFLP_P1_PROFILES')
         if (len(chosen) < minimum or len(chosen) != len(set(chosen))
                 or any(name not in names for name in chosen) or p1_profile in chosen):
             raise ValueError(f'Выберите не менее {minimum} разных П2, не включая П1')
@@ -225,8 +230,7 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
     p1 = profile_from_env(p1_key, env)
     eflp = mode in {'eflp_volume', 'eflp_unique'}
     p2 = None if eflp or mode == 'cash_volume' else profile_from_env(p2_key, env)
-    p1_settings = (Settings.from_env('p1') if p1_key == 'p1'
-                   else Settings.from_env('p2', p2_profile=p1_key))
+    p1_settings = settings_for_profile(p1_key)
     settings = [p1_settings]
     if not eflp and mode != 'cash_volume':
         settings.append(Settings.from_env('p2', p2_profile=p2_key))

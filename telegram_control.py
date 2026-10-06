@@ -146,14 +146,17 @@ class TelegramControl:
             rows.append((('↩️ Назад', 'back'),))
         if (not self.running or force_idle) and not pending and not series_active:
             if self.menu == 'cash_p1':
-                from trade_profiles import ready_p1_profiles, profile_prefix
+                from trade_profiles import eflp_p1_profiles, ready_p1_profiles, profile_prefix
                 from trade_modes import configured_mode_profiles
                 try:
                     fixed_p2 = (set(configured_mode_profiles(self.selected_mode)[1])
                                 if self.selected_mode in {'eflp_volume', 'eflp_unique'} else set())
                 except ValueError:
                     fixed_p2 = set()
-                choices = [item for item in ready_p1_profiles(profiles_from_env(), os.environ)
+                p1_keys = (eflp_p1_profiles(os.environ)
+                           if self.selected_mode in {'eflp_volume', 'eflp_unique'}
+                           else ['p1', *profiles_from_env()])
+                choices = [item for item in ready_p1_profiles(p1_keys, os.environ, include_main=False)
                            if item.key not in fixed_p2
                            and os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()]
                 rows.extend(tuple((item.nickname, 'cash_p1:' + item.key) for item in choices[i:i + 2])
@@ -294,8 +297,8 @@ class TelegramControl:
             profile = cycle['spec'].get('p2_profile', 'default')
             actor = target['actor']
             selected = (profile if actor == 'p2' else cycle['spec'].get('p1_profile', 'p1'))
-            settings = (Settings.from_env('p1') if selected == 'p1' else
-                        Settings.from_env('p2', p2_profile=selected))
+            from trade_profiles import settings_for_profile
+            settings = settings_for_profile(selected)
             if fingerprint(settings.api_key) != cycle['spec'].get('profiles', {}).get(actor):
                 return await self.reply('API-ключ профиля изменился. Сообщение не отправлено.')
             client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url,
@@ -496,13 +499,14 @@ class TelegramControl:
             return await self.launch_trade_mode('cash_volume', p1, chosen)
         if action in {'eflp_volume', 'eflp_unique'}:
             from rollover import load_state, profiles_from_env
-            from trade_profiles import ready_p1_profiles, profile_prefix
+            from trade_profiles import eflp_p1_profiles, ready_p1_profiles, profile_prefix
             from trade_modes import configured_mode_profiles
             saved = load_state(self.journal)
             if self.running or self.unfinished() or (saved and saved['status'] not in {'done', 'stopped'}):
                 return await self.reply('Сначала заверши или продолжи сохранённую серию.')
             fixed_p2 = set(configured_mode_profiles(action)[1])
-            choices = [item for item in ready_p1_profiles(profiles_from_env(), os.environ)
+            choices = [item for item in ready_p1_profiles(eflp_p1_profiles(os.environ), os.environ,
+                                                         include_main=False)
                        if item.key not in fixed_p2
                        and os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()]
             if not choices:
@@ -520,9 +524,12 @@ class TelegramControl:
             return await self.reply(f'Выбери П1 для режима «{labels[action]}».{suffix}')
         if action.startswith('cash_p1:'):
             from rollover import profiles_from_env
-            from trade_profiles import ready_p1_profiles, profile_prefix
+            from trade_profiles import eflp_p1_profiles, ready_p1_profiles, profile_prefix
             name = action.split(':', 1)[1]
-            ready = {item.key for item in ready_p1_profiles(profiles_from_env(), os.environ)
+            p1_keys = (eflp_p1_profiles(os.environ)
+                       if self.selected_mode in {'eflp_volume', 'eflp_unique'}
+                       else ['p1', *profiles_from_env()])
+            ready = {item.key for item in ready_p1_profiles(p1_keys, os.environ, include_main=False)
                      if os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()}
             if self.selected_mode in {'eflp_volume', 'eflp_unique'}:
                 from trade_modes import configured_mode_profiles

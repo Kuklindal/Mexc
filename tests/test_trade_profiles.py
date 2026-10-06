@@ -1,6 +1,9 @@
+import os
 import unittest
+from unittest.mock import patch
 
-from trade_profiles import profile_from_env, ready_p1_profiles, validate_unique_profiles
+from trade_profiles import (eflp_p1_profiles, profile_from_env, ready_p1_profiles,
+                            settings_for_profile, validate_unique_profiles)
 
 
 def configuration(count=20):
@@ -20,6 +23,24 @@ def configuration(count=20):
 
 
 class TradeProfileTests(unittest.TestCase):
+    def test_dedicated_eflp_p1_accounts_are_separate_from_p2(self):
+        env = configuration(2)
+        env.update({'EFLP_P1_PROFILES': 'p1,p1_2',
+                    'MEXC_P1_2_API_KEY': 'second-maker-key',
+                    'MEXC_P1_2_SECRET_KEY': 'second-maker-secret',
+                    'MEXC_P1_2_MEMBER_ID': 'second-maker-member',
+                    'MEXC_P1_2_NICKNAME': 'second-maker',
+                    'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456788',
+                    'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-maker-browser'})
+        self.assertEqual(eflp_p1_profiles(env), ['p1', 'p1_2'])
+        self.assertEqual([item.key for item in ready_p1_profiles(
+            eflp_p1_profiles(env), env, include_main=False)], ['p1', 'p1_2'])
+        self.assertEqual(profile_from_env('p1_2', env).member_id, 'second-maker-member')
+        with patch.dict(os.environ, env):
+            self.assertEqual(settings_for_profile('p1_2').api_key, 'second-maker-key')
+        with self.assertRaisesRegex(ValueError, 'EFLP_P1_PROFILES'):
+            eflp_p1_profiles({'EFLP_P1_PROFILES': 'p1,p1,p2_2'})
+
     def test_dynamic_p1_and_twenty_distinct_p2(self):
         env = configuration(21)
         p1, p2 = validate_unique_profiles('1', [str(i) for i in range(2, 22)], env)

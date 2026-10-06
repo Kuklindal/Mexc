@@ -1510,7 +1510,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 raise ValueError('Режим сохранённого цикла менять нельзя')
             if p1_profile != 'p1':
                 p1_profile = p2_profile_name(p1_profile)
-            prefixes = {"p1": "MEXC_P1" if p1_profile == 'p1' else p2_prefix(p1_profile),
+            from trade_profiles import profile_prefix, settings_for_profile
+            prefixes = {"p1": profile_prefix(p1_profile),
                         "p2": p2_prefix(p2_profile)}
             p2_payment_id = os.getenv(f"{prefixes['p2']}_PAYMENT_ID", "").strip()
             if p2_payment_id:
@@ -1543,8 +1544,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                     raise ValueError("Для API-цикла установите ENABLE_STATE_CHANGES=true в .env")
                 for actor in ("p1", "p2"):
                     selected = p1_profile if actor == 'p1' else p2_profile
-                    profile = (Settings.from_env('p1') if selected == 'p1' else
-                               Settings.from_env('p2', p2_profile=selected))
+                    profile = settings_for_profile(selected)
                     profiles[actor] = fingerprint(profile.api_key)
                     clients[actor] = MexcP2PClient(profile.api_key, profile.secret_key, profile.base_url,
                                                    profile.recv_window, proxy_url=profile.proxy_url,

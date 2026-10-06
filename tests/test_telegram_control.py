@@ -219,6 +219,14 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.journal.abandon(self.cycle_id)
         env = env_for(2) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
                             'MEXC_P2_2_BUY_ADV_NO': 'a1234567890123456787',
+                            'EFLP_P1_PROFILES': 'p1,p1_2',
+                            'MEXC_P1_2_API_KEY': 'second-maker-key',
+                            'MEXC_P1_2_SECRET_KEY': 'second-maker-secret',
+                            'MEXC_P1_2_MEMBER_ID': 'second-maker-member',
+                            'MEXC_P1_2_NICKNAME': 'Second maker',
+                            'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456789',
+                            'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456787',
+                            'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-maker-browser',
                             'MEXC_P2_1_PAYMENT_ID': '1001',
                             'MEXC_P2_2_PAYMENT_ID': '1002',
                             'EFLP_VOLUME_P2_PROFILES': '2,1'}
@@ -227,6 +235,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             await control.perform('eflp_volume')
             self.assertEqual(control.menu, 'cash_p1')
             self.assertEqual(control.selected_mode, 'eflp_volume')
+            self.assertIn('Second maker', self.buttons(control))
             self.assertFalse(any(button['callback_data'].endswith('cash_p1:2')
                                  for row in control.keyboard()['inline_keyboard'] for button in row))
             with patch.object(control, 'work_rollover', new_callable=AsyncMock):
@@ -241,20 +250,28 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         from rollover import load_state
         self.journal.abandon(self.cycle_id)
         env = env_for(21) | {
-            'MEXC_P2_21_BUY_ADV_NO': 'a1234567890123456788',
+            'EFLP_P1_PROFILES': 'p1_2',
+            'MEXC_P1_2_API_KEY': 'other-p1-key',
+            'MEXC_P1_2_SECRET_KEY': 'other-p1-secret',
+            'MEXC_P1_2_MEMBER_ID': 'other-p1-member',
+            'MEXC_P1_2_NICKNAME': 'Other maker',
+            'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456789',
+            'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456788',
+            'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'other-p1-browser',
             'EFLP_UNIQUE_P2_PROFILES': ','.join(str(i) for i in range(1, 21))}
         with patch.dict(os.environ, env):
             control = self.control()
             await control.perform('eflp_unique')
             self.assertEqual(control.menu, 'cash_p1')
             self.assertEqual(control.selected_mode, 'eflp_unique')
-            self.assertFalse(any(button['callback_data'].endswith('cash_p1:1')
+            self.assertFalse(any(button['callback_data'].endswith('cash_p1:p1')
                                  for row in control.keyboard()['inline_keyboard'] for button in row))
+            self.assertIn('Other maker', self.buttons(control))
             with patch.object(control, 'work_rollover', new_callable=AsyncMock):
-                await control.perform('cash_p1:21')
+                await control.perform('cash_p1:p1_2')
                 await asyncio.sleep(0)
             self.assertIsNone(control.menu)
-            self.assertEqual(load_state(self.journal)['p1_profile'], '21')
+            self.assertEqual(load_state(self.journal)['p1_profile'], 'p1_2')
             self.assertEqual(load_state(self.journal)['profiles'], [str(i) for i in range(1, 21)])
 
     async def test_unique_toggle_edits_same_telegram_menu(self):

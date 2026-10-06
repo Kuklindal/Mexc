@@ -84,12 +84,19 @@ class Settings:
 
     @classmethod
     def from_env(cls, account: str | None = None, *, require_keys: bool = True,
-                 p2_profile: str | None = None) -> "Settings":
+                 p2_profile: str | None = None, p1_profile: str | None = None) -> "Settings":
         prefix = f"MEXC_{account.upper()}" if account else "MEXC"
         if p2_profile is not None and account != "p2":
             raise ValueError("Профиль П2 можно выбирать только для аккаунта p2")
+        if p1_profile is not None and account != "p1":
+            raise ValueError("Профиль П1 можно выбирать только для аккаунта p1")
         if account == "p2":
             prefix = p2_prefix(select_p2_profile(p2_profile, None, os.environ))
+        elif account == "p1" and p1_profile is not None:
+            key = p1_profile.strip().lower()
+            if key != 'p1' and not re.fullmatch(r'p1_[a-z0-9_]{1,29}', key):
+                raise ValueError('Профиль П1: используйте p1 или p1_2, p1_3 и так далее')
+            prefix = 'MEXC_P1' if key == 'p1' else 'MEXC_' + key.upper()
         api_key = os.getenv(f"{prefix}_API_KEY", "").strip()
         secret_key = os.getenv(f"{prefix}_SECRET_KEY", "").strip()
 

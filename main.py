@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--mode", choices=["api", "manual"], help="api (по умолчанию) — подтверждения в консоли; manual — действия кнопками на сайте")
     cycle.add_argument("--resume", metavar="ID", help="Продолжить сохранённый цикл")
     cycle.add_argument("--p2-profile", metavar="NAME", help="Профиль П2 из .env; при --resume берётся сохранённый")
-    cycle.add_argument("--p1-profile", metavar="NAME", help="Профиль П1: p1 или настроенный профиль П2")
+    cycle.add_argument("--p1-profile", metavar="NAME", help="Профиль П1: p1, p1_2 или ранее настроенный профиль П2")
     cycle.add_argument("--reverse-maker", choices=["p1", "p2"],
                        help="Владелец объявления обратной продажи USDT; для новых режимов — p2")
     cycle.add_argument('--scheduler-mode', choices=['volume', 'unique', 'cash_volume', 'eflp_volume', 'eflp_unique'],
