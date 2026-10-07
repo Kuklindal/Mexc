@@ -10,11 +10,48 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from deploy import open_adspower_mexc
+from deploy import manage_adspower_profile, open_adspower_mexc
 from main import build_parser
 
 
 class LinuxDeployTests(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_commands_only_change_requested_profile(self):
+        calls = []
+
+        async def handler(request):
+            calls.append((request.url.path, request.url.params.get('user_id')))
+            if request.url.path.endswith('/active'):
+                status = 'Active' if len(calls) > 1 else 'Inactive'
+                return httpx.Response(200, json={'code': 0, 'data': {'status': status}})
+            return httpx.Response(200, json={'code': 0, 'data': {}})
+
+        original_client = httpx.AsyncClient
+        configured = SimpleNamespace(base_url='http://127.0.0.1:50325', api_key='test-key')
+        with patch.object(manage_adspower_profile.AdsPower, 'from_env', return_value=configured), \
+                patch('adspower.httpx.AsyncClient', side_effect=lambda **_: original_client(
+                    transport=httpx.MockTransport(handler))), \
+                patch('adspower.AdsPower.endpoint', new=AsyncMock()), \
+                patch('adspower.asyncio.sleep', new=AsyncMock()):
+            await manage_adspower_profile.manage_profile('browser-open', 'chosen123')
+            await manage_adspower_profile.manage_profile('browser-close', 'chosen123')
+
+        self.assertEqual(calls, [
+            ('/api/v1/browser/active', 'chosen123'),
+            ('/api/v1/browser/start', 'chosen123'),
+            ('/api/v1/browser/active', 'chosen123'),
+            ('/api/v1/browser/stop', 'chosen123'),
+        ])
+        self.assertEqual(build_parser().parse_args(['browser-open', 'chosen123']).profile_id,
+                         'chosen123')
+        self.assertEqual(build_parser().parse_args(['browser-close', 'chosen123']).profile_id,
+                         'chosen123')
+
+    async def test_browser_commands_reject_invalid_profile_id_before_api(self):
+        with patch.object(manage_adspower_profile.AdsPower, 'from_env') as configured:
+            with self.assertRaises(ValueError):
+                await manage_adspower_profile.manage_profile('browser-close', '../other')
+        configured.assert_not_called()
+
     def test_parallel_instances_load_only_the_selected_env_file(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:

@@ -284,6 +284,8 @@ async def run_series(runner, cycle_id: str):
 class CycleRunner:
     def __init__(self, journal: Journal, reporter: Reporter, clients: dict,
                  console: Console, *, state_changes: bool, p2_payment_id: str = "", browser=None,
+                 p2_pay_method_id: str = "", p2_payment_browser=None,
+                 p2_payment_account_id: int | None = None,
                  pay_method_id: str = "", automatic: bool = False, delay_seconds: float = 20,
                  trusted_members: dict | None = None, p1_over_verify: str = "",
                  trusted_nicknames: dict | None = None, delay_max_seconds: float | None = None,
@@ -295,6 +297,9 @@ class CycleRunner:
         self.console = console
         self.state_changes = state_changes
         self.p2_payment_id = p2_payment_id.strip()
+        self.p2_pay_method_id = positive_id(p2_pay_method_id) if p2_pay_method_id else None
+        self.p2_payment_browser = p2_payment_browser
+        self.p2_payment_account_id = p2_payment_account_id
         self.p2_profile = p2_profile
         self.browser = browser
         self.maker_browser = maker_browser
@@ -429,6 +434,8 @@ class CycleRunner:
             raise ValueError('Профиль П1 не совпадает с сохранённым циклом')
         if "p2_payment_id" in self.spec and self.spec["p2_payment_id"] != self.p2_payment_id:
             raise ValueError("Реквизиты П2 изменились; верните настройки начатого цикла")
+        if self.spec.get('p2_pay_method_id') and int(self.spec['p2_pay_method_id']) != self.p2_pay_method_id:
+            raise ValueError('Способ оплаты П2 изменился; верните настройки начатого цикла')
         if self.spec.get("members") and self.spec["members"] != self.trusted_members:
             raise ValueError("Разрешённые участники изменились; верните настройки начатого цикла")
         if self.spec.get("nicknames") and self.spec["nicknames"] != self.trusted_nicknames:
@@ -973,17 +980,23 @@ class CycleRunner:
             # The account ID is paymentInfo.id; payMethod is the method type (e.g. 578).
             ids.append(positive_id(str(payment.get("id", ""))))
         if (actor == 'p2' and self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}
-                and self.spec.get('eflp_p1_pay_method_id')):
+                and self.forward_pay_method_id()):
             selected = [ids[i] for i, payment in enumerate(payments)
                         if str(payment.get('payMethod')) == str(self.forward_pay_method_id())]
             if len(selected) != 1:
-                raise Paused('Первый ордер Eflp не содержит однозначных реквизитов карты П1 с выбранным payMethod')
+                raise Paused('Первый ордер не содержит однозначных реквизитов П1 с выбранным payMethod')
             return selected[0]
         if (actor == 'p1' and self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}
                 and self.p2_payment_id):
             selected = [account_id for account_id in ids if account_id == positive_id(self.p2_payment_id)]
             if len(selected) != 1:
                 raise Paused('Обратный ордер Eflp не содержит выбранных реквизитов П2 из .env')
+            return selected[0]
+        if actor == 'p1' and self.p2_pay_method_id:
+            selected = [ids[i] for i, payment in enumerate(payments)
+                        if str(payment.get('payMethod')) == str(self.p2_pay_method_id)]
+            if len(selected) != 1:
+                raise Paused('Обратный ордер не содержит однозначных реквизитов П2 с выбранным payMethod')
             return selected[0]
         if len(ids) == 1:
             self.console.write(f"ID платёжных реквизитов получен из ордера: {ids[0]}")
@@ -1067,9 +1080,9 @@ class CycleRunner:
                     configured_method = self.forward_pay_method_id()
                     payments = ad.get('paymentInfo')
                     if not isinstance(payments, list) or not payments or not all(isinstance(p, dict) for p in payments):
-                        raise Paused('MEXC не вернул способы оплаты объявления П1; первый ордер Eflp не открыт')
+                        raise Paused('MEXC не вернул способы оплаты объявления П1; первый ордер не открыт')
                     if str(configured_method) not in {str(p.get('payMethod')) for p in payments}:
-                        raise Paused(f'Способ оплаты {configured_method} не найден в объявлении П1; первый ордер Eflp не открыт')
+                        raise Paused(f'Способ оплаты {configured_method} не найден в объявлении П1; первый ордер не открыт')
                 if (leg == "forward" or p2_maker) and self.spec.get('scheduler_mode') not in {'eflp_volume', 'eflp_unique'}:
                     # A configured fallback is not evidence that the live checkbox is on.
                     browser = self.maker_browser if p2_maker else self.browser
@@ -1125,7 +1138,13 @@ class CycleRunner:
                     raise Paused('Сумма обратной сделки вне лимитов объявления П2; настройте объявление или разделите возврат')
                 args.update(amount=str(amount), user_confirm_pay_method_id=self.pay_method_id)
             else:
-                if self.p2_payment_id:
+                if self.p2_pay_method_id:
+                    if not self.p2_payment_browser:
+                        raise Paused('Для получения ID реквизитов П2 по payMethod нужен его профиль AdsPower')
+                    payment_id = self.p2_payment_account_id or await self.p2_payment_browser.payment_account_by_method(
+                        self.p2_pay_method_id, self.spec['fiat'])
+                    self.console.write(f'Реквизиты П2 для {self.spec["fiat"]} определены по payMethod {self.p2_pay_method_id}.')
+                elif self.p2_payment_id:
                     payment_id = positive_id(self.p2_payment_id)
                     self.console.write(f"ID реквизитов П2 из выбранного профиля {self.p2_profile}: {payment_id}. Проверьте, что реквизиты актуальны.")
                 else:
@@ -1502,14 +1521,6 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
             scheduler_mode = (existing['spec'].get('scheduler_mode') if existing else
                                getattr(args, 'scheduler_mode', None))
             eflp_p1_pay_method_id = None
-            if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing:
-                raw_method = os.getenv('EFLP_P1_PAY_METHOD_ID', '').strip()
-                if not raw_method:
-                    raise ValueError('Для Eflp задайте EFLP_P1_PAY_METHOD_ID — payMethod карты П1 из объявления продажи')
-                try:
-                    eflp_p1_pay_method_id = positive_id(raw_method)
-                except ValueError:
-                    raise ValueError('EFLP_P1_PAY_METHOD_ID должен быть положительным числовым payMethod') from None
             if scheduler_mode == 'cash_volume':
                 cash_route_setting = (existing['spec'].get('cash_final_return', 'p2p') if existing else
                                       'ordinary')
@@ -1525,7 +1536,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 raise ValueError('Режим сохранённого цикла менять нельзя')
             if p1_profile != 'p1':
                 p1_profile = p2_profile_name(p1_profile)
-            from trade_profiles import (eflp_p1_fiat, eflp_p2_payment_id,
+            from trade_profiles import (eflp_p1_fiat, eflp_p2_payment_id, mode_pay_method_id,
                                         profile_prefix, settings_for_profile)
             prefixes = {"p1": profile_prefix(p1_profile),
                         "p2": p2_prefix(p2_profile)}
@@ -1536,14 +1547,18 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
             if series_options and not automatic:
                 raise ValueError("Диапазон суммы и --count доступны только с --auto")
             plan = auto_plan(args, os.environ) if automatic and not existing else None
-            if existing and scheduler_mode in {'eflp_volume', 'eflp_unique'}:
+            p2_pay_method_id = ''
+            if existing:
                 p2_payment_id = existing['spec'].get('p2_payment_id', '')
+                p2_pay_method_id = existing['spec'].get('p2_pay_method_id', '')
             elif scheduler_mode in {'eflp_volume', 'eflp_unique'}:
                 selected_fiat = plan['fiat'] if plan else purchase_amount(args.amount or '')[1]
                 expected_fiat = eflp_p1_fiat(p1_profile, os.environ)
                 if selected_fiat != expected_fiat:
                     raise ValueError(f'{prefixes["p1"]}_FIAT={expected_fiat}, '
                                      f'но для ордера выбрана валюта {selected_fiat}')
+                eflp_p1_pay_method_id = positive_id(mode_pay_method_id(
+                    scheduler_mode, selected_fiat, os.environ))
                 p2_payment_id = eflp_p2_payment_id(p2_profile, selected_fiat, os.environ)
             else:
                 p2_payment_id = os.getenv(f"{prefixes['p2']}_PAYMENT_ID", "").strip()
@@ -1585,6 +1600,17 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 console.write("Google Таблица не настроена: суммы продаж сохраняются локально до подключения.")
             browser = None
             maker_browser = None
+            p2_payment_browser = None
+            p2_payment_account_id = None
+            if mode == 'api' and p2_pay_method_id:
+                from adspower import AdsPower
+                payment_profile_id = os.getenv(f"{prefixes['p2']}_ADSPOWER_PROFILE_ID", '').strip()
+                if not payment_profile_id:
+                    raise ValueError(f"{prefixes['p2']}_ADSPOWER_PROFILE_ID нужен для выбора реквизитов по payMethod")
+                if existing and existing['spec'].get('p2_payment_ads_profile_id') not in {None, payment_profile_id}:
+                    raise ValueError('Профиль AdsPower П2 изменился; верните настройки начатого цикла')
+                p2_payment_browser = AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
+                                              os.getenv('ADSPOWER_API_KEY', ''), payment_profile_id)
             if mode == "api" and os.getenv("SELLER_CHECK_MODE", "manual").strip() == "adspower":
                 from adspower import AdsPower
                 browser = (AdsPower.from_env() if p1_profile == 'p1' else
@@ -1611,8 +1637,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                     raise ValueError("Для авторежима нужны разные MEXC_P1_MEMBER_ID и MEXC_P2_MEMBER_ID")
                 if not os.getenv(f"{prefixes['p1']}_SELL_ADV_NO"):
                     raise ValueError(f"Заполните {prefixes['p1']}_SELL_ADV_NO")
-                if reverse_maker == 'p1' and (not os.getenv(f"{prefixes['p1']}_BUY_ADV_NO") or not p2_payment_id):
-                    raise ValueError(f"Для старого маршрута нужны {prefixes['p1']}_BUY_ADV_NO и {prefixes['p2']}_PAYMENT_ID")
+                if reverse_maker == 'p1' and (not os.getenv(f"{prefixes['p1']}_BUY_ADV_NO") or not (p2_payment_id or p2_pay_method_id)):
+                    raise ValueError(f"Для обратного ордера нужны {prefixes['p1']}_BUY_ADV_NO и способ оплаты П2")
                 if reverse_maker == 'p2' and (not os.getenv(f"{prefixes['p2']}_SELL_ADV_NO")
                                                or not maker_browser or not maker_browser.profile_id):
                     raise ValueError(f"Для нового маршрута заполните {prefixes['p2']}_SELL_ADV_NO и {prefixes['p2']}_ADSPOWER_PROFILE_ID")
@@ -1629,6 +1655,10 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 await browser.ensure_mexc_page()
                 async with browser.connection() as call:
                     await call("Target.getTargets")
+                if p2_payment_browser and reverse_maker == 'p1' and not existing:
+                    # Check the receiving account before the first order can lock USDT.
+                    p2_payment_account_id = await p2_payment_browser.payment_account_by_method(
+                        positive_id(p2_pay_method_id), plan['fiat'] if plan else existing['spec']['fiat'])
                 if maker_browser and reverse_maker == 'p2':
                     await maker_browser.ensure_started()
                     await maker_browser.ensure_mexc_page()
@@ -1663,6 +1693,9 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 | ({"members": members} if all(members.values()) else {})
                 | ({"nicknames": nicknames} if nicknames["p2"] else {})
                 | {"p2_profile": p2_profile, "p2_payment_id": p2_payment_id}
+                | ({'p2_pay_method_id': p2_pay_method_id,
+                    'p2_payment_ads_profile_id': p2_payment_browser.profile_id}
+                   if p2_payment_browser else {})
                 | ({'scheduler_mode': args.scheduler_mode} if getattr(args, 'scheduler_mode', None) else {})
                 | ({'cash_route_selected': False,
                      'cash_final_return': cash_route_setting,
@@ -1681,6 +1714,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 | ({"series": plan} if plan else {}))
             runner = CycleRunner(journal, reporter, clients, console, state_changes=settings.enable_state_changes,
                                  p2_payment_id=p2_payment_id, p2_profile=p2_profile, browser=browser,
+                                 p2_pay_method_id=p2_pay_method_id, p2_payment_browser=p2_payment_browser,
+                                 p2_payment_account_id=p2_payment_account_id,
                                  p1_profile=p1_profile, maker_browser=maker_browser,
                                  pay_method_id=os.getenv("MEXC_PAY_METHOD_ID", "578"), automatic=automatic, delay_seconds=delay_seconds,
                                  trusted_members=members if all(members.values()) else {},

@@ -22,6 +22,11 @@ def env_for(count=20):
         'MEXC_P1_API_KEY': 'main-key', 'MEXC_P1_SECRET_KEY': 'main-secret',
         'MEXC_P1_MEMBER_ID': 'main-member', 'MEXC_P1_SELL_ADV_NO': 'a1234567890123456789',
         'MEXC_P1_FIAT': 'RUB',
+        'EFLP_PAY_METHOD_ID_RUB': '518',
+        'EFLP_PAY_METHOD_ID_GEL': '519',
+        'EFLP_PAY_METHOD_ID_KZT': '520',
+        'EFLP_PAY_METHOD_ID_TJS': '521',
+        'EFLP_PAY_METHOD_ID_KGS': '522',
         'MEXC_P1_DEPOSIT_ADDRESS_PLASMA': '0x' + '1' * 40,
         'ADSPOWER_P1_PROFILE_ID': 'main-browser',
     }
@@ -76,7 +81,7 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(configured_mode_profiles('eflp_unique', env),
                          (None, [str(i) for i in range(20, 0, -1)]))
 
-    def test_eflp_series_requires_payment_id_for_selected_p1_fiat(self):
+    def test_eflp_series_requires_common_method_and_each_p2_fiat_account_id(self):
         self.journal.abandon(self.cycle_id)
         env = env_for(1) | {'EFLP_P1_PROFILES': 'p1_3',
                             'MEXC_P1_3_API_KEY': 'gel-key',
@@ -87,19 +92,39 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                             'MEXC_P1_3_BUY_ADV_NO': 'a1234567890123456788',
                             'MEXC_P1_3_ADSPOWER_PROFILE_ID': 'gel-browser',
                             'MEXC_P1_3_FIAT': 'GEL'}
+        del env['EFLP_PAY_METHOD_ID_GEL']
+        with self.assertRaisesRegex(ValueError, 'EFLP_PAY_METHOD_ID_GEL'):
+            begin_mode(self.journal, 'eflp_volume', p1_profile='p1_3',
+                       p2_profiles=['1'], env=env)
+        env['EFLP_PAY_METHOD_ID_GEL'] = '519'
+        del env['MEXC_P2_1_ADSPOWER_PROFILE_ID']
         with self.assertRaisesRegex(ValueError, 'MEXC_P2_1_PAYMENT_ID_GEL'):
             begin_mode(self.journal, 'eflp_volume', p1_profile='p1_3',
                        p2_profiles=['1'], env=env)
-        env['MEXC_P2_1_PAYMENT_ID_GEL'] = '4567'
+        env['MEXC_P2_1_PAYMENT_ID_GEL'] = '2253483'
         state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1_3',
                            p2_profiles=['1'], env=env)
         self.assertEqual(state['p1_profile'], 'p1_3')
+
+    def test_unique_eflp_accepts_fiat_account_ids_without_p2_browsers(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(20) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        for number in range(1, 21):
+            del env[f'MEXC_P2_{number}_ADSPOWER_PROFILE_ID']
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=[str(number) for number in range(1, 21)], env=env)
+        self.assertEqual(len(state['profiles']), 20)
 
     def test_cash_mode_uses_ordinary_return_without_p2_maker_or_deposit(self):
         self.journal.abandon(self.cycle_id)
         env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
         del env['MEXC_P2_1_SELL_ADV_NO']
         del env['MEXC_P2_1_ADSPOWER_PROFILE_ID']
+        del env['MEXC_P2_1_PAYMENT_ID']
+        with self.assertRaisesRegex(ValueError, 'MEXC_P2_1_PAYMENT_ID'):
+            begin_mode(self.journal, 'cash_volume', p1_profile='p1',
+                       p2_profiles=['1'], env=env)
+        env['MEXC_P2_1_PAYMENT_ID'] = '1001'
         state = begin_mode(self.journal, 'cash_volume', p1_profile='p1',
                            p2_profiles=['1'], env=env)
         self.assertEqual(state['profiles'], ['1'])
@@ -262,6 +287,64 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
             await run_mode(self.journal, state, asyncio.Event(), None)
         trade.assert_not_awaited()
         self.assertEqual(state['status'], 'done')
+
+    async def test_eflp_volume_notifies_when_each_p2_reaches_target(self):
+        from rollover import save_state
+
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+                                   'p1_profile': 'p1', 'p2_profile': '1',
+                                   'nicknames': {'p1': 'Maker', 'p2': 'Buyer'}})
+        self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+                                result={'quantity': '20050'},
+                                context={'amount': '100000', 'quantity': '20050'})
+        self.complete(cid, '20050')
+        state['active_cycle'] = cid
+        save_state(self.journal, state)
+        _finish_completed_cycle(self.journal, state, cid, '1')
+        event = self.journal.step(cid, 'eflp_profile_done')
+        self.assertEqual(event['status'], 'done')
+        notices = [row for row in self.journal.pending('telegram')
+                   if row['step'] == 'eflp_profile_done']
+        self.assertEqual(len(notices), 1)
+        self.assertIn('П1: Maker', notices[0]['message'])
+        self.assertIn('П2: Buyer', notices[0]['message'])
+        self.assertIn('20050', notices[0]['message'])
+
+    async def test_eflp_final_notice_survives_failed_send_and_restart(self):
+        from rollover import cycle_rowid, save_state
+
+        self.journal.abandon(self.cycle_id)
+        env = env_for(20) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=[str(i) for i in range(1, 21)], env=env)
+        cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_unique',
+                                   'p1_profile': 'p1', 'p2_profile': '20',
+                                   'nicknames': {'p1': 'Maker', 'p2': 'Buyer 20'}})
+        self.complete(cid, '80')
+        state.update(unique_done=list(state['profiles']), last_cycle_rowid=cycle_rowid(self.journal, cid))
+        save_state(self.journal, state)
+        telegram = type('Telegram', (), {'enabled': True,
+            'send': AsyncMock(side_effect=[False, True])})()
+        with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
+            await run_mode(self.journal, state, asyncio.Event(), telegram)
+            self.assertEqual(state['status'], 'done')
+            self.assertEqual(telegram.send.await_count, 1)
+            pending = [row for row in self.journal.pending('telegram')
+                       if row['step'] == 'eflp_mode_done']
+            self.assertEqual(len(pending), 1)
+            self.assertIn('П1: Maker', pending[0]['message'])
+            self.assertIn('Уникальных П2: 20', pending[0]['message'])
+            await run_mode(self.journal, state, asyncio.Event(), telegram)
+        trade.assert_not_awaited()
+        self.assertEqual(telegram.send.await_count, 2)
+        self.assertFalse(any(row['step'] == 'eflp_mode_done'
+                             for row in self.journal.pending('telegram')))
+        self.assertEqual(self.journal.db.execute(
+            "SELECT COUNT(*) FROM events WHERE step='eflp_mode_done'").fetchone()[0], 1)
 
     async def test_unique_requires_twenty_and_remembers_selected_roles(self):
         self.journal.abandon(self.cycle_id)

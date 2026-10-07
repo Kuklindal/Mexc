@@ -46,6 +46,18 @@ def build_parser() -> argparse.ArgumentParser:
     browser_check = sub.add_parser("adspower-check", help="Проверить профиль П1 и кнопку ордера без нажатия")
     browser_check.add_argument("order_no")
     sub.add_parser("adspower-open", help="Открыть профиль П1 AdsPower и вкладку MEXC без действий по ордеру")
+    browser_open = sub.add_parser("browser-open", help="Открыть один профиль AdsPower по его ID")
+    browser_open.add_argument("profile_id", metavar="ID", help="ID профиля AdsPower, например k1fpushv")
+    browser_close = sub.add_parser("browser-close", help="Закрыть один профиль AdsPower по его ID")
+    browser_close.add_argument("profile_id", metavar="ID", help="ID профиля AdsPower, например k1fpushv")
+    payment_check = sub.add_parser("payment-method-check", help="Без сделки проверить реквизиты П2 по общему payMethod")
+    payment_check.add_argument("--p2-profile", required=True, metavar="NAME", help="Ключ П2 из .env, например 12")
+    payment_check.add_argument("--fiat", required=True, metavar="FIAT", help="Валюта, например KZT")
+    payment_check.add_argument("--mode", choices=["cash", "eflp"], required=True)
+    payment_ids = sub.add_parser("payment-ids", help="Прочитать ID реквизитов у выбранных П2 через AdsPower без ордеров")
+    payment_ids.add_argument("--profiles", required=True, metavar="2,3,12", help="Ключи П2 через запятую; ID AdsPower можно задать как 3=k1abc")
+    payment_ids.add_argument("--mode", choices=["cash", "eflp"], required=True)
+    payment_ids.add_argument("--fiat", metavar="FIAT", help="Валюта; для налички по умолчанию RUB")
     ad_payments = sub.add_parser("ad-payments", help="Показать ID способов оплаты из объявления П1 без создания ордера")
     ad_payments.add_argument("--p1-profile", default="p1", metavar="NAME",
                              help="Профиль П1 из .env, например p1_3")
@@ -132,6 +144,34 @@ async def async_main() -> int:
 
         await open_mexc()
         return 0
+    if args.command in {"browser-open", "browser-close"}:
+        from deploy.manage_adspower_profile import manage_profile
+
+        await manage_profile(args.command, args.profile_id)
+        return 0
+    if args.command == "payment-method-check":
+        from adspower import AdsPower
+        from config import p2_profile_name
+        from trade_profiles import mode_pay_method_id, profile_prefix
+
+        profile = p2_profile_name(args.p2_profile)
+        fiat = args.fiat.strip().upper()
+        if len(fiat) != 3 or not fiat.isascii() or not fiat.isalpha():
+            raise ValueError("--fiat: укажите три латинские буквы, например KZT")
+        mode = "cash_volume" if args.mode == "cash" else "eflp_volume"
+        method = int(mode_pay_method_id(mode, fiat, os.environ))
+        browser_id = os.getenv(f"{profile_prefix(profile)}_ADSPOWER_PROFILE_ID", "").strip()
+        if not browser_id:
+            raise ValueError(f"Для П2 {profile} не задан профиль AdsPower")
+        browser = AdsPower(os.getenv("ADSPOWER_BASE_URL", "http://127.0.0.1:50325"),
+                           os.getenv("ADSPOWER_API_KEY", ""), browser_id)
+        account_id = await browser.payment_account_by_method(method, fiat)
+        print(f"П2 {profile}: payMethod {method} ({fiat}) соответствует одним реквизитам ID {account_id}")
+        return 0
+    if args.command == "payment-ids":
+        from payment_ids import read_selected_payment_ids
+
+        return await read_selected_payment_ids(args)
     if args.command == "ad-payments":
         from trade_profiles import profile_prefix
 

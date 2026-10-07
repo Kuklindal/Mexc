@@ -97,9 +97,32 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await runner.payment_account('p2', 'ORDER-METHOD'), 222)
         self.assertEqual(await runner.payment_account('p1', 'ORDER-METHOD'), 2642995)
         self.exchange.orders['ORDER-METHOD']['paymentInfo'] = [{'id': 111, 'payMethod': 578}]
-        with self.assertRaisesRegex(Paused, 'реквизитов карты П1'):
+        with self.assertRaisesRegex(Paused, 'реквизитов П1'):
             await runner.payment_account('p2', 'ORDER-METHOD')
         with self.assertRaisesRegex(Paused, 'реквизитов П2'):
+            await runner.payment_account('p1', 'ORDER-METHOD')
+
+    async def test_reverse_sell_uses_p2_account_resolved_from_common_method(self):
+        runner = self.runner()
+        runner.spec = dict(self.spec, scheduler_mode='eflp_volume', fiat='KZT',
+                           p2_pay_method_id='520')
+        runner.p2_payment_id = ''
+        runner.p2_pay_method_id = 520
+        runner.p2_payment_account_id = 2253483
+        runner.p2_payment_browser = type('PaymentBrowser', (), {})()
+        runner.p2_payment_browser.payment_account_by_method = AsyncMock()
+        with patch.object(runner, 'result', side_effect=lambda key: {
+                'reverse_ad': {'adv_no': 'AD-BUY'},
+                'forward_complete': {'quantity': '100'}}.get(key, {})):
+            prepared = await runner.prepare(Step('reverse_create', 'p2', 'create'), recovery=False)
+        self.assertEqual(prepared['user_confirm_payment_id'], 2253483)
+        runner.p2_payment_browser.payment_account_by_method.assert_not_awaited()
+
+        self.exchange.orders['ORDER-METHOD'] = {'advOrderNo': 'ORDER-METHOD', 'paymentInfo': [
+            {'id': 2253483, 'payMethod': 520}, {'id': 999, 'payMethod': 518}]}
+        self.assertEqual(await runner.payment_account('p1', 'ORDER-METHOD'), 2253483)
+        self.exchange.orders['ORDER-METHOD']['paymentInfo'] = [{'id': 999, 'payMethod': 518}]
+        with self.assertRaisesRegex(Paused, 'payMethod'):
             await runner.payment_account('p1', 'ORDER-METHOD')
 
     async def test_p2_maker_return_uses_p2_ad_and_p1_as_buyer(self):

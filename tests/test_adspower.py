@@ -34,6 +34,54 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.get.await_count, 2)
         sleep.assert_awaited_once_with(2)
 
+    async def test_payment_method_read_returns_only_unique_account_id(self):
+        page = {'type': 'page', 'targetId': 'payment-tab',
+                'url': 'https://www.mexc.co/buy-crypto/payment'}
+        self.call.side_effect = [
+            {'targetInfos': [page]}, {'sessionId': 'payment-session'},
+            {'result': {'value': {'ids': ['2253483']}}},
+        ]
+        self.assertEqual(await self.browser._read_payment_account(518, 'KZT'), 2253483)
+        self.assertEqual([call.args[0] for call in self.call.call_args_list],
+                         ['Target.getTargets', 'Target.attachToTarget', 'Runtime.evaluate'])
+        self.assertIn('/api/payment/user', self.call.call_args_list[-1].args[1]['expression'])
+
+    async def test_payment_method_read_rejects_ambiguous_recipients(self):
+        self.call.side_effect = [
+            {'targetInfos': [{'type': 'page', 'targetId': 'payment-tab',
+                              'url': 'https://www.mexc.co/buy-crypto/payment'}]},
+            {'sessionId': 'payment-session'},
+            {'result': {'value': {'ids': ['111', '222']}}},
+        ]
+        with self.assertRaisesRegex(AdsPowerError, 'нужен ровно один'):
+            await self.browser._read_payment_account(518, 'KZT')
+
+    async def test_temporary_p2_browser_is_closed_after_payment_read(self):
+        original_client = httpx.AsyncClient
+        async def handler(request):
+            return httpx.Response(200, json={'code': 0, 'data': {'status': 'Inactive'}})
+        with patch('adspower.httpx.AsyncClient',
+                   side_effect=lambda **_: original_client(transport=httpx.MockTransport(handler))), \
+                patch.object(self.browser, 'ensure_started', new=AsyncMock()) as start, \
+                patch.object(self.browser, '_read_payment_account', new=AsyncMock(return_value=2253483)), \
+                patch.object(self.browser, 'stop_profile', new=AsyncMock()) as stop:
+            self.assertEqual(await self.browser.payment_account_by_method(518, 'KZT'), 2253483)
+        start.assert_awaited_once()
+        stop.assert_awaited_once()
+
+    async def test_existing_p2_browser_stays_open_after_payment_read(self):
+        original_client = httpx.AsyncClient
+        async def handler(request):
+            return httpx.Response(200, json={'code': 0, 'data': {'status': 'Active'}})
+        with patch('adspower.httpx.AsyncClient',
+                   side_effect=lambda **_: original_client(transport=httpx.MockTransport(handler))), \
+                patch.object(self.browser, 'ensure_started', new=AsyncMock()) as start, \
+                patch.object(self.browser, '_read_payment_account', new=AsyncMock(return_value=2253483)), \
+                patch.object(self.browser, 'stop_profile', new=AsyncMock()) as stop:
+            self.assertEqual(await self.browser.payment_account_by_method(518, 'KZT'), 2253483)
+        start.assert_not_awaited()
+        stop.assert_not_awaited()
+
     async def test_persistent_local_api_timeout_is_classified_for_scheduler(self):
         with patch('adspower.httpx.AsyncClient') as factory, \
                 patch('adspower.asyncio.sleep', new=AsyncMock()):

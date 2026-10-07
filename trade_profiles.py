@@ -44,6 +44,21 @@ def eflp_p2_payment_id(key: str, fiat: str, env: Mapping[str, str]) -> str:
     return payment_id
 
 
+def mode_pay_method_id(mode: str, fiat: str, env: Mapping[str, str]) -> str:
+    """Payment type for cash's first order or both Eflp order participants."""
+    if mode == 'cash_volume':
+        field = 'MEXC_PAY_METHOD_ID'
+        value = (env.get(field) or '578').strip()
+    elif mode in {'eflp_volume', 'eflp_unique'}:
+        field = f'EFLP_PAY_METHOD_ID_{fiat}'
+        value = (env.get(field) or '').strip()
+    else:
+        raise ValueError('Неизвестный режим для способа оплаты')
+    if not value.isascii() or not value.isdecimal() or int(value or '0') <= 0:
+        raise ValueError(f'{field}: укажите положительный числовой payMethod для {fiat}')
+    return value
+
+
 def eflp_p1_profiles(env: Mapping[str, str]) -> list[str]:
     """Dedicated Eflp maker accounts; never infer them from the P2 pool."""
     raw = (env.get('EFLP_P1_PROFILES') or 'p1').strip()

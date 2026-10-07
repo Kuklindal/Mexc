@@ -19,7 +19,7 @@ from adspower import AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable
 from phrases import phrases_for_mode
 from rollover import (STATE_KEY, amount_from_ad, cycle_rowid, load_state, profiles_from_env,
                       save_state, wait_until)
-from trade_profiles import (eflp_p1_fiat, eflp_p1_profiles, eflp_p2_payment_id,
+from trade_profiles import (eflp_p1_fiat, eflp_p1_profiles, eflp_p2_payment_id, mode_pay_method_id,
                             profile_from_env, profile_prefix,
                             settings_for_profile, validate_unique_profiles)
 from volume_policy import (TARGET_USDT, CEILING_USDT, CASH_TARGET_USDT, CASH_CEILING_USDT,
@@ -78,6 +78,7 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
                 or len({item.adspower_profile_id for item in configured}) != len(configured)):
             raise ValueError('Участники должны иметь разные MEMBER_ID и профили AdsPower')
     elif mode == 'cash_volume':
+        mode_pay_method_id(mode, 'RUB', env)
         chosen = list(p2_profiles or [])
         if not chosen or len(chosen) != len(set(chosen)) or any(name not in names for name in chosen):
             raise ValueError('Выберите хотя бы один настроенный профиль П2 без повторов')
@@ -95,6 +96,9 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
                        if not (env.get(f'{p2_prefix}_{field}') or '').strip()]
             if missing:
                 raise ValueError('Для П2 не заполнено: ' + ', '.join(missing))
+            payment_id = env[f'{p2_prefix}_PAYMENT_ID'].strip()
+            if not payment_id.isascii() or not payment_id.isdecimal() or int(payment_id) <= 0:
+                raise ValueError(f'{p2_prefix}_PAYMENT_ID: укажите положительный ID реквизитов П2')
             member = env[f'{p2_prefix}_MEMBER_ID'].strip()
             key = env[f'{p2_prefix}_API_KEY'].strip()
             if member in members or key in keys:
@@ -114,6 +118,7 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
         if not (env.get(f'{p1.prefix}_BUY_ADV_NO') or '').strip():
             raise ValueError('Для П1 нужны объявления продажи и покупки USDT')
         fiat = eflp_p1_fiat(p1_profile, env)
+        mode_pay_method_id(mode, fiat, env)
         member_ids = {p1.member_id}
         api_keys = {env.get(f'{p1.prefix}_API_KEY', '').strip()}
         for name in chosen:
@@ -448,9 +453,12 @@ def _finish_completed_cycle(journal, state, cycle_id, profile):
             and Decimal(state['eflp_volume_by_profile'].get(profile, '0')) >= Decimal('20000')
             and profile not in state['eflp_done']):
         state['eflp_done'].append(profile)
-        journal.transition(cycle_id, 'eflp_profile_done', 'system', 'done',
-            f'✅ П2 {p2_nickname(profile)} выполнил объём Eflp: '
-            f'{state["eflp_volume_by_profile"][profile]} USDT.')
+        if not journal.step(cycle_id, 'eflp_profile_done'):
+            p1_name = spec.get('nicknames', {}).get('p1') or state['p1_profile']
+            p2_name = spec.get('nicknames', {}).get('p2') or p2_nickname(profile)
+            journal.transition(cycle_id, 'eflp_profile_done', 'system', 'done',
+                f'✅ Объём Eflp готов\nП1: {p1_name}\nП2: {p2_name}\n'
+                f'Объём П2: {state["eflp_volume_by_profile"][profile]} USDT')
     if state['mode'] == 'cash_volume' and spec.get('reverse_maker') == 'p2':
         forced = spec.get('cash_forced_cooldown')
         if forced:
@@ -469,6 +477,32 @@ def _finish_completed_cycle(journal, state, cycle_id, profile):
                                        'anchor': cash_window['orders'][0]['at'],
                                        'reason': 'volume_rolling', 'manual_block': False}
     save_state(journal, state)
+
+
+def _queue_eflp_mode_done(journal, state):
+    """Persist one final notice so a failed Telegram send can be retried."""
+    row = journal.db.execute('SELECT id FROM cycles WHERE rowid=?',
+                             (state['last_cycle_rowid'],)).fetchone()
+    if not row:
+        raise Paused('Завершённый цикл Eflp не найден для итогового уведомления')
+    cycle_id = row['id']
+    cycle = journal.cycle(cycle_id)
+    if (cycle['status'] != 'completed'
+            or cycle['spec'].get('scheduler_mode') != state['mode']
+            or cycle['spec'].get('p1_profile') != state['p1_profile']):
+        raise Paused('Итоговое уведомление Eflp не соответствует сохранённому циклу')
+    if journal.step(cycle_id, 'eflp_mode_done'):
+        return
+    p1_name = cycle['spec'].get('nicknames', {}).get('p1') or state['p1_profile']
+    if state['mode'] == 'eflp_volume':
+        total = sum((Decimal(value) for value in state['eflp_volume_by_profile'].values()), Decimal('0'))
+        message = (f'✅ Объём Eflp завершён\nП1: {p1_name}\n'
+                   f'П2 завершили: {len(state["eflp_done"])}/{len(state["profiles"])}\n'
+                   f'Общий объём: {total} USDT')
+    else:
+        message = (f'✅ Уникальные Eflp завершены\nП1: {p1_name}\n'
+                   f'Уникальных П2: {len(state["unique_done"])}')
+    journal.transition(cycle_id, 'eflp_mode_done', 'system', 'done', message)
 
 
 async def _finish_cash_network_return(journal, state, cycle_id, profile, stop_event):
@@ -685,14 +719,13 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None)
                 eflp_unique_done = (state['mode'] == 'eflp_unique'
                                     and len(state['unique_done']) >= 20)
                 if eflp_target_done or eflp_unique_done:
+                    if telegram and getattr(telegram, 'enabled', False):
+                        _queue_eflp_mode_done(journal, state)
                     state['status'] = 'done'
                     save_state(journal, state)
                     if telegram and getattr(telegram, 'enabled', False):
-                        p1_name = profile_from_env(state['p1_profile'], os.environ).nickname
-                        message = (f'✅ Объём Eflp выполнен для всех выбранных П2 у П1 {p1_name}.' if eflp_target_done else
-                                   f'✅ Уникальные Eflp выполнены: П1 {p1_name}, '
-                                   f'{len(state["unique_done"])} разных П2.')
-                        await telegram.send(message, reply_markup=telegram_keyboard() if telegram_keyboard else None)
+                        from sheets import Reporter
+                        await Reporter(journal, telegram, None, keyboard=telegram_keyboard).flush()
                     return
                 profile, deadline = next_profile(state, journal=journal)
                 save_state(journal, state)

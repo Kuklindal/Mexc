@@ -402,7 +402,8 @@ class Reporter:
         self.sheet_error_reported = False
 
     def telegram_text(self, event: dict) -> str:
-        if event['step'] in {'rollover_switch_notice', 'ad_rejection_alert', 'eflp_profile_done'}:
+        if event['step'] in {'rollover_switch_notice', 'ad_rejection_alert',
+                             'eflp_profile_done', 'eflp_mode_done'}:
             return event['message']
         cid = event["cycle_id"]
         cycle = self.journal.cycle(cid)
@@ -440,7 +441,8 @@ class Reporter:
         if self.telegram.enabled:
             for event in self.journal.pending("telegram"):
                 important = (event["status"] in {"error", "paused"}
-                              or event['step'] in {'rollover_switch_notice', 'ad_rejection_alert', 'eflp_profile_done'})
+                              or event['step'] in {'rollover_switch_notice', 'ad_rejection_alert',
+                                                   'eflp_profile_done', 'eflp_mode_done'})
                 if not important:
                     # Suppress old queued progress messages too; retain the full local history.
                     self.journal.delivered("telegram", event["id"])

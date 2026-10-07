@@ -121,6 +121,44 @@ ORDER_VIEW = r"""(orderNo, click) => {
 }"""
 
 
+# The authenticated MEXC payment page uses this read-only endpoint to list
+# account-specific IDs. Return only the IDs matching the configured type;
+# never export card numbers, bank details, cookies or the whole response.
+PAYMENT_ACCOUNT_VIEW = r"""async (method, fiat) => {
+    if (location.protocol !== 'https:' ||
+            !['mexc.com','www.mexc.com','mexc.co','www.mexc.co','mexc.io','www.mexc.io'].includes(location.hostname))
+        return {error:'origin'};
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+        const response = await fetch('/api/payment/user', {
+            method:'GET',credentials:'same-origin',cache:'no-store',signal:controller.signal});
+        if (!response.ok) return {error:'http'};
+        const body = await response.json();
+        if (body.code !== 0) return {error:'api'};
+        const data = body.data;
+        const entries = Array.isArray(data) ? data :
+            Array.isArray(data?.list) ? data.list :
+            Array.isArray(data?.rows) ? data.rows :
+            Array.isArray(data?.records) ? data.records :
+            Array.isArray(data?.data) ? data.data :
+            data && data.id != null && data.payMethod != null ? [data] : null;
+        if (!entries) return {error:'format'};
+        const matches = entries.filter(item => {
+            if (!item || String(item.payMethod) !== String(method) || item.enabled === false || item.disabled === true)
+                return false;
+            const currency = item.fiatUnit ?? item.fiat ?? item.currency;
+            return !currency || String(currency).toUpperCase() === fiat;
+        }).map(item => String(item.id));
+        return {ids:matches};
+    } catch (_) {
+        return {error:'read'};
+    } finally {
+        clearTimeout(timer);
+    }
+}"""
+
+
 def local_url(value: str, schemes: set[str]) -> str:
     parsed = urlsplit(value)
     if parsed.scheme not in schemes or parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or parsed.username or parsed.password:
@@ -167,6 +205,97 @@ class AdsPower:
                     started = True
                 await asyncio.sleep(5)
         raise AdsPowerUnavailable('AdsPower не подтвердил запуск профиля за 120 секунд')
+
+    async def payment_account_by_method(self, method_id: int, fiat: str) -> int:
+        """Read this account's own payment ID by type, without exporting bank details."""
+        if type(method_id) is not int or method_id <= 0 or not re.fullmatch(r'[A-Z]{3}', fiat):
+            raise ValueError('Для поиска реквизитов нужны payMethod и валюта')
+        if not self.api_key or not self.profile_id:
+            raise AdsPowerError('Для чтения реквизитов П2 нужны ADSPOWER_API_KEY и его профиль AdsPower')
+        try:
+            async with httpx.AsyncClient(timeout=max(15, self.command_timeout), trust_env=False) as client:
+                response = await client.get(self.base_url + '/api/v1/browser/active',
+                    params={'user_id': self.profile_id},
+                    headers={'Authorization': 'Bearer ' + self.api_key})
+                payload = response.json()
+        except (httpx.RequestError, ValueError):
+            raise AdsPowerUnavailable('Не удалось проверить состояние профиля П2 AdsPower') from None
+        if response.status_code != 200 or not isinstance(payload, dict) or payload.get('code') != 0:
+            raise AdsPowerError('AdsPower не подтвердил состояние профиля П2')
+        data = payload.get('data')
+        was_active = isinstance(data, dict) and data.get('status') == 'Active'
+        if not was_active:
+            await self.ensure_started()
+        try:
+            return await self._read_payment_account(method_id, fiat)
+        finally:
+            # Profiles already open before this read belong to the operator.
+            if not was_active:
+                await self.stop_profile()
+
+    async def _read_payment_account(self, method_id: int, fiat: str) -> int:
+        created_id = None
+        async with self.connection() as call:
+            try:
+                for _ in range(10):
+                    targets = (await call('Target.getTargets', timeout=20)).get('targetInfos', [])
+                    pages = [item for item in targets if item.get('type') == 'page'
+                             and urlsplit(item.get('url', '')).scheme == 'https'
+                             and urlsplit(item.get('url', '')).hostname in {
+                                 'mexc.com', 'www.mexc.com', 'mexc.co', 'www.mexc.co',
+                                 'mexc.io', 'www.mexc.io'}]
+                    pages.sort(key=lambda item: 'payment' not in urlsplit(item['url']).path)
+                    if not pages and not created_id:
+                        created = await call('Target.createTarget', {
+                            'url': 'https://www.mexc.co/buy-crypto/payment', 'background': True}, timeout=30)
+                        created_id = created.get('targetId')
+                        if not created_id:
+                            raise AdsPowerError('AdsPower не открыл страницу способов оплаты П2')
+                    found_ids = set()
+                    saw_list = False
+                    for page in pages:
+                        try:
+                            attached = await call('Target.attachToTarget', {
+                                'targetId': page['targetId'], 'flatten': True}, timeout=20)
+                        except AdsPowerError:
+                            continue
+                        session = attached.get('sessionId')
+                        if not session:
+                            continue
+                        try:
+                            result = await call('Runtime.evaluate', {
+                                'expression': f'({PAYMENT_ACCOUNT_VIEW})({method_id}, {json.dumps(fiat)})',
+                                'awaitPromise': True, 'returnByValue': True}, session, timeout=20)
+                        except AdsPowerTimeout:
+                            continue
+                        value = result.get('result', {}).get('value')
+                        if 'exceptionDetails' in result or not isinstance(value, dict):
+                            continue
+                        ids = value.get('ids')
+                        if isinstance(ids, list):
+                            saw_list = True
+                            if len(ids) > 1 or (ids and (not str(ids[0]).isascii()
+                                    or not str(ids[0]).isdecimal() or int(ids[0]) <= 0)):
+                                raise AdsPowerError(f'В профиле П2 найдено {len(ids)} реквизитов с payMethod {method_id} для {fiat}; нужен ровно один')
+                            if ids:
+                                found_ids.add(int(ids[0]))
+                            continue
+                        if value.get('error') in {'api', 'format'}:
+                            continue
+                    if len(found_ids) == 1:
+                        return found_ids.pop()
+                    if len(found_ids) > 1:
+                        raise AdsPowerError('Вкладки профиля П2 вернули разные реквизиты; проверьте вход в MEXC')
+                    if saw_list:
+                        raise AdsPowerError(f'В профиле П2 не найден payMethod {method_id} для {fiat}')
+                    await asyncio.sleep(3)
+                raise AdsPowerUnavailable('MEXC не ответил на чтение способов оплаты П2 через AdsPower')
+            finally:
+                if created_id:
+                    try:
+                        await call('Target.closeTarget', {'targetId': created_id}, timeout=10)
+                    except AdsPowerError:
+                        pass
 
     async def ensure_mexc_page(self) -> None:
         """Require a rendered MEXC page, not merely a matching tab URL."""
