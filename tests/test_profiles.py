@@ -10,10 +10,29 @@ from unittest.mock import AsyncMock, patch
 from config import Settings, p2_prefix, proxy_url, select_p2_profile
 from cycle import run_command
 from main import build_parser
+from trade_profiles import eflp_p1_fiat, eflp_p2_payment_id
 import test_auto as fixtures
 
 
 class ProfileTests(unittest.TestCase):
+    def test_eflp_fiat_selects_only_its_own_payment_id(self):
+        env = {'MEXC_P1_3_FIAT': 'gel',
+               'MEXC_P2_12_PAYMENT_ID': '999',
+               'MEXC_P2_12_PAYMENT_ID_GEL': '101',
+               'MEXC_P2_12_PAYMENT_ID_KZT': '202',
+               'MEXC_P2_12_PAYMENT_ID_TJS': '303',
+               'MEXC_P2_12_PAYMENT_ID_KGS': '404'}
+        self.assertEqual(eflp_p1_fiat('p1_3', env), 'GEL')
+        for fiat, expected in [('GEL', '101'), ('KZT', '202'),
+                               ('TJS', '303'), ('KGS', '404')]:
+            self.assertEqual(eflp_p2_payment_id('12', fiat, env), expected)
+        del env['MEXC_P2_12_PAYMENT_ID_GEL']
+        with self.assertRaisesRegex(ValueError, 'MEXC_P2_12_PAYMENT_ID_GEL'):
+            eflp_p2_payment_id('12', 'GEL', env)
+        env['MEXC_P2_12_PAYMENT_ID_GEL'] = '0'
+        with self.assertRaisesRegex(ValueError, 'MEXC_P2_12_PAYMENT_ID_GEL'):
+            eflp_p2_payment_id('12', 'GEL', env)
+
     def test_default_and_named_profiles_are_isolated(self):
         env = {'MEXC_P1_API_KEY': 'p1-key', 'MEXC_P1_SECRET_KEY': 'p1-secret',
                'MEXC_P2_API_KEY': 'old-key', 'MEXC_P2_SECRET_KEY': 'old-secret',
@@ -62,6 +81,46 @@ class ProfileTests(unittest.TestCase):
 
 
 class ProfileCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_eflp_cycle_saves_selected_fiat_payment_id_and_resume_keeps_it(self):
+        with TemporaryDirectory() as directory:
+            env = {'CYCLE_DB': str(Path(directory) / 'cycles.sqlite3'),
+                   'ENABLE_STATE_CHANGES': 'true', 'SELLER_CHECK_MODE': 'adspower',
+                   'MEXC_P1_3_API_KEY': 'p1-key', 'MEXC_P1_3_SECRET_KEY': 'p1-secret',
+                   'MEXC_P1_3_MEMBER_ID': 'p1-member', 'MEXC_P1_3_NICKNAME': 'P1 GEL',
+                   'MEXC_P1_3_SELL_ADV_NO': 'a1234567890123456789',
+                   'MEXC_P1_3_BUY_ADV_NO': 'a1234567890123456788',
+                   'MEXC_P1_3_ADSPOWER_PROFILE_ID': 'browser-gel',
+                   'MEXC_P1_3_FIAT': 'GEL', 'EFLP_P1_PAY_METHOD_ID': '518',
+                   'MEXC_P2_12_API_KEY': 'p2-key', 'MEXC_P2_12_SECRET_KEY': 'p2-secret',
+                   'MEXC_P2_12_MEMBER_ID': 'p2-member', 'MEXC_P2_12_NICKNAME': 'P2',
+                   'MEXC_P2_12_PAYMENT_ID': '999',
+                   'MEXC_P2_12_PAYMENT_ID_GEL': '12345'}
+            captured = []
+            async def series(runner, cycle_id):
+                captured.append((runner, runner.journal.cycle(cycle_id)))
+            with (patch.dict(os.environ, env, clear=True), patch('logger_setup.setup_logging'),
+                  patch('mexc_client.MexcP2PClient') as client,
+                  patch('adspower.AdsPower') as ads,
+                  patch('cycle.run_series', side_effect=series),
+                  redirect_stdout(io.StringIO())):
+                client.return_value.close = AsyncMock()
+                browser = ads.return_value
+                browser.profile_id = 'browser-gel'
+                browser.ensure_started = AsyncMock()
+                browser.ensure_mexc_page = AsyncMock()
+                browser.connection.return_value.__aenter__.return_value = AsyncMock(return_value={})
+                args = build_parser().parse_args([
+                    'cycle', '--auto', '--scheduler-mode', 'eflp_volume',
+                    '--p1-profile', 'p1_3', '--p2-profile', '12', '--amount', '1000 GEL'])
+                self.assertEqual(await run_command(args), 0)
+                self.assertEqual(captured[-1][0].p2_payment_id, '12345')
+                self.assertEqual(captured[-1][1]['spec']['p2_payment_id'], '12345')
+                self.assertEqual(captured[-1][1]['spec']['fiat'], 'GEL')
+                os.environ['MEXC_P2_12_PAYMENT_ID_GEL'] = '54321'
+                resume = build_parser().parse_args(['cycle', '--resume', captured[-1][1]['id']])
+                self.assertEqual(await run_command(resume), 0)
+                self.assertEqual(captured[-1][0].p2_payment_id, '12345')
+
     async def test_command_binds_keys_identity_payment_and_persists_selection(self):
         with TemporaryDirectory() as directory:
             env = {'CYCLE_DB': str(Path(directory) / 'cycles.sqlite3'), 'ENABLE_STATE_CHANGES': 'true',

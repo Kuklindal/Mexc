@@ -19,7 +19,8 @@ from adspower import AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable
 from phrases import phrases_for_mode
 from rollover import (STATE_KEY, amount_from_ad, cycle_rowid, load_state, profiles_from_env,
                       save_state, wait_until)
-from trade_profiles import (eflp_p1_profiles, profile_from_env, profile_prefix,
+from trade_profiles import (eflp_p1_fiat, eflp_p1_profiles, eflp_p2_payment_id,
+                            profile_from_env, profile_prefix,
                             settings_for_profile, validate_unique_profiles)
 from volume_policy import (TARGET_USDT, CEILING_USDT, CASH_TARGET_USDT, CASH_CEILING_USDT,
                            cooldown_until, record_purchase, rolling_cash_purchases,
@@ -112,15 +113,17 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
         p1 = profile_from_env(p1_profile, env)
         if not (env.get(f'{p1.prefix}_BUY_ADV_NO') or '').strip():
             raise ValueError('Для П1 нужны объявления продажи и покупки USDT')
+        fiat = eflp_p1_fiat(p1_profile, env)
         member_ids = {p1.member_id}
         api_keys = {env.get(f'{p1.prefix}_API_KEY', '').strip()}
         for name in chosen:
             prefix = profile_prefix(name)
-            required = ('API_KEY', 'SECRET_KEY', 'MEMBER_ID', 'NICKNAME', 'PAYMENT_ID')
+            required = ('API_KEY', 'SECRET_KEY', 'MEMBER_ID', 'NICKNAME')
             missing = [f'{prefix}_{field}' for field in required
                        if not (env.get(f'{prefix}_{field}') or '').strip()]
             if missing:
                 raise ValueError('Для П2 Eflp не заполнено: ' + ', '.join(missing))
+            eflp_p2_payment_id(name, fiat, env)
             member = env[f'{prefix}_MEMBER_ID'].strip()
             key = env[f'{prefix}_API_KEY'].strip()
             if member in member_ids or key in api_keys:
@@ -283,6 +286,11 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
         fiat = sell.get('fiatUnit')
         if not fiat:
             raise Paused('У объявления П1 нет фиатной валюты')
+        if eflp:
+            expected_fiat = eflp_p1_fiat(p1_key, env)
+            if fiat != expected_fiat:
+                raise Paused(f'Объявление П1 имеет валюту {fiat}, а в '
+                             f'{profile_prefix(p1_key)}_FIAT указано {expected_fiat}')
         p1_price = Decimal(str(sell['price']))
         if not p1_price.is_finite() or p1_price <= 0:
             raise Paused('Некорректная цена объявления продажи П1')

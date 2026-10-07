@@ -385,6 +385,39 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-page-content", str(caught.exception))
         ws.send.assert_awaited_once()
 
+    async def test_refused_cdp_connection_before_command_is_retryable(self):
+        browser = AdsPower("http://127.0.0.1:53152", "secret-test-key", "P1")
+        browser.endpoint = AsyncMock(return_value="ws://127.0.0.1:1234/debug")
+
+        @asynccontextmanager
+        async def refused_connection(*args, **kwargs):
+            raise ConnectionRefusedError("secret-websocket-address")
+            yield
+
+        with patch("adspower.websockets.connect", new=refused_connection):
+            with self.assertRaises(AdsPowerUnavailable) as caught:
+                async with browser.connection():
+                    self.fail("Connection should not be established")
+        self.assertNotIn("secret-websocket-address", str(caught.exception))
+
+    async def test_transport_failure_after_command_is_not_retryable(self):
+        browser = AdsPower("http://127.0.0.1:53152", "test-key", "P1")
+        browser.endpoint = AsyncMock(return_value="ws://127.0.0.1:1234/debug")
+        ws = AsyncMock()
+        ws.recv.side_effect = ConnectionResetError("private-cdp-payload")
+
+        @asynccontextmanager
+        async def connection(*args, **kwargs):
+            yield ws
+
+        with patch("adspower.websockets.connect", new=connection):
+            with self.assertRaises(AdsPowerError) as caught:
+                async with browser.connection() as call:
+                    await call("Runtime.evaluate", {"expression": "private-page-content"})
+        self.assertNotIsInstance(caught.exception, AdsPowerUnavailable)
+        self.assertNotIn("private-cdp-payload", str(caught.exception))
+        ws.send.assert_awaited_once()
+
     async def test_late_response_after_timeout_does_not_satisfy_next_command(self):
         browser = AdsPower("http://127.0.0.1:53152", "test-key", "P1")
         browser.endpoint = AsyncMock(return_value="ws://127.0.0.1:1234/debug")

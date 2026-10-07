@@ -158,8 +158,12 @@ class TelegramControl:
                            else ['p1', *profiles_from_env()])
                 choices = [item for item in ready_p1_profiles(p1_keys, os.environ, include_main=False)
                            if item.key not in fixed_p2
-                           and os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()]
-                rows.extend(tuple((item.nickname, 'cash_p1:' + item.key) for item in choices[i:i + 2])
+                           and os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()
+                           and (self.selected_mode == 'cash_volume'
+                                or os.getenv(f'{profile_prefix(item.key)}_FIAT', '').strip())]
+                rows.extend(tuple((item.nickname + (' · ' + os.getenv(f'{profile_prefix(item.key)}_FIAT', '').strip().upper()
+                                                    if self.selected_mode in {'eflp_volume', 'eflp_unique'} else ''),
+                                   'cash_p1:' + item.key) for item in choices[i:i + 2])
                             for i in range(0, len(choices), 2))
                 rows.append((('↩️ Назад', 'back'),))
             elif self.menu == 'cash_p2':
@@ -506,12 +510,13 @@ class TelegramControl:
                 return await self.reply('Сначала заверши или продолжи сохранённую серию.')
             fixed_p2 = set(configured_mode_profiles(action)[1])
             choices = [item for item in ready_p1_profiles(eflp_p1_profiles(os.environ), os.environ,
-                                                         include_main=False)
-                       if item.key not in fixed_p2
-                       and os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()]
+                                                          include_main=False)
+                        if item.key not in fixed_p2
+                        and os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()
+                        and os.getenv(f'{profile_prefix(item.key)}_FIAT', '').strip()]
             if not choices:
                 return await self.reply('Нет настроенного П1 с объявлениями продажи и покупки USDT, '
-                                        'профилем AdsPower и вне списка П2.')
+                                        'профилем AdsPower, FIAT и вне списка П2.')
             self.menu = 'cash_p1'
             self.selected_mode = action
             self.cash_p1 = None
@@ -530,7 +535,9 @@ class TelegramControl:
                        if self.selected_mode in {'eflp_volume', 'eflp_unique'}
                        else ['p1', *profiles_from_env()])
             ready = {item.key for item in ready_p1_profiles(p1_keys, os.environ, include_main=False)
-                     if os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()}
+                     if os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()
+                     and (self.selected_mode == 'cash_volume'
+                          or os.getenv(f'{profile_prefix(item.key)}_FIAT', '').strip())}
             if self.selected_mode in {'eflp_volume', 'eflp_unique'}:
                 from trade_modes import configured_mode_profiles
                 fixed_p2 = configured_mode_profiles(self.selected_mode)[1]

@@ -26,6 +26,24 @@ def profile_prefix(key: str) -> str:
     return p2_prefix(p2_profile_name(key))
 
 
+def eflp_p1_fiat(key: str, env: Mapping[str, str]) -> str:
+    """Fiat assigned to an Eflp maker; it must match both live advertisements."""
+    field = f'{profile_prefix(key)}_FIAT'
+    fiat = (env.get(field) or '').strip().upper()
+    if not re.fullmatch(r'[A-Z]{3}', fiat):
+        raise ValueError(f'{field}: укажите три латинские буквы валюты, например GEL')
+    return fiat
+
+
+def eflp_p2_payment_id(key: str, fiat: str, env: Mapping[str, str]) -> str:
+    """Account-specific collection method for the selected Eflp fiat."""
+    field = f'{profile_prefix(key)}_PAYMENT_ID_{fiat}'
+    payment_id = (env.get(field) or '').strip()
+    if not payment_id.isascii() or not payment_id.isdecimal() or int(payment_id or '0') <= 0:
+        raise ValueError(f'{field}: укажите активный положительный ID реквизитов П2 для {fiat}')
+    return payment_id
+
+
 def eflp_p1_profiles(env: Mapping[str, str]) -> list[str]:
     """Dedicated Eflp maker accounts; never infer them from the P2 pool."""
     raw = (env.get('EFLP_P1_PROFILES') or 'p1').strip()

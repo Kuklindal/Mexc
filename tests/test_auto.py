@@ -45,6 +45,29 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         runner.clients['p2'].mark_paid.assert_awaited_once_with('ORDER-1', 123)
         runner.browser.inspect.assert_not_called()
 
+    async def test_eflp_volume_replenishes_without_identity_document_requirement(self):
+        runner = self.runner()
+        runner.spec = dict(self.spec, scheduler_mode='eflp_volume')
+        self.exchange.ad['overVerify'] = ''
+        runner.browser.ad_details = AsyncMock(return_value={
+            'id': 'AD-SELL', 'coinName': 'USDT', 'currency': 'RUB',
+            'tradeType': 1, 'availableQuantity': self.exchange.ad['availableQuantity'],
+            'overVerify': None})
+        def result(name):
+            return {'quantity': '100'} if name == 'reverse_complete' else {'adv_no': 'AD-SELL'}
+        with (patch.object(runner, 'result', side_effect=result),
+              patch.object(runner, 'snapshot', new=AsyncMock(return_value={
+                  'state': 'COMPLETED', 'order_no': 'ORDER-1'}))):
+            plan = await runner.prepare(Step('reverse_replenish', 'p1', 'replenish'), recovery=False)
+        self.assertEqual(plan['method'], 'quantity_only')
+        self.assertEqual(plan['over_verify'], 'null')
+        runner.browser.ad_details.return_value['availableQuantity'] = plan['target_available']
+        await runner.check_browser_ad(plan)
+        runner.browser.ad_details.return_value['availableQuantity'] = self.exchange.ad['availableQuantity']
+        runner.spec = dict(self.spec, scheduler_mode='eflp_unique')
+        with self.assertRaisesRegex(ValueError, 'Удостоверение личности'):
+            await runner.quantity_plan(self.exchange.ad, 'AD-SELL', '100')
+
     async def test_eflp_first_order_uses_p1_card_method_and_cash_keeps_its_method(self):
         runner = self.runner()
         for mode in ('eflp_volume', 'eflp_unique'):

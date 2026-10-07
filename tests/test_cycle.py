@@ -813,7 +813,7 @@ class SheetsTests(unittest.IsolatedAsyncioTestCase):
         await sheets.send(sale)
         await sheets.send(sale)
         from config import p2_nickname
-        self.assertEqual(calls, [("PUT", "A5:D5", [[107.5877, "23.09.2026", "03:30:45", p2_nickname('default')]])] * 2)
+        self.assertEqual(calls, [("PUT", "A5:E5", [[107.5877, "23.09.2026", "03:30:45", p2_nickname('default'), 'p1']])] * 2)
 
 
 if __name__ == "__main__":

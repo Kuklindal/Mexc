@@ -1038,7 +1038,8 @@ class CycleRunner:
                                    "Проверьте пополнение на MEXC; повторного запроса не будет.")
                 return saved
             plan = (await self.quantity_plan(ad, adv_no, quantity, side="BUY" if buy_ad else "SELL", browser=browser)
-                    if maker_preparation or buy_ad or ad.get('overVerify') is None else self.replenish_plan(ad, adv_no, quantity))
+                    if (maker_preparation or buy_ad or self.spec.get('scheduler_mode') == 'eflp_volume'
+                        or ad.get('overVerify') is None) else self.replenish_plan(ad, adv_no, quantity))
             self.console.write(f"Объявление {adv_no}: сейчас {plan['before_available']} USDT, добавить {quantity} USDT. "
                                f"Ожидаемый доступный остаток: {plan['target_available']} USDT.\n"
                                f"Статус объявления: {ad.get('advStatus', 'неизвестен')}; публикация этим шагом не выполняется.")
@@ -1322,8 +1323,7 @@ class CycleRunner:
         if not browser:
             raise Paused("Для пополнения без сброса настроек нужен открытый профиль П1 AdsPower")
         actual = await browser.ad_details(plan['adv_no'])
-        verification = (json.dumps(actual.get('overVerify'), sort_keys=True, ensure_ascii=False)
-                        if plan.get('side') == 'BUY' else ad_verification(actual))
+        verification = CycleRunner.browser_ad_verification(self, actual, plan.get('side', 'SELL'))
         if 'target_total' in plan:
             matched = (Decimal(str(actual.get('availableQuantity', 'NaN')))
                        + Decimal(str(actual.get('frozenQuantity', 'NaN')))
@@ -1332,6 +1332,21 @@ class CycleRunner:
             matched = Decimal(str(actual.get('availableQuantity', 'NaN'))) == Decimal(plan['target_available'])
         if str(actual.get('id')) != plan['adv_no'] or verification != plan['over_verify'] or not matched:
             raise Paused("Остаток или дополнительная проверка не совпадают с планом; повторное пополнение запрещено")
+
+    def browser_ad_verification(self, actual: dict, side: str) -> str:
+        if side == 'BUY':
+            return json.dumps(actual.get('overVerify'), sort_keys=True, ensure_ascii=False)
+        if self.spec.get('scheduler_mode') == 'eflp_volume':
+            # Eflp volume ads need no identity-document requirement. Preserve
+            # whatever is actually configured, including a missing check.
+            value = actual.get('overVerify')
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    raise Paused('Некорректная настройка проверки объявления П1') from None
+            return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+        return ad_verification(actual)
 
     async def quantity_plan(self, ad: dict, adv_no: str, quantity: str, side: str = 'SELL', browser=None) -> dict:
         browser = browser or self.browser
@@ -1356,8 +1371,7 @@ class CycleRunner:
         increment = Decimal(money(quantity))
         if not available.is_finite() or available < 0:
             raise ValueError("Некорректный остаток объявления")
-        verification = (json.dumps(actual.get('overVerify'), sort_keys=True, ensure_ascii=False)
-                        if side == 'BUY' else ad_verification(actual))
+        verification = CycleRunner.browser_ad_verification(self, actual, side)
         plan = {'method': 'quantity_only', 'adv_no': adv_no, 'fiat': self.spec['fiat'], 'quantity': str(increment),
                 'before_available': str(available), 'target_available': str(available + increment),
                 'over_verify': verification, 'side': side}
@@ -1511,12 +1525,10 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 raise ValueError('Режим сохранённого цикла менять нельзя')
             if p1_profile != 'p1':
                 p1_profile = p2_profile_name(p1_profile)
-            from trade_profiles import profile_prefix, settings_for_profile
+            from trade_profiles import (eflp_p1_fiat, eflp_p2_payment_id,
+                                        profile_prefix, settings_for_profile)
             prefixes = {"p1": profile_prefix(p1_profile),
                         "p2": p2_prefix(p2_profile)}
-            p2_payment_id = os.getenv(f"{prefixes['p2']}_PAYMENT_ID", "").strip()
-            if p2_payment_id:
-                positive_id(p2_payment_id)
             automatic = (existing["spec"].get("automatic", False) if existing else args.auto) and not args.interactive
             series_options = any(v is not None for v in (args.min_amount, args.max_amount, args.count, args.fiat))
             if existing and (series_options or args.amount):
@@ -1524,6 +1536,19 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
             if series_options and not automatic:
                 raise ValueError("Диапазон суммы и --count доступны только с --auto")
             plan = auto_plan(args, os.environ) if automatic and not existing else None
+            if existing and scheduler_mode in {'eflp_volume', 'eflp_unique'}:
+                p2_payment_id = existing['spec'].get('p2_payment_id', '')
+            elif scheduler_mode in {'eflp_volume', 'eflp_unique'}:
+                selected_fiat = plan['fiat'] if plan else purchase_amount(args.amount or '')[1]
+                expected_fiat = eflp_p1_fiat(p1_profile, os.environ)
+                if selected_fiat != expected_fiat:
+                    raise ValueError(f'{prefixes["p1"]}_FIAT={expected_fiat}, '
+                                     f'но для ордера выбрана валюта {selected_fiat}')
+                p2_payment_id = eflp_p2_payment_id(p2_profile, selected_fiat, os.environ)
+            else:
+                p2_payment_id = os.getenv(f"{prefixes['p2']}_PAYMENT_ID", "").strip()
+            if p2_payment_id:
+                positive_id(p2_payment_id)
             if existing and args.auto and not existing["spec"].get("automatic", False):
                 raise ValueError("Начатый цикл не переводится в авторежим. Используйте --auto для нового цикла.")
             console = AutoConsole() if automatic else Console()

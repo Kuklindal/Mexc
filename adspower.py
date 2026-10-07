@@ -292,9 +292,11 @@ class AdsPower:
 
     @asynccontextmanager
     async def connection(self):
+        connected = False
         try:
             async with websockets.connect(await self.endpoint(), open_timeout=self.command_timeout, close_timeout=3,
                                           proxy=None) as ws:
+                connected = True
                 seq = 0
 
                 async def call(method, params=None, session=None, *, timeout=None):
@@ -330,8 +332,12 @@ class AdsPower:
         except Exception as exc:
             # Never include raw websocket URLs, headers, tokens, page contents or cookies.
             location = _safe_error_location(exc)
-            raise AdsPowerError(f"Ошибка AdsPower ({type(exc).__name__}, {location}); "
-                                "проверьте результат на MEXC") from None
+            message = (f"Ошибка AdsPower ({type(exc).__name__}, {location}); "
+                       "проверьте результат на MEXC")
+            if not connected and isinstance(exc, (OSError, TimeoutError)):
+                # No CDP command was sent, so the scheduler may safely retry its preflight.
+                raise AdsPowerUnavailable(message) from None
+            raise AdsPowerError(message) from None
         # Closing this CDP connection detaches the automation; the browser stays open.
 
     async def view(self, call, session, order_no, *, click=False):

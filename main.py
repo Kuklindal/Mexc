@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 
 from config import Settings
@@ -45,6 +46,9 @@ def build_parser() -> argparse.ArgumentParser:
     browser_check = sub.add_parser("adspower-check", help="Проверить профиль П1 и кнопку ордера без нажатия")
     browser_check.add_argument("order_no")
     sub.add_parser("adspower-open", help="Открыть профиль П1 AdsPower и вкладку MEXC без действий по ордеру")
+    ad_payments = sub.add_parser("ad-payments", help="Показать ID способов оплаты из объявления П1 без создания ордера")
+    ad_payments.add_argument("--p1-profile", default="p1", metavar="NAME",
+                             help="Профиль П1 из .env, например p1_3")
 
     transfer = sub.add_parser("wallet-transfer", help="Перевести USDT между фиатным и спотовым счетами одного аккаунта")
     transfer.add_argument("--account", required=True, choices=["p1", "p2"])
@@ -128,6 +132,28 @@ async def async_main() -> int:
 
         await open_mexc()
         return 0
+    if args.command == "ad-payments":
+        from trade_profiles import profile_prefix
+
+        profile = args.p1_profile.strip().lower()
+        settings = Settings.from_env('p1', p1_profile=profile)
+        adv_no = os.getenv(f'{profile_prefix(profile)}_SELL_ADV_NO', '').strip()
+        if not adv_no:
+            raise ValueError(f'Для {profile} не задан номер SELL-объявления')
+        client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url,
+                              settings.recv_window, proxy_url=settings.proxy_url)
+        try:
+            ad = await client.get_ad(adv_no)
+            payments = ad.get('paymentInfo')
+            if not isinstance(payments, list) or not payments:
+                raise RuntimeError('MEXC не вернул способы оплаты этого объявления')
+            for payment in payments:
+                if not isinstance(payment, dict) or not str(payment.get('payMethod', '')).isdigit():
+                    raise RuntimeError('MEXC вернул неожиданный формат способа оплаты')
+                print(f"payMethod={payment['payMethod']}; paymentInfo.id={payment.get('id', '—')}")
+            return 0
+        finally:
+            await client.close()
     if args.command in {"cycle", "cycle-status", "cycle-reset", "sync-journal"}:
         from cycle import run_command
         return await run_command(args)

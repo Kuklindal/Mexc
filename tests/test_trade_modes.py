@@ -21,6 +21,7 @@ def env_for(count=20):
         'ROLLOVER_PROFILES': ','.join(str(i) for i in range(1, count + 1)),
         'MEXC_P1_API_KEY': 'main-key', 'MEXC_P1_SECRET_KEY': 'main-secret',
         'MEXC_P1_MEMBER_ID': 'main-member', 'MEXC_P1_SELL_ADV_NO': 'a1234567890123456789',
+        'MEXC_P1_FIAT': 'RUB',
         'MEXC_P1_DEPOSIT_ADDRESS_PLASMA': '0x' + '1' * 40,
         'ADSPOWER_P1_PROFILE_ID': 'main-browser',
     }
@@ -31,6 +32,7 @@ def env_for(count=20):
                      f'{prefix}_MEMBER_ID': f'member-{index}',
                      f'{prefix}_NICKNAME': f'name-{index}',
                      f'{prefix}_PAYMENT_ID': str(1000 + index),
+                     f'{prefix}_PAYMENT_ID_RUB': str(1000 + index),
                      f'{prefix}_SELL_ADV_NO': f'a{index:019d}',
                     f'{prefix}_ADSPOWER_PROFILE_ID': f'browser-{index}'})
     return env
@@ -73,6 +75,25 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         env = env_for(21) | {'EFLP_UNIQUE_P2_PROFILES': ','.join(str(i) for i in range(20, 0, -1))}
         self.assertEqual(configured_mode_profiles('eflp_unique', env),
                          (None, [str(i) for i in range(20, 0, -1)]))
+
+    def test_eflp_series_requires_payment_id_for_selected_p1_fiat(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'EFLP_P1_PROFILES': 'p1_3',
+                            'MEXC_P1_3_API_KEY': 'gel-key',
+                            'MEXC_P1_3_SECRET_KEY': 'gel-secret',
+                            'MEXC_P1_3_MEMBER_ID': 'gel-member',
+                            'MEXC_P1_3_NICKNAME': 'GEL maker',
+                            'MEXC_P1_3_SELL_ADV_NO': 'a1234567890123456789',
+                            'MEXC_P1_3_BUY_ADV_NO': 'a1234567890123456788',
+                            'MEXC_P1_3_ADSPOWER_PROFILE_ID': 'gel-browser',
+                            'MEXC_P1_3_FIAT': 'GEL'}
+        with self.assertRaisesRegex(ValueError, 'MEXC_P2_1_PAYMENT_ID_GEL'):
+            begin_mode(self.journal, 'eflp_volume', p1_profile='p1_3',
+                       p2_profiles=['1'], env=env)
+        env['MEXC_P2_1_PAYMENT_ID_GEL'] = '4567'
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1_3',
+                           p2_profiles=['1'], env=env)
+        self.assertEqual(state['p1_profile'], 'p1_3')
 
     def test_cash_mode_uses_ordinary_return_without_p2_maker_or_deposit(self):
         self.journal.abandon(self.cycle_id)
@@ -332,6 +353,21 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(Decimal(amount.split()[0]), Decimal('1000'))
             self.assertLess(Decimal(amount.split()[0]), Decimal('8000'))
             draw.assert_called_once()
+
+    async def test_eflp_rejects_live_ad_in_different_fiat(self):
+        env = env_for(1) | {'MEXC_P1_FIAT': 'GEL',
+                            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        sell = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL',
+                'coinName': 'USDT', 'fiatUnit': 'KZT', 'advStatus': 'OPEN'}
+        buy = dict(sell, advNo=env['MEXC_P1_BUY_ADV_NO'], side='BUY')
+        client = type('Client', (), {})()
+        client.get_ad = AsyncMock(side_effect=lambda ad_no: sell if ad_no == sell['advNo'] else buy)
+        client.close = AsyncMock()
+        with (patch.dict(os.environ, env),
+              patch('trade_modes.MexcP2PClient', return_value=client)):
+            with self.assertRaisesRegex(Paused, 'MEXC_P1_FIAT'):
+                await choose_mode_amount('eflp_volume', 'p1', '1', {}, env)
+        client.close.assert_awaited_once()
 
     async def test_cash_amount_uses_journal_across_runs_and_stops_before_70k(self):
         self.journal.abandon(self.cycle_id)

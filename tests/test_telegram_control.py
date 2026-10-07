@@ -227,6 +227,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                             'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456789',
                             'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456787',
                             'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-maker-browser',
+                            'MEXC_P1_2_FIAT': 'KZT',
                             'MEXC_P2_1_PAYMENT_ID': '1001',
                             'MEXC_P2_2_PAYMENT_ID': '1002',
                             'EFLP_VOLUME_P2_PROFILES': '2,1'}
@@ -235,7 +236,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             await control.perform('eflp_volume')
             self.assertEqual(control.menu, 'cash_p1')
             self.assertEqual(control.selected_mode, 'eflp_volume')
-            self.assertIn('Second maker', self.buttons(control))
+            self.assertIn('Second maker · KZT', self.buttons(control))
             self.assertFalse(any(button['callback_data'].endswith('cash_p1:2')
                                  for row in control.keyboard()['inline_keyboard'] for button in row))
             with patch.object(control, 'work_rollover', new_callable=AsyncMock):
@@ -258,6 +259,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456789',
             'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456788',
             'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'other-p1-browser',
+            'MEXC_P1_2_FIAT': 'RUB',
             'EFLP_UNIQUE_P2_PROFILES': ','.join(str(i) for i in range(1, 21))}
         with patch.dict(os.environ, env):
             control = self.control()
@@ -266,7 +268,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(control.selected_mode, 'eflp_unique')
             self.assertFalse(any(button['callback_data'].endswith('cash_p1:p1')
                                  for row in control.keyboard()['inline_keyboard'] for button in row))
-            self.assertIn('Other maker', self.buttons(control))
+            self.assertIn('Other maker · RUB', self.buttons(control))
             with patch.object(control, 'work_rollover', new_callable=AsyncMock):
                 await control.perform('cash_p1:p1_2')
                 await asyncio.sleep(0)

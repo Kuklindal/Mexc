@@ -138,6 +138,8 @@ GOOGLE_SERVICE_ACCOUNT_FILE=credentials/google-service-account.json
 в аккаунте П2 откройте страницу способов оплаты, в F12 → Network найдите `/api/payment/user`;
 нужен `data.id` записи с подходящим `data.payMethod`. Отдельного метода чтения списка
 реквизитов по API-ключу эта инструкция не описывает.
+Для П1 бот может показать `payMethod` прямо из его SELL-объявления через Merchant API,
+без открытия ордера: `MEXC_ENV_FILE=.env.eflp .venv/bin/python main.py ad-payments --p1-profile p1_3`.
 
 ## Запуск
 

@@ -16,10 +16,16 @@ from notifier import TelegramNotifier
 from config import p2_nickname
 
 
-HEADER = ["Сумма продажи (USDT)", "Дата (Красноярск)", "Время (UTC+7)", "Профиль П2"]
+HEADER = ["Сумма продажи (USDT)", "Дата (Красноярск)", "Время (UTC+7)",
+          "Профиль П2", "Профиль П1"]
 WEEKLY_MARKER = "Недельная сводка MEXC"
-EFLP_MARKER = "Eflp: аккаунт П1"
-EFLP_META_HEADER = ["П1 для сводки Eflp", "Режим", "MEMBER_ID П2"]
+EFLP_WEEKLY_MARKER = "Недельная сводка Eflp"
+EFLP_MARKER = "П1"
+OLD_EFLP_MARKER = "Eflp: аккаунт П1"
+OLD_EFLP_META_HEADER = ["П1 для сводки Eflp", "Режим", "MEMBER_ID П2"]
+EFLP_META_HEADER = ["Ключ П1 для сводки Eflp", "Режим", "MEMBER_ID П2"]
+WEEK_START_FORMULA = '=IFERROR(DATEVALUE(LEFT($G$1;10))+TIMEVALUE(RIGHT($G$1;5));0)'
+WEEK_SALES_FORMULA = '=ARRAYFORMULA(IF(B2:B="";"";IFERROR(DATEVALUE(B2:B)+TIMEVALUE(C2:C)-4/24;"")))'
 MOSCOW = timezone(timedelta(hours=3))
 
 
@@ -59,9 +65,9 @@ def weekly_formulas(sales: list[dict], selected: str, row_count: int) -> list[li
     profiles = sorted({sale_profile(sale) for sale in sales})
     rows = [["" for _ in range(5)] for _ in range(max(18, 11 + len(profiles), row_count))]
     rows[0] = [WEEKLY_MARKER, selected, "До (не включительно)",
-               '=TEXT($E$1+7;"dd.mm.yyyy hh:mm")&" МСК"', ""]
+               '=TEXT($U$1+7;"dd.mm.yyyy hh:mm")&" МСК"', ""]
     rows[2] = ["Общий объем USDT",
-               '=SUMIFS($A$2:$A;$E$2:$E;">="&$E$1;$E$2:$E;"<"&($E$1+7))',
+                '=SUMIFS($A$2:$A;$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7))',
                "Придёт USD",
                '=IFS(G3<1000000;0;G3<2000000;300;G3<2500000;450;TRUE;525)', ""]
     rows[3] = ["В общаг USD", '=I3*5%', "", "", ""]
@@ -75,7 +81,7 @@ def weekly_formulas(sales: list[dict], selected: str, row_count: int) -> list[li
     rows[10] = ["Продажи по профилям П2", "USDT", "", "", ""]
     for i, profile in enumerate(profiles, 12):
         rows[i - 1] = [profile,
-                       f'=SUMIFS($A$2:$A;$D$2:$D;F{i};$E$2:$E;">="&$E$1;$E$2:$E;"<"&($E$1+7))',
+                       f'=SUMIFS($A$2:$A;$D$2:$D;F{i};$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7))',
                        "", "", ""]
     return rows
 
@@ -88,7 +94,7 @@ def sale_values(sale: dict) -> list:
     if not quantity.is_finite() or quantity <= 0 or not sale.get("completed_at"):
         raise GoogleSheetsError("В журнале нет количества USDT или времени первой продажи; запись остановлена")
     date, clock = krasnoyarsk_time(sale["completed_at"]).split()
-    return [float(quantity), date, clock, sale_profile(sale)]
+    return [float(quantity), date, clock, sale_profile(sale), sale_p1_name(sale)]
 
 
 def sale_profile(sale: dict) -> str:
@@ -100,25 +106,34 @@ def sale_p1_name(sale: dict) -> str:
     saved = (sale.get('p1_nickname') or '').strip()
     if saved:
         return saved
-    if profile == 'p1':
-        return os.getenv('MEXC_P1_NICKNAME', '').strip() or 'p1'
-    return p2_nickname(profile)
+    return os.getenv(f'MEXC_{profile.upper()}_NICKNAME', '').strip() or profile
 
 
 def eflp_meta_values(sale: dict) -> list[str]:
-    return [sale_p1_name(sale), sale.get('scheduler_mode') or '',
+    return [sale.get('p1_profile') or 'p1', sale.get('scheduler_mode') or '',
             sale.get('p2_member_id') or '']
 
 
-def eflp_formulas(sales: list[dict], row_count: int) -> list[list[str]]:
-    accounts = sorted({sale_p1_name(sale) for sale in sales
-                       if sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}})
-    rows = [['', '', ''] for _ in range(max(2, row_count, len(accounts) + 1))]
-    rows[0] = [EFLP_MARKER, 'Объём USDT', 'Уникальных П2']
-    for row_number, name in enumerate(accounts, 2):
-        rows[row_number - 1] = [name,
-            f'=SUMIFS($A$2:$A;$Q$2:$Q;N{row_number};$R$2:$R;"eflp*";$E$2:$E;">="&$E$1;$E$2:$E;"<"&($E$1+7))',
-            f'=COUNTUNIQUEIFS($S$2:$S;$Q$2:$Q;N{row_number};$R$2:$R;"eflp*";$E$2:$E;">="&$E$1;$E$2:$E;"<"&($E$1+7);$S$2:$S;"<>")']
+def eflp_formulas(sales: list[dict], row_count: int, *, first_data_row: int = 2,
+                  unique_col: str = 'O', sales_col: str = 'P') -> list[list[str]]:
+    accounts = {sale.get('p1_profile') or 'p1': sale_p1_name(sale) for sale in sales
+                if sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}}
+    rows = [['', '', '', ''] for _ in range(max(2, row_count, len(accounts) + 1))]
+    rows[0] = [EFLP_MARKER, 'Уникальных П2', 'Общая сумма продаж (USDT)', 'Итого USDT']
+    for row_number, key in enumerate(sorted(accounts), first_data_row):
+        rows[row_number - first_data_row + 1] = [accounts[key],
+            f'=COUNTUNIQUEIFS($T$2:$T;$R$2:$R;"{key}";$S$2:$S;"eflp*";$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7);$T$2:$T;"<>")',
+            f'=SUMIFS($A$2:$A;$R$2:$R;"{key}";$S$2:$S;"eflp*";$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7))',
+            f'=IF(AND({unique_col}{row_number}>=20;{sales_col}{row_number}>20000);90;0)']
+    return rows
+
+
+def eflp_weekly_formulas(sales: list[dict], selected: str, row_count: int) -> list[list[str]]:
+    table = eflp_formulas(sales, max(2, row_count - 1), first_data_row=3,
+                          unique_col='G', sales_col='H')
+    rows = [[EFLP_WEEKLY_MARKER, selected, 'До (не включительно)',
+             '=TEXT($U$1+7;"dd.mm.yyyy hh:mm")&" МСК"', '']]
+    rows.extend([row + [''] for row in table])
     return rows
 
 
@@ -147,7 +162,8 @@ class GoogleSheets:
             await asyncio.to_thread(self.credentials.refresh, partial(Request(), timeout=20))
         return self.credentials.token
 
-    async def request(self, method: str, cell_range: str, values: list | None = None) -> dict:
+    async def request(self, method: str, cell_range: str, values: list | None = None,
+                      *, value_render_option: str | None = None) -> dict:
         token = await self.token()
         a1 = "'" + self.tab.replace("'", "''") + "'!" + cell_range
         url = ("https://sheets.googleapis.com/v4/spreadsheets/"
@@ -155,7 +171,8 @@ class GoogleSheets:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.request(method, url,
                 headers={"Authorization": f"Bearer {token}"},
-                params={"valueInputOption": "RAW"} if values is not None else None,
+                params=({"valueInputOption": "RAW"} if values is not None else
+                        {"valueRenderOption": value_render_option} if value_render_option else None),
                 json={"values": values} if values is not None else None)
         if response.status_code >= 400:
             hints = {403: ("запись отклонена для сервисного аккаунта в этой таблице; проверьте его роль для GOOGLE_SHEET_ID и ограничения файла"
@@ -199,15 +216,40 @@ class GoogleSheets:
             return
         target = self.spreadsheet_id + "/" + self.tab
         existing = (await self.request("GET", "A:D")).get("values", [])
+        p1_column = (await self.request("GET", "E:E")).get("values", [])
         if journal.sheet_target() is None and existing:
             raise GoogleSheetsError("Для первого подключения нужна пустая отдельная вкладка A:D")
         legacy = bool(existing and existing[0] == ["Сумма продажи"])
         old_header = bool(existing and existing[0] == HEADER[:3])
-        if existing and existing[0] != HEADER and not legacy and not old_header:
+        four_column = bool(existing and existing[0] == HEADER[:4])
+        if existing and not (four_column or legacy or old_header):
             raise GoogleSheetsError("Заголовок таблицы изменён; запись остановлена")
+        sales = {int(s['id']): s for s in journal.sales()}
+        has_p1_column = bool(p1_column and p1_column[0] == [HEADER[4]])
+        old_week_array = False
+        if has_p1_column:
+            for i, row in enumerate(p1_column[1:], 1):
+                if row and (i not in sales or row != [sale_p1_name(sales[i])]):
+                    raise GoogleSheetsError("Столбец П1 отличается от журнала; запись остановлена")
+        elif p1_column:
+            # E2 was an array formula, so old helper dates can fill every sale row.
+            formulas = (await self.request("GET", "E1:E2", value_render_option="FORMULA")).get("values", [])
+            summary = (await self.request("GET", "F:J")).get("values", [])
+            old_week_array = formulas == [[WEEK_START_FORMULA], [WEEK_SALES_FORMULA]]
+            interrupted_migration = (formulas == [[WEEK_START_FORMULA]]
+                                     and not any(row for row in p1_column[2:]))
+            if (not (old_week_array or interrupted_migration)
+                    or not summary or summary[0][0] not in {WEEKLY_MARKER, EFLP_WEEKLY_MARKER}):
+                raise GoogleSheetsError("Столбец E занят; профиль П1 не записан")
         journal.bind_sheet(target)
+        if old_week_array:
+            # Clear the array-formula anchor before replacing its spill with P1
+            # values. E1 remains as a marker if this migration is interrupted.
+            await self.batch_update([{"updateCells": {
+                "range": {"sheetId": await self.get_sheet_id(), "startRowIndex": 1,
+                          "endRowIndex": 2, "startColumnIndex": 4, "endColumnIndex": 5},
+                "rows": [{"values": [{}]}], "fields": "userEnteredValue"}}])
         if legacy or old_header:
-            sales = {int(s['id']): s for s in journal.sales()}
             for i, row in enumerate(existing[1:], 1):
                 if not row:
                     continue
@@ -221,11 +263,10 @@ class GoogleSheets:
                 if expected is None or not matches:
                     raise GoogleSheetsError("Старые строки отличаются от журнала; автоматическая замена рублей на USDT остановлена")
             rows = [HEADER] + [sale_values(sales[i]) if i in sales else [] for i in range(1, max(sales, default=0) + 1)]
-            await self.request("PUT", f"A1:D{len(rows)}", rows)
+            await self.request("PUT", f"A1:E{len(rows)}", rows)
         else:
             # Existing journals used the internal profile key in column D. Change
             # only that column after checking A:C against our own sale records.
-            sales = {int(s['id']): s for s in journal.sales()}
             change_names = False
             names = []
             for i, row in enumerate(existing[1:], 1):
@@ -248,43 +289,61 @@ class GoogleSheets:
                 names.append([expected[3]])
             if change_names:
                 await self.request("PUT", f"D2:D{len(names) + 1}", names)
-            await self.request("PUT", "A1:D1", [HEADER])
+            p1_rows = [[HEADER[4]]] + [[sale_p1_name(sales[i])] if i in sales else []
+                                       for i in range(1, max(sales, default=0) + 1)]
+            await self.request("PUT", f"E1:E{len(p1_rows)}", p1_rows)
+            await self.request("PUT", "A1:D1", [HEADER[:4]])
         self.ready = True
 
     async def send(self, sale: dict):
         row = int(sale["id"]) + 1
         values = [sale_values(sale)]
         # A timeout after a successful write can safely be retried at the same row.
-        await self.request("PUT", f"A{row}:D{row}", values)
+        await self.request("PUT", f"A{row}:E{row}", values)
 
     async def send_weekly(self, sales: list[dict]):
+        eflp = (any(sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'} for sale in sales)
+                or bool(os.getenv('EFLP_P1_PROFILES', '').strip()))
         existing = (await self.request("GET", "F:J")).get("values", [])
         occupied = any(any(cell != "" for cell in row) for row in existing)
         if occupied and (
-                not existing[0] or existing[0][0] != WEEKLY_MARKER):
+                not existing[0] or existing[0][0] not in
+                ({WEEKLY_MARKER, EFLP_WEEKLY_MARKER} if eflp else {WEEKLY_MARKER})):
             raise GoogleSheetsError("Столбцы F:J заняты; недельная сводка не перезаписала чужие данные")
-        if not occupied and any((await self.request("GET", "E:E")).get("values", [])):
-            raise GoogleSheetsError("Столбец E занят; служебные даты не перезаписали чужие данные")
         selected, choices = week_choices(sales, existing[0][1] if existing and len(existing[0]) > 1 else None)
-        rows = weekly_formulas(sales, selected, len(existing))
-        eflp_existing = (await self.request('GET', 'N:P')).get('values', [])
-        if any(any(cell != '' for cell in row) for row in eflp_existing) and (
-                not eflp_existing[0] or eflp_existing[0][0] != EFLP_MARKER):
-            raise GoogleSheetsError('Столбцы N:P заняты; сводка Eflp не перезаписала чужие данные')
-        eflp_rows = eflp_formulas(sales, len(eflp_existing))
+        rows = (eflp_weekly_formulas(sales, selected, len(existing)) if eflp else
+                weekly_formulas(sales, selected, len(existing)))
+        eflp_existing = (await self.request('GET', 'N:Q')).get('values', [])
+        old_eflp_header = [OLD_EFLP_MARKER, 'Объём USDT', 'Уникальных П2']
+        new_eflp_header = [EFLP_MARKER, 'Уникальных П2', 'Общая сумма продаж (USDT)', 'Итого USDT']
+        old_layout = bool(eflp_existing and eflp_existing[0][:3] == old_eflp_header)
+        new_layout = bool(eflp_existing and eflp_existing[0][:4] == new_eflp_header)
+        if any(any(cell != '' for cell in row) for row in eflp_existing) and not (old_layout or new_layout):
+            raise GoogleSheetsError('Столбцы N:Q заняты; сводка Eflp не перезаписала чужие данные')
+        existing_dates = (await self.request('GET', 'U1:U2',
+                                             value_render_option='FORMULA')).get('values', [])
+        if existing_dates and existing_dates != [[WEEK_START_FORMULA], [WEEK_SALES_FORMULA]]:
+            raise GoogleSheetsError('Столбец U занят; служебные даты не записаны')
+        eflp_rows = ([['', '', '', ''] for _ in range(max(1, len(eflp_existing)))] if eflp else
+                     eflp_formulas(sales, len(eflp_existing)))
         by_row = {int(sale['id']): sale for sale in sales}
         metadata = [EFLP_META_HEADER] + [
             eflp_meta_values(by_row[row]) if row in by_row else []
             for row in range(1, max(by_row, default=0) + 1)]
-        existing_meta = (await self.request('GET', 'Q:S')).get('values', [])
-        if existing_meta and existing_meta[0] != EFLP_META_HEADER:
-            raise GoogleSheetsError('Столбцы Q:S заняты; данные Eflp не перезаписаны')
+        existing_meta = (await self.request('GET', 'Q:S' if old_layout else 'R:T')).get('values', [])
+        if old_layout and any((await self.request('GET', 'T:T')).get('values', [])):
+            raise GoogleSheetsError('Столбец T занят; данные Eflp не перенесены')
+        expected_header = OLD_EFLP_META_HEADER if old_layout else EFLP_META_HEADER
+        if existing_meta and existing_meta[0] != expected_header:
+            raise GoogleSheetsError('Служебные столбцы Eflp заняты; запись остановлена')
         for index, row in enumerate(existing_meta[1:], 1):
-            if row and (index >= len(metadata) or (row + [''] * (3 - len(row))) != metadata[index]):
+            expected = ([sale_p1_name(by_row[index]), by_row[index].get('scheduler_mode') or '',
+                         by_row[index].get('p2_member_id') or '']
+                        if old_layout and index in by_row else
+                        metadata[index] if index < len(metadata) else [])
+            if row and (row + [''] * (3 - len(row))) != expected:
                 raise GoogleSheetsError('Служебные строки Eflp расходятся с журналом; запись остановлена')
-        if len(existing_meta) < len(metadata):
-            first = max(1, len(existing_meta))
-            await self.request('PUT', f'Q{first}:S{len(metadata)}', metadata[first - 1:])
+        metadata.extend([] for _ in range(max(0, len(existing_meta) - len(metadata))))
         sheet_id = await self.get_sheet_id()
 
         def cell(value):
@@ -294,18 +353,22 @@ class GoogleSheets:
 
         requests = [
             {"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
-                                        "endRowIndex": 2, "startColumnIndex": 4, "endColumnIndex": 5},
-                             "rows": [{"values": [cell('=IFERROR(DATEVALUE(LEFT($G$1;10))+TIMEVALUE(RIGHT($G$1;5));0)')]},
-                                      {"values": [cell('=ARRAYFORMULA(IF(B2:B="";"";IFERROR(DATEVALUE(B2:B)+TIMEVALUE(C2:C)-4/24;"")))')]}
+                                         "endRowIndex": 2, "startColumnIndex": 20, "endColumnIndex": 21},
+                              "rows": [{"values": [cell(WEEK_START_FORMULA)]},
+                                       {"values": [cell(WEEK_SALES_FORMULA)]}
                                       ], "fields": "userEnteredValue"}},
             {"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
                                          "endRowIndex": len(rows), "startColumnIndex": 5, "endColumnIndex": 10},
                              "rows": [{"values": [cell(value) for value in row]} for row in rows],
                              "fields": "userEnteredValue"}},
             {"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
-                                         "endRowIndex": len(eflp_rows), "startColumnIndex": 13, "endColumnIndex": 16},
-                             "rows": [{"values": [cell(value) for value in row]} for row in eflp_rows],
-                             "fields": "userEnteredValue"}},
+                                         "endRowIndex": len(eflp_rows), "startColumnIndex": 13, "endColumnIndex": 17},
+                              "rows": [{"values": [cell(value) for value in row]} for row in eflp_rows],
+                              "fields": "userEnteredValue"}},
+            {"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
+                                         "endRowIndex": len(metadata), "startColumnIndex": 17, "endColumnIndex": 20},
+                              "rows": [{"values": [cell(value) for value in row]} for row in metadata],
+                              "fields": "userEnteredValue"}},
             {"setDataValidation": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
                                              "endRowIndex": 1, "startColumnIndex": 6, "endColumnIndex": 7},
                                    "rule": {"condition": {"type": "ONE_OF_LIST",
@@ -313,13 +376,17 @@ class GoogleSheets:
                                             "strict": True, "showCustomUi": True,
                                             "inputMessage": "Выберите неделю: четверг 18:50 МСК"}}},
             {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                                                     "startIndex": 4, "endIndex": 5},
-                                           "properties": {"hiddenByUser": True},
-                                           "fields": "hiddenByUser"}},
+                                                      "startIndex": 4, "endIndex": 5},
+                                            "properties": {"hiddenByUser": False},
+                                            "fields": "hiddenByUser"}},
             {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                                                     "startIndex": 13, "endIndex": 16},
-                                           "properties": {"hiddenByUser": True},
-                                           "fields": "hiddenByUser"}},
+                                                      "startIndex": 13, "endIndex": 17},
+                                            "properties": {"hiddenByUser": eflp},
+                                            "fields": "hiddenByUser"}},
+            {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                                                      "startIndex": 17, "endIndex": 21},
+                                            "properties": {"hiddenByUser": True},
+                                            "fields": "hiddenByUser"}},
         ]
         await self.batch_update(requests)
 
