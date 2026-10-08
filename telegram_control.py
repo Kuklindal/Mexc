@@ -188,7 +188,7 @@ class TelegramControl:
                     choices.append((('✅ ' if name in self.cash_p2 else '□ ') + nickname,
                                     'cash_p2:' + name))
                 rows.extend(tuple(choices[i:i + 2]) for i in range(0, len(choices), 2))
-                minimum = 20 if self.selected_mode == 'eflp_unique' else 1
+                minimum = 1
                 if len(self.cash_p2) >= minimum:
                     rows.append(((f'▶️ Запустить: {len(self.cash_p2)} П2', 'cash_start'),))
                 rows.append((('↩️ Назад', 'back'),))
@@ -389,7 +389,7 @@ class TelegramControl:
                                          + ' / 20000 USDT')
                         lines.append(f'П2 выполнили план: {len(scheduler.get("eflp_done", []))}/{len(scheduler["profiles"])}')
                     else:
-                        lines.append(f'Уникальных П2 завершили: {len(scheduler.get("unique_done", []))}/20')
+                        lines.append(f'Уникальных П2 завершили: {len(scheduler.get("unique_done", []))}/{min(20, len(scheduler["profiles"]))}')
             dust = scheduler.get('return_dust_usdt', {})
             if dust:
                 lines.append('Остаток округления на П2: ' + ', '.join(
@@ -480,8 +480,12 @@ class TelegramControl:
                   'eflp_unique': 'Уникальные Eflp'}
         from trade_profiles import profile_from_env
         p1_name = profile_from_env(p1_profile, os.environ).nickname
+        skipped = [name for name in p2_profiles if name not in state['profiles']]
         return await self.reply(f'Запускаю «{labels[mode]}». П1: {p1_name}. П2 по очереди: '
-                                + ', '.join(p2_nickname(name) for name in p2_profiles) + '.')
+                                + ', '.join(p2_nickname(name) for name in state['profiles']) + '.'
+                                + (' Пропущены П2, совпадающие с П1: '
+                                   + ', '.join(p2_nickname(name) for name in skipped) + '.'
+                                   if skipped else ''))
 
     async def perform(self, action: str, *, callback_message_id: int | None = None):
         if action.startswith('chat_'):
@@ -545,6 +549,15 @@ class TelegramControl:
             if self.menu != 'cash_p1' or self.running or name not in ready:
                 return await self.reply('Этот П1 недоступен; открой выбор заново.')
             if self.selected_mode in {'eflp_volume', 'eflp_unique'}:
+                from trade_profiles import split_eflp_p2_profiles
+                eligible, skipped = split_eflp_p2_profiles(name, fixed_p2, os.environ)
+                minimum = 1
+                if len(eligible) < minimum:
+                    return await self.reply(
+                        f'П2, совпадающие с выбранным П1, пропускаются: '
+                        f'{", ".join(p2_nickname(key) for key in skipped) or "нет"}. '
+                        f'Осталось {len(eligible)} П2 из необходимых {minimum}; '
+                        'добавь другие аккаунты П2 в .env и перезапусти бота.')
                 return await self.launch_trade_mode(self.selected_mode, name, fixed_p2)
             self.cash_p1 = name
             self.cash_p2.clear()
@@ -581,7 +594,7 @@ class TelegramControl:
         if action == 'cash_start':
             from rollover import load_state, profiles_from_env
             saved = load_state(self.journal)
-            minimum = 20 if self.selected_mode == 'eflp_unique' else 1
+            minimum = 1
             if (self.menu != 'cash_p2' or not self.cash_p1 or len(self.cash_p2) < minimum
                     or self.running or self.unfinished()
                     or (saved and saved['status'] not in {'done', 'stopped'})):

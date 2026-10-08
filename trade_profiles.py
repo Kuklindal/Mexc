@@ -26,6 +26,24 @@ def profile_prefix(key: str) -> str:
     return p2_prefix(p2_profile_name(key))
 
 
+def split_eflp_p2_profiles(p1_key: str, p2_keys: list[str],
+                           env: Mapping[str, str]) -> tuple[list[str], list[str]]:
+    """Keep P2 accounts distinct from the selected Eflp P1, preserving order."""
+    maker = profile_prefix(p1_key)
+    maker_member = (env.get(f'{maker}_MEMBER_ID') or '').strip()
+    maker_api_key = (env.get(f'{maker}_API_KEY') or '').strip()
+    selected, skipped = [], []
+    for key in p2_keys:
+        prefix = profile_prefix(key)
+        member = (env.get(f'{prefix}_MEMBER_ID') or '').strip()
+        api_key = (env.get(f'{prefix}_API_KEY') or '').strip()
+        same_account = (key == p1_key
+                        or bool(maker_member and member and maker_member == member)
+                        or bool(maker_api_key and api_key and maker_api_key == api_key))
+        (skipped if same_account else selected).append(key)
+    return selected, skipped
+
+
 def eflp_p1_fiat(key: str, env: Mapping[str, str]) -> str:
     """Fiat assigned to an Eflp maker; it must match both live advertisements."""
     field = f'{profile_prefix(key)}_FIAT'

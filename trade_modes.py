@@ -21,7 +21,7 @@ from rollover import (STATE_KEY, amount_from_ad, cycle_rowid, load_state, profil
                       save_state, wait_until)
 from trade_profiles import (eflp_p1_fiat, eflp_p1_profiles, eflp_p2_payment_id, mode_pay_method_id,
                             profile_from_env, profile_prefix,
-                            settings_for_profile, validate_unique_profiles)
+                            settings_for_profile, split_eflp_p2_profiles, validate_unique_profiles)
 from volume_policy import (TARGET_USDT, CEILING_USDT, CASH_TARGET_USDT, CASH_CEILING_USDT,
                            cooldown_until, record_purchase, rolling_cash_purchases,
                            rolling_cash_retry_at, window_for)
@@ -47,8 +47,6 @@ def configured_mode_profiles(mode: str, env=os.environ) -> tuple[str | None, lis
     unknown = [name for name in profiles if name not in known]
     if unknown:
         raise ValueError(f'{p2_field}: нет в ROLLOVER_PROFILES: ' + ', '.join(unknown))
-    if mode == 'eflp_unique' and len(profiles) < 20:
-        raise ValueError(f'{p2_field}: укажите не менее 20 разных профилей П2')
     p1 = None
     if p1_field:
         raw_p1 = (env.get(p1_field) or '').strip()
@@ -107,13 +105,16 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
             keys.add(key)
     elif mode in {'eflp_volume', 'eflp_unique'}:
         phrases_for_mode(mode, env)
-        chosen = list(p2_profiles or [])
-        minimum = 20 if mode == 'eflp_unique' else 1
+        requested = list(p2_profiles or [])
+        minimum = 1
         if p1_profile not in eflp_p1_profiles(env):
             raise ValueError('Выбранного П1 нет в EFLP_P1_PROFILES')
-        if (len(chosen) < minimum or len(chosen) != len(set(chosen))
-                or any(name not in names for name in chosen) or p1_profile in chosen):
-            raise ValueError(f'Выберите не менее {minimum} разных П2, не включая П1')
+        if len(requested) != len(set(requested)) or any(name not in names for name in requested):
+            raise ValueError('П2 Eflp должны быть разными и входить в ROLLOVER_PROFILES')
+        chosen, _ = split_eflp_p2_profiles(p1_profile, requested, env)
+        if len(chosen) < minimum:
+            raise ValueError(f'После пропуска П2, совпадающих с П1, осталось {len(chosen)}; '
+                             f'для этого режима нужно не менее {minimum} разных П2')
         p1 = profile_from_env(p1_profile, env)
         if not (env.get(f'{p1.prefix}_BUY_ADV_NO') or '').strip():
             raise ValueError('Для П1 нужны объявления продажи и покупки USDT')
@@ -671,6 +672,12 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None)
             if cycle_id:
                 cycle = journal.cycle(cycle_id)
                 profile = cycle['spec']['p2_profile']
+                if state['mode'] in {'eflp_volume', 'eflp_unique'}:
+                    _, same_as_p1 = split_eflp_p2_profiles(
+                        state['p1_profile'], [profile], os.environ)
+                    if same_as_p1:
+                        raise Paused('Активный цикл Eflp использует П2, совпадающего с П1; '
+                                     'проверьте ордера перед продолжением')
                 if (cycle['spec'].get('scheduler_mode') != state['mode']
                         or cycle['spec'].get('p1_profile') != state['p1_profile']
                         or profile not in state['profiles']):
@@ -707,6 +714,22 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None)
                     state['active_cycle'] = missed[0]['id']
                     save_state(journal, state)
                     continue
+                if state['mode'] in {'eflp_volume', 'eflp_unique'}:
+                    eligible, skipped = split_eflp_p2_profiles(
+                        state['p1_profile'], state['profiles'], os.environ)
+                    if skipped:
+                        minimum = 1
+                        if len(eligible) < minimum:
+                            raise Paused(f'После пропуска П2, совпадающих с П1, осталось '
+                                         f'{len(eligible)}; нужно не менее {minimum} П2')
+                        cursor = state['cursor'] % len(state['profiles'])
+                        ordered = state['profiles'][cursor:] + state['profiles'][:cursor]
+                        next_name = next(name for name in ordered if name in eligible)
+                        state['profiles'] = eligible
+                        state['cursor'] = eligible.index(next_name)
+                        state['eflp_done'] = [name for name in state.get('eflp_done', []) if name in eligible]
+                        state['unique_done'] = [name for name in state.get('unique_done', []) if name in eligible]
+                        save_state(journal, state)
                 if state['mode'] == 'unique' and len(state['unique_done']) == len(state['profiles']):
                     state['status'] = 'done'
                     save_state(journal, state)
@@ -717,7 +740,7 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None)
                 eflp_target_done = (state['mode'] == 'eflp_volume'
                                     and len(state['eflp_done']) == len(state['profiles']))
                 eflp_unique_done = (state['mode'] == 'eflp_unique'
-                                    and len(state['unique_done']) >= 20)
+                                    and len(state['unique_done']) >= min(20, len(state['profiles'])))
                 if eflp_target_done or eflp_unique_done:
                     if telegram and getattr(telegram, 'enabled', False):
                         _queue_eflp_mode_done(journal, state)

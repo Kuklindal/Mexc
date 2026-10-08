@@ -230,6 +230,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                             'MEXC_P1_2_FIAT': 'KZT',
                             'MEXC_P2_1_PAYMENT_ID': '1001',
                             'MEXC_P2_2_PAYMENT_ID': '1002',
+                            'MEXC_P2_2_MEMBER_ID': 'main-member',
                             'EFLP_VOLUME_P2_PROFILES': '2,1'}
         with patch.dict(os.environ, env):
             control = self.control()
@@ -243,14 +244,15 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                 await control.perform('cash_p1:p1')
                 await asyncio.sleep(0)
             self.assertIsNone(control.menu)
-            self.assertEqual(load_state(self.journal)['profiles'], ['2', '1'])
+            self.assertEqual(load_state(self.journal)['profiles'], ['1'])
             self.assertEqual(load_state(self.journal)['p1_profile'], 'p1')
+            self.assertIn('Пропущены П2, совпадающие с П1', control.telegram.send.call_args.args[0])
 
     async def test_eflp_unique_chooses_only_p1_then_uses_configured_p2(self):
         from test_trade_modes import env_for
         from rollover import load_state
         self.journal.abandon(self.cycle_id)
-        env = env_for(21) | {
+        env = env_for(2) | {
             'EFLP_P1_PROFILES': 'p1_2',
             'MEXC_P1_2_API_KEY': 'other-p1-key',
             'MEXC_P1_2_SECRET_KEY': 'other-p1-secret',
@@ -260,7 +262,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456788',
             'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'other-p1-browser',
             'MEXC_P1_2_FIAT': 'RUB',
-            'EFLP_UNIQUE_P2_PROFILES': ','.join(str(i) for i in range(1, 21))}
+            'EFLP_UNIQUE_P2_PROFILES': '1,2'}
         with patch.dict(os.environ, env):
             control = self.control()
             await control.perform('eflp_unique')
@@ -274,7 +276,8 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
             self.assertIsNone(control.menu)
             self.assertEqual(load_state(self.journal)['p1_profile'], 'p1_2')
-            self.assertEqual(load_state(self.journal)['profiles'], [str(i) for i in range(1, 21)])
+            self.assertEqual(load_state(self.journal)['profiles'], ['1', '2'])
+            self.assertIn('Уникальных П2 завершили: 0/2', control.status())
 
     async def test_unique_toggle_edits_same_telegram_menu(self):
         from test_trade_modes import env_for

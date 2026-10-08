@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, Step, steps_for_spec
-from adspower import AdsPowerTimeout
+from adspower import AdsPowerTimeout, AdsPowerUnavailable
 from mexc_client import MexcChatUnavailable
 from trade_modes import (_finish_cash_network_return, _finish_completed_cycle,
                           _handle_forward_rejection, _record_forward,
@@ -62,8 +62,7 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                             'EFLP_UNIQUE_P2_PROFILES': '1,2,3'}
         self.assertEqual(configured_mode_profiles('cash_volume', env), ('p1', ['3', '1']))
         self.assertEqual(configured_mode_profiles('eflp_volume', env), (None, ['2', '3']))
-        with self.assertRaisesRegex(ValueError, 'не менее 20'):
-            configured_mode_profiles('eflp_unique', env)
+        self.assertEqual(configured_mode_profiles('eflp_unique', env), (None, ['1', '2', '3']))
         env['CASH_VOLUME_P1_PROFILE'] = '2'
         self.assertEqual(configured_mode_profiles('cash_volume', env), ('2', ['3', '1']))
         env['CASH_VOLUME_P2_PROFILES'] = '2,3'
@@ -114,6 +113,66 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
                            p2_profiles=[str(number) for number in range(1, 21)], env=env)
         self.assertEqual(len(state['profiles']), 20)
+
+    def test_eflp_volume_skips_p2_that_is_selected_p1_account(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(3) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        env['MEXC_P2_1_MEMBER_ID'] = env['MEXC_P1_MEMBER_ID']
+        env['MEXC_P2_3_API_KEY'] = env['MEXC_P1_API_KEY']
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1', '2', '3'], env=env)
+        self.assertEqual(state['profiles'], ['2'])
+        self.assertEqual(next_profile(state)[0], '2')
+
+    def test_eflp_unique_skips_selected_p1_with_small_pool(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(2) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        env['MEXC_P2_1_MEMBER_ID'] = env['MEXC_P1_MEMBER_ID']
+        with self.assertRaisesRegex(ValueError, 'осталось 0'):
+            begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                       p2_profiles=['1'], env=env)
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=['1', '2'], env=env)
+        self.assertEqual(state['profiles'], ['2'])
+
+    async def test_saved_eflp_series_skips_new_alias_before_next_order(self):
+        from rollover import save_state
+
+        self.journal.abandon(self.cycle_id)
+        env = env_for(3) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1', '2', '3'], env=env)
+        state['cursor'] = 2
+        state['eflp_done'] = ['2', '3']
+        save_state(self.journal, state)
+        env['MEXC_P2_1_MEMBER_ID'] = env['MEXC_P1_MEMBER_ID']
+        with patch.dict(os.environ, env):
+            with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
+                await run_mode(self.journal, state, asyncio.Event(), None)
+        trade.assert_not_awaited()
+        self.assertEqual(state['profiles'], ['2', '3'])
+        self.assertEqual(state['cursor'], 1)
+        self.assertEqual(state['status'], 'done')
+
+    async def test_saved_eflp_active_cycle_is_not_skipped_without_reconciliation(self):
+        from rollover import save_state
+
+        self.journal.abandon(self.cycle_id)
+        env = env_for(2) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1', '2'], env=env)
+        active = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+                                      'p1_profile': 'p1', 'p2_profile': '1'})
+        state['active_cycle'] = active
+        save_state(self.journal, state)
+        env['MEXC_P2_1_MEMBER_ID'] = env['MEXC_P1_MEMBER_ID']
+        with patch.dict(os.environ, env):
+            with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
+                with self.assertRaisesRegex(Paused, 'Активный цикл Eflp'):
+                    await run_mode(self.journal, state, asyncio.Event(), None)
+        trade.assert_not_awaited()
+        self.assertEqual(state['status'], 'paused')
+        self.assertEqual(state['active_cycle'], active)
 
     def test_cash_mode_uses_ordinary_return_without_p2_maker_or_deposit(self):
         self.journal.abandon(self.cycle_id)
@@ -282,6 +341,34 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
                            p2_profiles=[str(index) for index in range(1, 21)], env=env)
         state['unique_done'] = list(state['profiles'])
+        save_state(self.journal, state)
+        with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
+            await run_mode(self.journal, state, asyncio.Event(), None)
+        trade.assert_not_awaited()
+        self.assertEqual(state['status'], 'done')
+
+    async def test_eflp_unique_stops_after_all_selected_when_fewer_than_twenty(self):
+        from rollover import save_state
+
+        self.journal.abandon(self.cycle_id)
+        env = env_for(2) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=['1', '2'], env=env)
+        state['unique_done'] = ['1', '2']
+        save_state(self.journal, state)
+        with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
+            await run_mode(self.journal, state, asyncio.Event(), None)
+        trade.assert_not_awaited()
+        self.assertEqual(state['status'], 'done')
+
+    async def test_eflp_unique_keeps_twenty_cap_for_larger_pool(self):
+        from rollover import save_state
+
+        self.journal.abandon(self.cycle_id)
+        env = env_for(21) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=[str(i) for i in range(1, 22)], env=env)
+        state['unique_done'] = state['profiles'][:20]
         save_state(self.journal, state)
         with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
             await run_mode(self.journal, state, asyncio.Event(), None)
@@ -592,6 +679,32 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                 raise AdsPowerTimeout('AdsPower: команда Runtime.evaluate не ответила за 10 секунд')
             self.assertEqual(args.resume, state['active_cycle'])
             self.complete(args.resume)
+            stop.set()
+
+        with patch('trade_modes.choose_mode_amount', new=AsyncMock(return_value='180000 RUB')), \
+                patch('trade_modes.run_command', side_effect=trade), \
+                patch('trade_modes.wait_until', new=AsyncMock()) as wait:
+            with self.assertRaises(OperatorStopped):
+                await run_mode(self.journal, state, stop, None)
+        self.assertEqual(len(calls), 2)
+        wait.assert_awaited_once()
+        self.assertEqual(state['completed_count'], 1)
+
+    async def test_cash_retries_generic_adspower_status_failure_without_operator(self):
+        self.journal.abandon(self.cycle_id)
+        state = begin_mode(self.journal, 'cash_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env_for(1) | {
+                               'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'})
+        stop = asyncio.Event()
+        calls = []
+
+        async def trade(args, **_):
+            calls.append(args)
+            if len(calls) == 1:
+                raise AdsPowerUnavailable('AdsPower временно отклонил проверку профиля (код -1)')
+            cid = self.journal.create(dict(self.spec, automatic=True, reverse_maker='p1',
+                scheduler_mode='cash_volume', p1_profile='p1', p2_profile='1', series={'count': 1}))
+            self.complete(cid)
             stop.set()
 
         with patch('trade_modes.choose_mode_amount', new=AsyncMock(return_value='180000 RUB')), \

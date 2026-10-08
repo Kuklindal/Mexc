@@ -191,7 +191,14 @@ class AdsPower:
                 except httpx.RequestError as exc:
                     raise AdsPowerUnavailable(f'AdsPower Local API недоступен ({type(exc).__name__})') from None
                 payload = response.json()
-                if response.status_code != 200 or payload.get('code') != 0:
+                if response.status_code != 200:
+                    raise AdsPowerError(f'AdsPower HTTP {response.status_code}: проверьте Local API и ключ')
+                if payload.get('code') == -1:
+                    # -1 is a generic failure; a concurrent profile operation may
+                    # be temporary. This read-only preflight is safe to retry.
+                    await asyncio.sleep(5)
+                    continue
+                if payload.get('code') != 0:
                     raise AdsPowerError('AdsPower отклонил проверку профиля')
                 if payload.get('data', {}).get('status') == 'Active':
                     await self.endpoint()
@@ -403,21 +410,27 @@ class AdsPower:
                 try:
                     response = await client.get(self.base_url + "/api/v1/browser/active",
                         params={"user_id": self.profile_id}, headers={"Authorization": "Bearer " + self.api_key})
-                    break
                 except (httpx.TimeoutException, httpx.ConnectError) as exc:
                     if attempt == 2:
                         raise AdsPowerUnavailable(
                             f"AdsPower Local API временно недоступен ({type(exc).__name__})") from None
                     await asyncio.sleep(2 * (attempt + 1))
-        if response.status_code != 200:
-            raise AdsPowerError(f"AdsPower HTTP {response.status_code}: проверьте Local API и ключ")
-        payload = response.json()
-        if payload.get("code") != 0:
-            raise AdsPowerError("AdsPower отклонил запрос: проверьте ключ и ID профиля П1")
-        data = payload.get("data", {})
-        if data.get("status") != "Active":
-            raise AdsPowerError("Откройте профиль П1 в AdsPower и нужный ордер MEXC")
-        return local_url(data.get("ws", {}).get("puppeteer", ""), {"ws", "wss"})
+                    continue
+                if response.status_code != 200:
+                    raise AdsPowerError(f"AdsPower HTTP {response.status_code}: проверьте Local API и ключ")
+                payload = response.json()
+                if payload.get("code") == -1:
+                    if attempt == 2:
+                        raise AdsPowerUnavailable(
+                            "AdsPower временно отклонил проверку профиля (код -1)")
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                if payload.get("code") != 0:
+                    raise AdsPowerError("AdsPower отклонил проверку профиля")
+                data = payload.get("data", {})
+                if data.get("status") != "Active":
+                    raise AdsPowerError("Откройте профиль П1 в AdsPower и нужный ордер MEXC")
+                return local_url(data.get("ws", {}).get("puppeteer", ""), {"ws", "wss"})
 
     @asynccontextmanager
     async def connection(self):
