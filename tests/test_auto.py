@@ -31,6 +31,27 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
             trusted_nicknames={"p2": "Trusted-P2"})
         return runner
 
+    async def test_handoff_uses_next_p1_for_reverse_order_and_replenishment(self):
+        runner = self.runner()
+        runner.spec = dict(self.spec, scheduler_mode='eflp_volume', reverse_fiat='GEL',
+                           reverse_p1_profile='p1_2', reverse_p1_member_id='MEMBER-NEXT',
+                           replenish_adv_no='AD-NEXT-SELL')
+        next_ad = copy.deepcopy(self.exchange.ad)
+        next_ad.update(advNo='AD-BUY', side='BUY', fiatUnit='GEL', overVerify=None,
+                       advStatus='OPEN')
+        next_client = type('NextClient', (), {})()
+        next_client.get_ad = AsyncMock(return_value=next_ad)
+        runner.clients['reverse_p1'] = next_client
+        with patch.object(runner, 'result', return_value={}), \
+                patch.object(runner, 'snapshot', new=AsyncMock(return_value={
+                    'order_no': 'ORDER-NEXT', 'state': 'COMPLETED', 'quantity': '100'})):
+            ad = await runner.prepare(Step('reverse_ad', 'p1', 'ad'), recovery=False)
+        self.assertEqual(ad['adv_no'], 'AD-BUY')
+        next_client.get_ad.assert_awaited_once_with('AD-BUY')
+        with self.assertRaisesRegex(Paused, 'ID'):
+            runner.check_counterparty({'memberId': 'MEMBER-P1', 'nickName': 'Old'},
+                                      'p2', 'ORDER-NEXT', 'reverse')
+
     async def test_eflp_payment_does_not_require_document_check_button(self):
         runner = self.runner()
         runner.spec = dict(self.spec, scheduler_mode='eflp_volume', mode='api')
@@ -45,9 +66,8 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         runner.clients['p2'].mark_paid.assert_awaited_once_with('ORDER-1', 123)
         runner.browser.inspect.assert_not_called()
 
-    async def test_eflp_volume_replenishes_without_identity_document_requirement(self):
+    async def test_eflp_replenishes_without_identity_document_requirement(self):
         runner = self.runner()
-        runner.spec = dict(self.spec, scheduler_mode='eflp_volume')
         self.exchange.ad['overVerify'] = ''
         runner.browser.ad_details = AsyncMock(return_value={
             'id': 'AD-SELL', 'coinName': 'USDT', 'currency': 'RUB',
@@ -55,16 +75,19 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
             'overVerify': None})
         def result(name):
             return {'quantity': '100'} if name == 'reverse_complete' else {'adv_no': 'AD-SELL'}
-        with (patch.object(runner, 'result', side_effect=result),
-              patch.object(runner, 'snapshot', new=AsyncMock(return_value={
-                  'state': 'COMPLETED', 'order_no': 'ORDER-1'}))):
-            plan = await runner.prepare(Step('reverse_replenish', 'p1', 'replenish'), recovery=False)
-        self.assertEqual(plan['method'], 'quantity_only')
-        self.assertEqual(plan['over_verify'], 'null')
-        runner.browser.ad_details.return_value['availableQuantity'] = plan['target_available']
-        await runner.check_browser_ad(plan)
-        runner.browser.ad_details.return_value['availableQuantity'] = self.exchange.ad['availableQuantity']
-        runner.spec = dict(self.spec, scheduler_mode='eflp_unique')
+        for mode in ('eflp_volume', 'eflp_unique'):
+            with self.subTest(mode=mode):
+                runner.spec = dict(self.spec, scheduler_mode=mode)
+                with (patch.object(runner, 'result', side_effect=result),
+                      patch.object(runner, 'snapshot', new=AsyncMock(return_value={
+                          'state': 'COMPLETED', 'order_no': 'ORDER-1'}))):
+                    plan = await runner.prepare(Step('reverse_replenish', 'p1', 'replenish'), recovery=False)
+                self.assertEqual(plan['method'], 'quantity_only')
+                self.assertEqual(plan['over_verify'], 'null')
+                runner.browser.ad_details.return_value['availableQuantity'] = plan['target_available']
+                await runner.check_browser_ad(plan)
+                runner.browser.ad_details.return_value['availableQuantity'] = self.exchange.ad['availableQuantity']
+        runner.spec = dict(self.spec, scheduler_mode='cash_volume')
         with self.assertRaisesRegex(ValueError, 'Удостоверение личности'):
             await runner.quantity_plan(self.exchange.ad, 'AD-SELL', '100')
 

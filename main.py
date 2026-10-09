@@ -25,9 +25,15 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--resume", metavar="ID", help="Продолжить сохранённый цикл")
     cycle.add_argument("--p2-profile", metavar="NAME", help="Профиль П2 из .env; при --resume берётся сохранённый")
     cycle.add_argument("--p1-profile", metavar="NAME", help="Профиль П1: p1, p1_2 или ранее настроенный профиль П2")
+    cycle.add_argument('--reverse-p1-profile', metavar='NAME',
+                       help='Internal transfer: the second order has a different P1')
+    cycle.add_argument('--forward-only', action='store_true',
+                       help='Internal final purchase without a reverse order')
+    cycle.add_argument('--forward-quantity', metavar='USDT',
+                       help='Internal exact USDT quantity for a final purchase')
     cycle.add_argument("--reverse-maker", choices=["p1", "p2"],
                        help="Владелец объявления обратной продажи USDT; для новых режимов — p2")
-    cycle.add_argument('--scheduler-mode', choices=['volume', 'unique', 'cash_volume', 'eflp_volume', 'eflp_unique'],
+    cycle.add_argument('--scheduler-mode', choices=['volume', 'unique', 'cash_volume', 'cash_unique', 'eflp_volume', 'eflp_unique'],
                         help='Внутренняя привязка к сохранённому режиму Telegram')
     control = cycle.add_mutually_exclusive_group()
     control.add_argument("--auto", action="store_true", help="Автоматический режим без подтверждений в консоли")

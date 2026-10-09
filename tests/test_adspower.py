@@ -117,6 +117,28 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         start.assert_not_awaited()
         stop.assert_not_awaited()
 
+    async def test_ensure_stopped_closes_only_its_active_profile_and_confirms(self):
+        observed = []
+        active = True
+
+        async def handler(request):
+            nonlocal active
+            self.assertEqual(request.url.params['user_id'], 'P1')
+            if request.url.path.endswith('/active'):
+                return httpx.Response(200, json={'code': 0,
+                    'data': {'status': 'Active' if active else 'Inactive'}})
+            observed.append(request.url.path)
+            active = False
+            return httpx.Response(200, json={'code': 0, 'data': {}})
+
+        original_client = httpx.AsyncClient
+        with patch('adspower.httpx.AsyncClient',
+                   side_effect=lambda **_: original_client(transport=httpx.MockTransport(handler))), \
+                patch('adspower.asyncio.sleep', new=AsyncMock()):
+            await self.browser.ensure_stopped()
+            await self.browser.ensure_stopped()
+        self.assertEqual(observed, ['/api/v1/browser/stop'])
+
     async def test_persistent_local_api_timeout_is_classified_for_scheduler(self):
         with patch('adspower.httpx.AsyncClient') as factory, \
                 patch('adspower.asyncio.sleep', new=AsyncMock()):

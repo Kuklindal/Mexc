@@ -166,6 +166,18 @@ def fingerprint(api_key: str) -> str:
 
 
 def steps_for_spec(spec: dict) -> list[Step]:
+    if spec.get('forward_only'):
+        if spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}:
+            result = []
+            for step in STEPS[:9]:
+                if step.key == 'forward_check':
+                    continue
+                if step.key in {'forward_paid', 'forward_release'}:
+                    wait_key = step.key.replace('_paid', '_wait_paid').replace('_release', '_wait_release')
+                    result.append(Step(wait_key, 'both', 'Ожидание перед действием'))
+                result.append(step)
+            return result
+        return STEPS[:9]
     if spec.get('scheduler_mode') == 'cash_volume' and spec.get('cash_return_route') == 'network':
         # The scheduler performs the saved, reconciled wallet return after the
         # confirmed first leg. No reverse P2P order is created on this route.
@@ -290,7 +302,7 @@ class CycleRunner:
                  trusted_members: dict | None = None, p1_over_verify: str = "",
                  trusted_nicknames: dict | None = None, delay_max_seconds: float | None = None,
                  p2_profile: str = "default", stop_event: asyncio.Event | None = None,
-                 p1_profile: str = 'p1', maker_browser=None):
+                 p1_profile: str = 'p1', maker_browser=None, reverse_browser=None):
         self.journal = journal
         self.reporter = reporter
         self.clients = clients
@@ -303,6 +315,7 @@ class CycleRunner:
         self.p2_profile = p2_profile
         self.browser = browser
         self.maker_browser = maker_browser
+        self.reverse_browser = reverse_browser
         self.p1_profile = p1_profile
         self.pay_method_id = positive_id(pay_method_id) if pay_method_id else None
         self.automatic = automatic
@@ -322,7 +335,17 @@ class CycleRunner:
         return steps_for_spec(self.spec)
 
     def browser_for_step(self, step: Step):
-        return self.maker_browser if step.key == 'reverse_check' else self.browser
+        if step.key == 'reverse_check':
+            return self.maker_browser
+        return self.reverse_browser if step.key.startswith('reverse_') and self.reverse_browser else self.browser
+
+    def client_for(self, actor: str, leg: str):
+        if actor == 'p1' and leg == 'reverse' and 'reverse_p1' in self.clients:
+            return self.clients['reverse_p1']
+        return self.clients[actor]
+
+    def fiat_for(self, leg: str) -> str:
+        return self.spec.get('reverse_fiat', self.spec['fiat']) if leg == 'reverse' else self.spec['fiat']
 
     def check_stop(self):
         if self.stop_event is not None and self.stop_event.is_set():
@@ -347,7 +370,7 @@ class CycleRunner:
         detail = self.result(f"{leg}_verify")
         order = self.result(f"{leg}_create")
         return {"amount": detail.get("amount", self.spec["amount"] if leg == "forward" else ""),
-                "fiat": self.spec["fiat"], "quantity": detail.get("quantity", ""),
+                "fiat": self.fiat_for(leg), "quantity": detail.get("quantity", ""),
                  "order_no": order.get("order_no", "")}
 
     def select_cash_reverse_route(self) -> bool:
@@ -455,8 +478,9 @@ class CycleRunner:
                 return
             raise Paused('Последняя покупка подтверждена; вывод через сеть выполняет сохранённая серия. '
                          'Продолжите серию через Telegram, не повторяйте цикл отдельно.')
-        if (cycle["status"] == "completed" and self.result("reverse_replenish")
-                and (not self.spec.get("buy_replenish") or self.result("reverse_replenish_buy"))):
+        if (cycle["status"] == "completed" and (self.spec.get('forward_only') and self.result('forward_complete')
+                or self.result("reverse_replenish")
+                and (not self.spec.get("buy_replenish") or self.result("reverse_replenish_buy")))):
             self.console.write("Этот цикл уже завершён. Повторных операций не будет.")
             await self.reporter.flush()
             await self.close_completed_tabs()
@@ -614,11 +638,11 @@ class CycleRunner:
                     # against the saved absolute target; never add the increment twice.
                     plan = saved['result']
                     if plan.get('adv_no') and plan.get('target_available'):
-                        ad = await self.clients[step.actor].get_ad(plan['adv_no'])
+                        ad = await self.client_for(step.actor, leg).get_ad(plan['adv_no'])
                         try:
                             self.check_replenished(ad, plan)
                         except Paused:
-                            browser = self.maker_browser if step.actor == 'p2' else self.browser
+                            browser = self.maker_browser if step.actor == 'p2' else (self.reverse_browser or self.browser)
                             current_plan = (await self.quantity_plan(ad, plan['adv_no'], plan['quantity'],
                                         side=plan.get('side', 'SELL'), browser=browser)
                                        if plan.get('method') == 'quantity_only' else
@@ -628,7 +652,8 @@ class CycleRunner:
                             retry, uncertain = True, False
                         else:
                             if plan.get('method') == 'quantity_only':
-                                await self.check_browser_ad(plan, browser=self.maker_browser if step.actor == 'p2' else self.browser)
+                                await self.check_browser_ad(plan, browser=self.maker_browser if step.actor == 'p2'
+                                                            else self.reverse_browser or self.browser)
                             await self.event(step, 'done', 'Пополнение подтверждено текущим остатком MEXC', plan)
                             continue
                 if self.automatic and uncertain and remote is not None and not already_applied:
@@ -638,7 +663,7 @@ class CycleRunner:
                     raise Paused("Результат предыдущей операции требует сверки. Автоматического повтора нет; продолжите с --interactive.")
                 if uncertain and action == "replenish" and saved["result"].get("rejected_code") in {700002, 60048, 60064}:
                     plan = {k: v for k, v in saved["result"].items() if k != "rejected_code"}
-                    ad = await self.clients[step.actor].get_ad(plan["adv_no"])
+                    ad = await self.client_for(step.actor, leg).get_ad(plan["adv_no"])
                     if Decimal(str(ad["availableQuantity"])) != Decimal(plan["target_available"]):
                         if self.replenish_plan(ad, plan["adv_no"], plan["quantity"]) != plan:
                             raise Paused("После отказа MEXC объявление изменилось. Повтор пополнения остановлен; требуется сверка.")
@@ -793,14 +818,18 @@ class CycleRunner:
     async def close_completed_tabs(self):
         if not self.browser or self.spec["mode"] != "api":
             return
-        required = ["forward_complete", "reverse_complete", "reverse_replenish"]
+        required = (["forward_complete"] if self.spec.get('forward_only') else
+                    ["forward_complete", "reverse_complete", "reverse_replenish"])
         if self.spec.get("buy_replenish"):
             required.append("reverse_replenish_buy")
         if not all(self.result(key) for key in required):
             return
         try:
-            orders = [self.result(f"{leg}_create")["order_no"] for leg in ("forward", "reverse")]
+            legs = ("forward",) if self.spec.get('forward_only') else ("forward", "reverse")
+            orders = [self.result(f"{leg}_create")["order_no"] for leg in legs]
             closed = await self.browser.close_order_tabs(orders)
+            if self.reverse_browser and self.reverse_browser.profile_id != self.browser.profile_id:
+                closed += await self.reverse_browser.close_order_tabs(orders)
             if self.maker_browser and self.spec.get('reverse_maker') == 'p2':
                 closed += await self.maker_browser.close_order_tabs(orders)
             self.console.write(f"Закрыто вкладок завершённых ордеров: {closed}.")
@@ -822,15 +851,19 @@ class CycleRunner:
             if self.result(f"{leg}_create"):
                 await self.snapshot(leg)
 
-    def check_counterparty(self, detail: dict, actor: str, order_no: str):
+    def check_counterparty(self, detail: dict, actor: str, order_no: str, leg: str = 'forward'):
         expected_actor = "p2" if actor == "p1" else "p1"
-        expected_id = self.trusted_members.get(expected_actor)
+        expected_id = (self.spec.get('reverse_p1_member_id')
+                       if expected_actor == 'p1' and leg == 'reverse' and self.spec.get('reverse_p1_member_id')
+                       else self.trusted_members.get(expected_actor))
         if not expected_id and not self.automatic:
             return
         member_id, nickname = counterparty_identity(detail)
         if not member_id or member_id != expected_id:
             raise Paused(f"Ордер {order_no}, ответ {actor}: ID контрагента не совпал или отсутствует. Действие заблокировано.")
-        expected_nickname = self.trusted_nicknames.get(expected_actor)
+        expected_nickname = (self.spec.get('reverse_p1_nickname')
+                             if expected_actor == 'p1' and leg == 'reverse'
+                             else self.trusted_nicknames.get(expected_actor))
         if (expected_actor == "p2" or expected_nickname) and (
                 not nickname or not expected_nickname or nickname != expected_nickname):
             raise Paused(f"Ордер {order_no}, ответ {actor}: ник контрагента не совпал или отсутствует. Действие заблокировано.")
@@ -849,7 +882,7 @@ class CycleRunner:
             raise Paused('В журнале нет времени отправки ордера; автоматическое создание дубля запрещено')
         start_ms = int(datetime.fromisoformat(row[0]).timestamp() * 1000) - 30000
         for attempt in range(2):
-            orders = await self.clients[step.actor].list_orders(
+            orders = await self.client_for(step.actor, leg).list_orders(
                 start_time_ms=start_ms, end_time_ms=int(datetime.now(timezone.utc).timestamp() * 1000), limit=50)
             if len(orders) >= 50:
                 raise Paused('История ордеров MEXC обрезана; отсутствие предыдущего ордера не доказано')
@@ -871,13 +904,13 @@ class CycleRunner:
                 order_no = matches[0]
                 states = set()
                 for actor in ('p1', 'p2'):
-                    detail = await self.clients[actor].get_order_detail(order_no)
+                    detail = await self.client_for(actor, leg).get_order_detail(order_no)
                     if (str(detail.get('advOrderNo')) != order_no
                             or str(detail.get('advNo')) != plan['adv_no']
                             or str(detail.get('coinName')).upper() != 'USDT'
-                            or str(detail.get('fiatUnit')).upper() != self.spec['fiat']):
+                            or str(detail.get('fiatUnit')).upper() != self.fiat_for(leg)):
                         raise Paused('Найденный ордер не совпадает с сохранённым запросом')
-                    self.check_counterparty(detail, actor, order_no)
+                    self.check_counterparty(detail, actor, order_no, leg)
                     key = 'amount' if plan.get('amount') else 'tradableQuantity'
                     try:
                         if Decimal(str(detail[key])) != Decimal(str(plan.get('amount') or plan['tradable_quantity'])):
@@ -900,20 +933,20 @@ class CycleRunner:
             details = {}
             for actor in ("p1", "p2"):
                 try:
-                    detail = await self.clients[actor].get_order_detail(order_no)
+                    detail = await self.client_for(actor, leg).get_order_detail(order_no)
                 except MexcReadUnavailable as exc:
                     raise MexcReadUnavailable(f'Чтение ордера через {actor}: {exc}') from exc
                 if str(detail.get("advOrderNo", "")) != order_no:
                     raise ValueError("API вернул другой номер ордера; продолжение заблокировано")
-                self.check_counterparty(detail, actor, order_no)
+                self.check_counterparty(detail, actor, order_no, leg)
                 if str(detail.get("coinName", "")).upper() != "USDT":
                     raise ValueError("Ордер не в USDT; продолжение заблокировано")
-                if str(detail.get("fiatUnit", "")).upper() != self.spec["fiat"]:
+                if str(detail.get("fiatUnit", "")).upper() != self.fiat_for(leg):
                     raise ValueError("Фиатная валюта не совпадает с циклом")
                 if detail.get("advNo") is not None and str(detail["advNo"]) != self.result(f"{leg}_ad")["adv_no"]:
                     raise ValueError("Объявление ордера не совпадает с выбранным")
                 details[actor] = {"order_no": order_no, "amount": money(detail.get("amount", "")),
-                    "quantity": money(detail.get("tradableQuantity", "")), "fiat": self.spec["fiat"],
+                    "quantity": money(detail.get("tradableQuantity", "")), "fiat": self.fiat_for(leg),
                     "state": str(detail.get("state", "UNKNOWN"))}
             a, b = details["p1"], details["p2"]
             if Decimal(a["amount"]) != Decimal(b["amount"]) or Decimal(a["quantity"]) != Decimal(b["quantity"]):
@@ -923,12 +956,15 @@ class CycleRunner:
             snapshot = a
         else:
             previous = self.result(f"{leg}_verify")
-            snapshot = {"order_no": order_no, "fiat": self.spec["fiat"], "state": "operator_verified",
+            snapshot = {"order_no": order_no, "fiat": self.fiat_for(leg), "state": "operator_verified",
                 "amount": self.console.ask("Фактическая сумма ордера в фиате",
                     previous.get("amount", self.spec["amount"] if leg == "forward" else ""), money),
                 "quantity": self.console.ask("Фактическое количество USDT в ордере",
                     previous.get("quantity", self.result("forward_complete").get("quantity", "")), money)}
-        if leg == "forward" and Decimal(snapshot["amount"]) != Decimal(self.spec["amount"]):
+        if leg == 'forward' and self.spec.get('forward_quantity') and (
+                Decimal(snapshot['quantity']) != Decimal(self.spec['forward_quantity'])):
+            raise ValueError('Финальный выкуп не покрывает сохранённое количество USDT')
+        if leg == "forward" and not self.spec.get('forward_quantity') and Decimal(snapshot["amount"]) != Decimal(self.spec["amount"]):
             raise ValueError("Сумма первой сделки не совпадает с согласованной")
         if leg == "reverse":
             expected_quantity = Decimal(self.result("forward_complete")["quantity"])
@@ -966,8 +1002,8 @@ class CycleRunner:
                 return positive_id(str(configured))
         return self.pay_method_id
 
-    async def payment_account(self, actor: str, order_no: str) -> int:
-        detail = await self.clients[actor].get_order_detail(order_no)
+    async def payment_account(self, actor: str, order_no: str, leg: str = 'forward') -> int:
+        detail = await self.client_for(actor, leg).get_order_detail(order_no)
         if str(detail.get("advOrderNo", "")) != order_no:
             raise ValueError("Получены реквизиты другого ордера")
         payments = detail.get("paymentInfo")
@@ -1029,13 +1065,15 @@ class CycleRunner:
             quantity = money(self.result("forward_complete" if maker_preparation else "reverse_complete")["quantity"])
             buy_ad = step.key == "reverse_replenish_buy"
             adv_no = (self.spec['reverse_adv_no'] if maker_preparation else
-                      self.result("reverse_ad" if buy_ad else "forward_ad")["adv_no"])
-            browser = self.maker_browser if maker_preparation else self.browser
+                      self.result("reverse_ad")["adv_no"] if buy_ad else
+                      self.spec.get('replenish_adv_no') or self.result("forward_ad")["adv_no"])
+            browser = (self.maker_browser if maker_preparation else
+                       self.reverse_browser if self.reverse_browser else self.browser)
             if self.spec["mode"] == "manual":
                 self.console.confirm(f"На MEXC добавьте {quantity} USDT к остатку объявления {adv_no}. "
                                      "Если уже добавили, повторно не пополняйте.", f"ПОПОЛНЕНО {adv_no}")
                 return {"adv_no": adv_no, "quantity": quantity}
-            ad = await self.clients[step.actor].get_ad(adv_no)
+            ad = await self.client_for(step.actor, leg).get_ad(adv_no)
             if recovery:
                 saved = self.journal.step(self.cycle_id, step.key)["result"]
                 # Old attempts stored the cumulative target; recover the available target
@@ -1050,9 +1088,11 @@ class CycleRunner:
                 self.console.write(f"Доступный остаток объявления соответствует цели {saved['target_available']} USDT. "
                                    "Проверьте пополнение на MEXC; повторного запроса не будет.")
                 return saved
-            plan = (await self.quantity_plan(ad, adv_no, quantity, side="BUY" if buy_ad else "SELL", browser=browser)
-                    if (maker_preparation or buy_ad or self.spec.get('scheduler_mode') == 'eflp_volume'
-                        or ad.get('overVerify') is None) else self.replenish_plan(ad, adv_no, quantity))
+            plan = (await self.quantity_plan(ad, adv_no, quantity, side="BUY" if buy_ad else "SELL", browser=browser,
+                                             fiat=self.fiat_for(leg))
+                    if (maker_preparation or buy_ad or self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}
+                        or ad.get('overVerify') is None) else self.replenish_plan(ad, adv_no, quantity,
+                                                                                   fiat=self.fiat_for(leg)))
             self.console.write(f"Объявление {adv_no}: сейчас {plan['before_available']} USDT, добавить {quantity} USDT. "
                                f"Ожидаемый доступный остаток: {plan['target_available']} USDT.\n"
                                f"Статус объявления: {ad.get('advStatus', 'неизвестен')}; публикация этим шагом не выполняется.")
@@ -1072,9 +1112,9 @@ class CycleRunner:
             if not adv_no:
                 adv_no = self.console.ask("Номер готового объявления П1 (advNo)")
             if self.automatic:
-                ad = await self.clients[step.actor].get_ad(adv_no)
+                ad = await self.client_for(step.actor, leg).get_ad(adv_no)
                 if (ad.get("advNo") != adv_no or ad.get("side") != ("SELL" if leg == "forward" or p2_maker else "BUY")
-                        or ad.get("coinName") != "USDT" or ad.get("fiatUnit") != self.spec["fiat"]):
+                        or ad.get("coinName") != "USDT" or ad.get("fiatUnit") != self.fiat_for(leg)):
                     raise Paused("Объявление не соответствует владельцу, стороне сделки, токену или валюте")
                 if leg == 'forward' and self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}:
                     configured_method = self.forward_pay_method_id()
@@ -1083,6 +1123,12 @@ class CycleRunner:
                         raise Paused('MEXC не вернул способы оплаты объявления П1; первый ордер не открыт')
                     if str(configured_method) not in {str(p.get('payMethod')) for p in payments}:
                         raise Paused(f'Способ оплаты {configured_method} не найден в объявлении П1; первый ордер не открыт')
+                if leg == 'reverse' and self.spec.get('eflp_reverse_pay_method_id'):
+                    payments = ad.get('paymentInfo')
+                    if (not isinstance(payments, list) or
+                            str(self.spec['eflp_reverse_pay_method_id']) not in
+                            {str(p.get('payMethod')) for p in payments if isinstance(p, dict)}):
+                        raise Paused('Новый П1 не предлагает настроенный способ оплаты в BUY-объявлении')
                 if (leg == "forward" or p2_maker) and self.spec.get('scheduler_mode') not in {'eflp_volume', 'eflp_unique'}:
                     # A configured fallback is not evidence that the live checkbox is on.
                     browser = self.maker_browser if p2_maker else self.browser
@@ -1120,8 +1166,10 @@ class CycleRunner:
                                                      'новая покупка не отправлена')
                 self.console.write(f"После подтверждения П2 откроет сделку по объявлению {args['adv_no']} "
                                    f"на {self.spec['amount']} {self.spec['fiat']}.")
-                args.update(amount=self.spec["amount"], user_confirm_pay_method_id=self.forward_pay_method_id() or self.console.ask(
-                    "ID способа оплаты из объявления (не номер карты)", validate=positive_id))
+                args.update(({"tradable_quantity": self.spec['forward_quantity']}
+                             if self.spec.get('forward_quantity') else {"amount": self.spec["amount"]}),
+                            user_confirm_pay_method_id=self.forward_pay_method_id() or self.console.ask(
+                                "ID способа оплаты из объявления (не номер карты)", validate=positive_id))
             elif self.spec.get('reverse_maker') == 'p2':
                 ad = await self.clients['p2'].get_ad(args['adv_no'])
                 price = Decimal(str(ad.get('price', 'NaN')))
@@ -1142,7 +1190,7 @@ class CycleRunner:
                     if not self.p2_payment_browser:
                         raise Paused('Для получения ID реквизитов П2 по payMethod нужен его профиль AdsPower')
                     payment_id = self.p2_payment_account_id or await self.p2_payment_browser.payment_account_by_method(
-                        self.p2_pay_method_id, self.spec['fiat'])
+                        self.p2_pay_method_id, self.fiat_for(leg))
                     self.console.write(f'Реквизиты П2 для {self.spec["fiat"]} определены по payMethod {self.p2_pay_method_id}.')
                 elif self.p2_payment_id:
                     payment_id = positive_id(self.p2_payment_id)
@@ -1206,7 +1254,7 @@ class CycleRunner:
             if action == "paid":
                 result = {"order_no": ctx["order_no"]}
                 if not manual:
-                    result["payment_account_id"] = await self.payment_account(step.actor, ctx["order_no"])
+                    result["payment_account_id"] = await self.payment_account(step.actor, ctx["order_no"], leg)
                 self.console.confirm(f"{step.actor}: " + ("проверьте уже выполненную оплату; не платите повторно. "
                     if recovery else "подтвердите, что полная сумма уже оплачена выбранным способом (наличные или перевод). ") +
                     "Эта отметка не переводит деньги. Не оплачивайте сделку повторно.", f"ОПЛАТА ВЫПОЛНЕНА {ctx['order_no']}")
@@ -1258,8 +1306,9 @@ class CycleRunner:
         if action == "replenish":
             maker_preparation = step.key == 'reverse_replenish_sell'
             self.check_state(await self.snapshot("forward" if maker_preparation else "reverse"), COMPLETED_STATES)
-            client = self.clients[step.actor]
-            browser = self.maker_browser if maker_preparation else self.browser
+            client = self.client_for(step.actor, leg)
+            browser = (self.maker_browser if maker_preparation else
+                       self.reverse_browser if self.reverse_browser else self.browser)
             ad = await client.get_ad(data["adv_no"])
             if recovery:
                 self.check_replenished(ad, data)
@@ -1269,7 +1318,8 @@ class CycleRunner:
             if data.get('method') == 'quantity_only':
                 try:
                     current = await self.quantity_plan(ad, data['adv_no'], data['quantity'],
-                                                       side=data.get('side', 'SELL'), browser=browser)
+                                                       side=data.get('side', 'SELL'), browser=browser,
+                                                       fiat=self.fiat_for(leg))
                 except AdsPowerUnavailable as exc:
                     raise AdsPowerPreflightUnavailable(str(exc)) from None
                 if ('target_total' in data and 'target_total' in current):
@@ -1286,7 +1336,7 @@ class CycleRunner:
                 self.check_replenished(await client.get_ad(data['adv_no']), data)
                 await self.check_browser_ad(data, browser=browser)
                 return data
-            if self.replenish_plan(ad, data["adv_no"], data["quantity"]) != data:
+            if self.replenish_plan(ad, data["adv_no"], data["quantity"], fiat=self.fiat_for(leg)) != data:
                 raise Paused("Объявление изменилось после подтверждения. Пополнение не отправлено; проверьте его на MEXC.")
             await client.replenish_ad(ad | {"overVerify": data["over_verify"]}, data["quantity"])
             self.check_replenished(await client.get_ad(data["adv_no"]), data)
@@ -1311,14 +1361,14 @@ class CycleRunner:
             self.check_state(await self.snapshot(leg), {"NOT_PAID"})
             await check_browser.approve(data["order_no"])
             return {"order_no": data["order_no"], "verification": "seller_check_completed_on_mexc"}
-        client = self.clients[step.actor] if step.actor != "both" else None
+        client = self.client_for(step.actor, leg) if step.actor != "both" else None
         if action == "create":
             return {"order_no": await client.create_order(**data)}
         if action in {"message", "reply"}:
             await client.send_chat_text(data["order_no"], data["text"])
             receiver = "p1" if step.actor == "p2" else "p2"
             # Placeholder until a verified read-receipt mechanism is configured.
-            data["chat_read"] = await self.clients[receiver].mark_chat_read(data["order_no"])
+            data["chat_read"] = await self.client_for(receiver, leg).mark_chat_read(data["order_no"])
         elif action == "paid":
             seller_browser = (None if self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}
                               else self.browser if leg == 'forward' else self.maker_browser
@@ -1355,8 +1405,8 @@ class CycleRunner:
     def browser_ad_verification(self, actual: dict, side: str) -> str:
         if side == 'BUY':
             return json.dumps(actual.get('overVerify'), sort_keys=True, ensure_ascii=False)
-        if self.spec.get('scheduler_mode') == 'eflp_volume':
-            # Eflp volume ads need no identity-document requirement. Preserve
+        if self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}:
+            # Eflp ads need no identity-document requirement. Preserve
             # whatever is actually configured, including a missing check.
             value = actual.get('overVerify')
             if isinstance(value, str):
@@ -1367,8 +1417,10 @@ class CycleRunner:
             return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
         return ad_verification(actual)
 
-    async def quantity_plan(self, ad: dict, adv_no: str, quantity: str, side: str = 'SELL', browser=None) -> dict:
+    async def quantity_plan(self, ad: dict, adv_no: str, quantity: str, side: str = 'SELL', browser=None,
+                            fiat: str | None = None) -> dict:
         browser = browser or self.browser
+        fiat = fiat or self.spec['fiat']
         if not browser:
             raise Paused("API не возвращает настройки проверки. Для пополнения без их сброса нужен AdsPower П1")
         actual = await browser.ad_details(adv_no)
@@ -1383,7 +1435,7 @@ class CycleRunner:
         if (actual.get('id') != adv_no or actual.get('coinName') != 'USDT'
                 or actual.get('tradeType') != (0 if side == 'BUY' else 1)
                 or ad.get('side', side) != side
-                or actual.get('currency') != self.spec['fiat'] or ad.get('advNo') != adv_no
+                or actual.get('currency') != fiat or ad.get('advNo') != adv_no
                 or not balance_matches):
             raise Paused("Данные объявления в API и браузере расходятся; пополнение остановлено")
         available = Decimal(str(actual['availableQuantity']))
@@ -1391,7 +1443,7 @@ class CycleRunner:
         if not available.is_finite() or available < 0:
             raise ValueError("Некорректный остаток объявления")
         verification = CycleRunner.browser_ad_verification(self, actual, side)
-        plan = {'method': 'quantity_only', 'adv_no': adv_no, 'fiat': self.spec['fiat'], 'quantity': str(increment),
+        plan = {'method': 'quantity_only', 'adv_no': adv_no, 'fiat': fiat, 'quantity': str(increment),
                 'before_available': str(available), 'target_available': str(available + increment),
                 'over_verify': verification, 'side': side}
         if api_frozen is not None and browser_frozen is not None:
@@ -1402,8 +1454,9 @@ class CycleRunner:
                         target_total=str(available + frozen + increment))
         return plan
 
-    def replenish_plan(self, ad: dict, adv_no: str, quantity: str) -> dict:
-        if ad.get("advNo") != adv_no or ad.get("fiatUnit") != self.spec["fiat"]:
+    def replenish_plan(self, ad: dict, adv_no: str, quantity: str, *, fiat: str | None = None) -> dict:
+        fiat = fiat or self.spec['fiat']
+        if ad.get("advNo") != adv_no or ad.get("fiatUnit") != fiat:
             raise ValueError("Объявление или валюта не совпадают с исходной продажей")
         params = ad_replenish_params(ad | {"overVerify": ad_verification(ad, self.p1_over_verify)}, quantity)
         available = Decimal(str(ad.get("availableQuantity", "")))
@@ -1431,7 +1484,7 @@ class CycleRunner:
         else:
             matched = Decimal(str(ad.get('availableQuantity', 'NaN'))) == Decimal(plan['target_available'])
         if (ad.get("advNo") != plan.get("adv_no") or ad.get("side") != plan.get("side", "SELL")
-                or ad.get("coinName") != "USDT" or ad.get("fiatUnit") != self.spec["fiat"]
+                or ad.get("coinName") != "USDT" or ad.get("fiatUnit") != plan.get('fiat', self.spec['fiat'])
                 or "target_available" not in plan
                 or not matched
                 or ("target_max_limit" in plan and Decimal(str(ad.get("maxSingleTransAmount", "NaN"))) != Decimal(plan["target_max_limit"]))):
@@ -1518,6 +1571,12 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
             p2_profile = select_p2_profile(args.p2_profile, existing["spec"] if existing else None, os.environ)
             p1_profile = (existing['spec'].get('p1_profile', 'p1') if existing else
                           getattr(args, 'p1_profile', None) or 'p1')
+            reverse_p1_profile = (existing['spec'].get('reverse_p1_profile') if existing else
+                                  getattr(args, 'reverse_p1_profile', None))
+            forward_only = (bool(existing['spec'].get('forward_only')) if existing else
+                            bool(getattr(args, 'forward_only', False)))
+            forward_quantity = (existing['spec'].get('forward_quantity') if existing else
+                                getattr(args, 'forward_quantity', None))
             scheduler_mode = (existing['spec'].get('scheduler_mode') if existing else
                                getattr(args, 'scheduler_mode', None))
             eflp_p1_pay_method_id = None
@@ -1529,18 +1588,31 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
             reverse_maker = (existing['spec'].get('reverse_maker', 'p1') if existing else
                              getattr(args, 'reverse_maker', None) or 'p1')
             if existing and (getattr(args, 'p1_profile', None) not in {None, p1_profile}
-                             or getattr(args, 'reverse_maker', None) not in {None, reverse_maker}):
+                             or getattr(args, 'reverse_maker', None) not in {None, reverse_maker}
+                             or getattr(args, 'reverse_p1_profile', None) not in {None, reverse_p1_profile}):
                 raise ValueError('Роли участников начатого цикла менять нельзя')
             if existing and getattr(args, 'scheduler_mode', None) not in {
                     None, existing['spec'].get('scheduler_mode')}:
                 raise ValueError('Режим сохранённого цикла менять нельзя')
             if p1_profile != 'p1':
                 p1_profile = p2_profile_name(p1_profile)
+            if reverse_p1_profile and reverse_p1_profile != 'p1':
+                reverse_p1_profile = p2_profile_name(reverse_p1_profile)
+            if forward_only and reverse_p1_profile:
+                raise ValueError('Финальный выкуп без возврата несовместим со вторым П1')
+            if reverse_p1_profile and reverse_p1_profile == p1_profile:
+                raise ValueError('Для перехода укажите другого П1')
+            if reverse_p1_profile and reverse_maker != 'p1':
+                raise ValueError('При переходе второе объявление должно принадлежать новому П1')
             from trade_profiles import (eflp_p1_fiat, eflp_p2_payment_id, mode_pay_method_id,
                                         profile_prefix, settings_for_profile)
             prefixes = {"p1": profile_prefix(p1_profile),
                         "p2": p2_prefix(p2_profile)}
+            reverse_p1_prefix = profile_prefix(reverse_p1_profile) if reverse_p1_profile else prefixes['p1']
             automatic = (existing["spec"].get("automatic", False) if existing else args.auto) and not args.interactive
+            if forward_quantity and (not automatic or scheduler_mode not in {
+                    'eflp_volume', 'eflp_unique', 'cash_unique'}):
+                raise ValueError('Точное количество USDT разрешено только для автоматического финала Eflp/наличных')
             series_options = any(v is not None for v in (args.min_amount, args.max_amount, args.count, args.fiat))
             if existing and (series_options or args.amount):
                 raise ValueError("При --resume используются сохранённые суммы и количество циклов; новые параметры не задавайте")
@@ -1548,6 +1620,10 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 raise ValueError("Диапазон суммы и --count доступны только с --auto")
             plan = auto_plan(args, os.environ) if automatic and not existing else None
             p2_pay_method_id = ''
+            reverse_fiat = (existing['spec'].get('reverse_fiat') if existing else
+                            eflp_p1_fiat(reverse_p1_profile, os.environ)
+                            if reverse_p1_profile and scheduler_mode in {'eflp_volume', 'eflp_unique'}
+                            else 'RUB' if reverse_p1_profile else None)
             if existing:
                 p2_payment_id = existing['spec'].get('p2_payment_id', '')
                 p2_pay_method_id = existing['spec'].get('p2_pay_method_id', '')
@@ -1559,7 +1635,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                                      f'но для ордера выбрана валюта {selected_fiat}')
                 eflp_p1_pay_method_id = positive_id(mode_pay_method_id(
                     scheduler_mode, selected_fiat, os.environ))
-                p2_payment_id = eflp_p2_payment_id(p2_profile, selected_fiat, os.environ)
+                p2_payment_id = eflp_p2_payment_id(p2_profile, reverse_fiat or selected_fiat, os.environ)
             else:
                 p2_payment_id = os.getenv(f"{prefixes['p2']}_PAYMENT_ID", "").strip()
             if p2_payment_id:
@@ -1575,6 +1651,15 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
             delay_seconds, delay_max_seconds = delay_bounds(os.environ)
             members = {actor: os.getenv(f"{prefix}_MEMBER_ID", "").strip() for actor, prefix in prefixes.items()}
             nicknames = {actor: os.getenv(f"{prefix}_NICKNAME", "").strip() for actor, prefix in prefixes.items()}
+            if reverse_p1_profile:
+                reverse_member = os.getenv(f'{reverse_p1_prefix}_MEMBER_ID', '').strip()
+                if (not reverse_member or reverse_member in members.values()
+                        or not os.getenv(f'{reverse_p1_prefix}_BUY_ADV_NO', '').strip()
+                        or not os.getenv(f'{reverse_p1_prefix}_SELL_ADV_NO', '').strip()):
+                    raise ValueError('Новый П1 должен иметь отдельный MEMBER_ID и оба объявления BUY/SELL')
+                if existing and (existing['spec'].get('reverse_p1_member_id') != reverse_member
+                                 or existing['spec'].get('reverse_fiat') != reverse_fiat):
+                    raise ValueError('Настройки нового П1 изменились после начала переходного цикла')
             if (automatic or any(members.values())) and not nicknames["p2"]:
                 raise ValueError(f"Заполните {prefixes['p2']}_NICKNAME — точный ник выбранного П2 на MEXC")
             profiles = {}
@@ -1590,6 +1675,15 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                     clients[actor] = MexcP2PClient(profile.api_key, profile.secret_key, profile.base_url,
                                                    profile.recv_window, proxy_url=profile.proxy_url,
                                                    timeout_seconds=45 if scheduler_mode == 'cash_volume' and reverse_maker == 'p2' else 20)
+                if reverse_p1_profile:
+                    reverse_settings = settings_for_profile(reverse_p1_profile)
+                    profiles['reverse_p1'] = fingerprint(reverse_settings.api_key)
+                    clients['reverse_p1'] = MexcP2PClient(
+                        reverse_settings.api_key, reverse_settings.secret_key,
+                        reverse_settings.base_url, reverse_settings.recv_window,
+                        proxy_url=reverse_settings.proxy_url)
+                    if profiles['reverse_p1'] in {profiles['p1'], profiles['p2']}:
+                        raise ValueError('При переходе все три аккаунта должны иметь разные API-ключи')
                 if profiles["p1"] == profiles["p2"]:
                     raise ValueError("Для П1 и П2 указаны одинаковые API-ключи")
                 if existing and profiles != existing["spec"]["profiles"]:
@@ -1600,6 +1694,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 console.write("Google Таблица не настроена: суммы продаж сохраняются локально до подключения.")
             browser = None
             maker_browser = None
+            reverse_browser = None
             p2_payment_browser = None
             p2_payment_account_id = None
             if mode == 'api' and p2_pay_method_id:
@@ -1617,6 +1712,11 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                            AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
                                     os.getenv('ADSPOWER_API_KEY', ''),
                                     os.getenv(f"{prefixes['p1']}_ADSPOWER_PROFILE_ID", '')))
+                if reverse_p1_profile:
+                    reverse_browser_id = (os.getenv('ADSPOWER_P1_PROFILE_ID', '') if reverse_p1_profile == 'p1'
+                                          else os.getenv(f'{reverse_p1_prefix}_ADSPOWER_PROFILE_ID', ''))
+                    reverse_browser = AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
+                                               os.getenv('ADSPOWER_API_KEY', ''), reverse_browser_id)
                 if reverse_maker == 'p2' or (scheduler_mode == 'cash_volume' and cash_route_setting == 'p2p'):
                     maker_browser = AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
                                              os.getenv('ADSPOWER_API_KEY', ''),
@@ -1624,7 +1724,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 if scheduler_mode == 'cash_volume' and reverse_maker == 'p2':
                     browser.command_timeout = 30
                     maker_browser.command_timeout = 30
-            browser_ids = ({'p1': browser.profile_id, 'p2': maker_browser.profile_id if maker_browser else ''}
+            browser_ids = ({'p1': browser.profile_id, 'p2': maker_browser.profile_id if maker_browser else '',
+                            **({'reverse_p1': reverse_browser.profile_id} if reverse_browser else {})}
                            if browser else {})
             if existing and existing['spec'].get('adspower_profiles') and (
                     existing['spec']['adspower_profiles'] != browser_ids):
@@ -1637,7 +1738,9 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                     raise ValueError("Для авторежима нужны разные MEXC_P1_MEMBER_ID и MEXC_P2_MEMBER_ID")
                 if not os.getenv(f"{prefixes['p1']}_SELL_ADV_NO"):
                     raise ValueError(f"Заполните {prefixes['p1']}_SELL_ADV_NO")
-                if reverse_maker == 'p1' and (not os.getenv(f"{prefixes['p1']}_BUY_ADV_NO") or not (p2_payment_id or p2_pay_method_id)):
+                if reverse_maker == 'p1' and not forward_only and (
+                        not os.getenv(f"{reverse_p1_prefix}_BUY_ADV_NO")
+                        or not (p2_payment_id or p2_pay_method_id)):
                     raise ValueError(f"Для обратного ордера нужны {prefixes['p1']}_BUY_ADV_NO и способ оплаты П2")
                 if reverse_maker == 'p2' and (not os.getenv(f"{prefixes['p2']}_SELL_ADV_NO")
                                                or not maker_browser or not maker_browser.profile_id):
@@ -1655,6 +1758,11 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 await browser.ensure_mexc_page()
                 async with browser.connection() as call:
                     await call("Target.getTargets")
+                if reverse_browser:
+                    await reverse_browser.ensure_started()
+                    await reverse_browser.ensure_mexc_page()
+                    async with reverse_browser.connection() as call:
+                        await call('Target.getTargets')
                 if p2_payment_browser and reverse_maker == 'p1' and not existing:
                     # Check the receiving account before the first order can lock USDT.
                     p2_payment_account_id = await p2_payment_browser.payment_account_by_method(
@@ -1687,7 +1795,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
             cycle_id = args.resume or journal.create(new_spec(console, mode, profiles,
                 sell_adv_no=os.getenv(f"{prefixes['p1']}_SELL_ADV_NO", ""),
                 buy_adv_no=os.getenv(f"{prefixes['p2']}_SELL_ADV_NO" if reverse_maker == 'p2'
-                                     else f"{prefixes['p1']}_BUY_ADV_NO", ""),
+                                     else f"{reverse_p1_prefix}_BUY_ADV_NO", ""),
                 amount_input=amount_input, automatic=automatic,
                 reverse_maker=reverse_maker, p1_profile=p1_profile)
                 | ({"members": members} if all(members.values()) else {})
@@ -1697,6 +1805,16 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                     'p2_payment_ads_profile_id': p2_payment_browser.profile_id}
                    if p2_payment_browser else {})
                 | ({'scheduler_mode': args.scheduler_mode} if getattr(args, 'scheduler_mode', None) else {})
+                | ({'forward_only': True, 'buy_replenish': False} if forward_only and not existing else {})
+                | ({'forward_quantity': money(forward_quantity)} if forward_quantity and not existing else {})
+                | ({'reverse_p1_profile': reverse_p1_profile,
+                    'reverse_p1_member_id': os.getenv(f'{reverse_p1_prefix}_MEMBER_ID', '').strip(),
+                    'reverse_p1_nickname': os.getenv(f'{reverse_p1_prefix}_NICKNAME', '').strip(),
+                    'reverse_fiat': reverse_fiat,
+                    'eflp_reverse_pay_method_id': mode_pay_method_id(scheduler_mode, reverse_fiat, os.environ)
+                    if scheduler_mode in {'eflp_volume', 'eflp_unique'} else None,
+                    'replenish_adv_no': os.getenv(f'{reverse_p1_prefix}_SELL_ADV_NO', '').strip()}
+                   if reverse_p1_profile and not existing else {})
                 | ({'cash_route_selected': False,
                      'cash_final_return': cash_route_setting,
                     'cash_policy': 'rolling24_p1',
@@ -1717,6 +1835,7 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                                  p2_pay_method_id=p2_pay_method_id, p2_payment_browser=p2_payment_browser,
                                  p2_payment_account_id=p2_payment_account_id,
                                  p1_profile=p1_profile, maker_browser=maker_browser,
+                                 reverse_browser=reverse_browser,
                                  pay_method_id=os.getenv("MEXC_PAY_METHOD_ID", "578"), automatic=automatic, delay_seconds=delay_seconds,
                                  trusted_members=members if all(members.values()) else {},
                                  trusted_nicknames=nicknames, delay_max_seconds=delay_max_seconds,

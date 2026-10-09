@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock, patch
 from journal import Journal
 from datetime import datetime, timedelta, timezone
 
-from sheets import (EFLP_MARKER, EFLP_WEEKLY_MARKER, OLD_EFLP_MARKER,
+from sheets import (_complete_sale_cycle, EFLP_MARKER, EFLP_WEEKLY_MARKER, OLD_EFLP_MARKER,
                      EFLP_META_HEADER, OLD_EFLP_META_HEADER,
                      GoogleSheets, GoogleSheetsError, HEADER, Reporter,
                      WEEKLY_MARKER, WEEK_START_FORMULA, WEEK_SALES_FORMULA,
-                     eflp_formulas, sale_p1_name, week_choices, weekly_formulas, weekly_start)
+                      cash_unique_formulas, eflp_formulas, eflp_meta_values, sale_p1_name, sale_values,
+                      week_choices, weekly_formulas, weekly_start)
 
 
 class MigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -41,6 +42,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.existing_t = []
         self.existing_u = []
         self.existing_u_formulas = []
+        self.existing_cash_unique = []
         async def request(method, cell_range, values=None, *, value_render_option=None):
             self.calls.append((method, cell_range, values))
             if method == 'GET':
@@ -51,6 +53,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                 values_by_range = {'F:J': self.existing_summary, 'E:E': self.existing_e,
                                    'N:Q': self.existing_eflp, 'Q:S': self.existing_old_eflp_meta,
                                    'R:T': self.existing_eflp_meta, 'T:T': self.existing_t,
+                                   'V:W': self.existing_cash_unique,
                                    'U:U': self.existing_u,
                                    'A:D': self.existing}
                 return {'values': values_by_range[cell_range]}
@@ -61,6 +64,30 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.journal.close()
         self.temp.cleanup()
         self.env_patch.stop()
+
+    async def test_eflp_progress_reads_only_rows_matching_local_journal(self):
+        spec = {'mode': 'api', 'scheduler_mode': 'eflp_volume',
+                'p1_profile': 'p1_3', 'p2_profile': '12',
+                'members': {'p2': 'member-12'}}
+        self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?',
+                                (json.dumps(spec), self.cid))
+        self.journal.db.commit()
+        sale = self.journal.sales()[0]
+        visible = [HEADER, sale_values(sale)]
+        metadata = [EFLP_META_HEADER, eflp_meta_values(sale)]
+
+        async def request(method, cell_range):
+            return {'values': visible if cell_range == 'A:E' else metadata}
+
+        self.sheets.request = request
+        self.assertEqual(await self.sheets.read_eflp_sales(self.journal), [sale])
+        visible[1][0] = 9999
+        with self.assertRaisesRegex(GoogleSheetsError, 'отличается от журнала'):
+            await self.sheets.read_eflp_sales(self.journal)
+        visible[1] = sale_values(sale)
+        metadata.append(['p1_3', 'eflp_volume', 'unknown'])
+        with self.assertRaisesRegex(GoogleSheetsError, 'без соответствующей записи'):
+            await self.sheets.read_eflp_sales(self.journal)
 
     async def test_migration_uses_usdt_and_sale_time_with_day_rollover(self):
         await self.sheets.prepare(self.journal)
@@ -104,7 +131,8 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writes[3]['updateCells']['range']['startColumnIndex'], 17)
         self.assertEqual(writes[3]['updateCells']['rows'][0]['values'][0]
                          ['userEnteredValue']['stringValue'], EFLP_META_HEADER[0])
-        self.assertTrue(writes[6]['updateDimensionProperties']['properties']['hiddenByUser'])
+        self.assertEqual(writes[4]['updateCells']['range']['startColumnIndex'], 21)
+        self.assertTrue(writes[7]['updateDimensionProperties']['properties']['hiddenByUser'])
 
     async def test_eflp_report_uses_visible_weekly_table_next_to_sales(self):
         self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?',
@@ -196,6 +224,36 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('$U$1+7', rows[1][2])
         self.assertEqual(rows[1][3], '=IF(AND(O2>=20;P2>20000);90;0)')
 
+    def test_cash_unique_weekly_block_uses_only_finished_cycles(self):
+        sales = [dict(p1_profile='p1_2', p1_nickname='Cash maker',
+                      scheduler_mode='cash_unique', p2_member_id='buyer-1')]
+        rows = cash_unique_formulas(sales, 0)
+        self.assertEqual(rows[0], ['П1 — уникальные наличка', 'Уникальных П2'])
+        self.assertEqual(rows[1][0], 'Cash maker')
+        self.assertIn('"cash_unique_done"', rows[1][1])
+        self.assertIn('$U$1+7', rows[1][1])
+
+    def test_cash_unique_metadata_switches_to_done_after_full_cycle(self):
+        spec = {'mode': 'api', 'scheduler_mode': 'cash_unique', 'buy_replenish': True,
+                'p1_profile': 'p1_2', 'p2_profile': '3'}
+        self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?',
+                                (json.dumps(spec), self.cid))
+        self.journal.db.commit()
+        sale = self.journal.sales()[0]
+        self.assertFalse(_complete_sale_cycle(self.journal, sale))
+        for name in ('reverse_complete', 'reverse_replenish', 'reverse_replenish_buy'):
+            self.journal.transition(self.cid, name, 'both', 'done', name)
+        self.journal.transition(self.cid, 'cycle', 'both', 'completed', 'done',
+                                cycle_status='completed')
+        self.assertTrue(_complete_sale_cycle(self.journal, sale))
+        self.assertEqual(eflp_meta_values(sale, completed=True)[1], 'cash_unique_done')
+
+    async def test_cash_unique_block_rejects_occupied_columns(self):
+        self.existing_cash_unique = [['Другие данные']]
+        with self.assertRaisesRegex(GoogleSheetsError, 'V:W заняты'):
+            await self.sheets.send_weekly(self.journal.sales())
+        self.sheets.batch_update.assert_not_awaited()
+
     def test_eflp_groups_by_p1_key_even_when_nicknames_match(self):
         sales = [dict(p1_profile='p1_2', p1_nickname='Maker', scheduler_mode='eflp_volume'),
                  dict(p1_profile='p1_3', p1_nickname='Maker', scheduler_mode='eflp_unique')]
@@ -230,7 +288,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         selected = requests[1]['updateCells']['rows'][0]['values'][1]['userEnteredValue']['stringValue']
         self.assertEqual(selected, '17.09.2026 18:50')
         self.assertIn(selected, [v['userEnteredValue'] for v in
-            requests[4]['setDataValidation']['rule']['condition']['values']])
+            requests[5]['setDataValidation']['rule']['condition']['values']])
 
     def test_legacy_journal_backfills_from_first_sale_event(self):
         self.journal.db.execute("UPDATE sales SET quantity='', completed_at=''")
@@ -261,7 +319,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         requests = self.sheets.batch_update.await_args.args[0]
         chosen = requests[1]['updateCells']['rows'][0]['values'][1]['userEnteredValue']['stringValue']
         options = [value['userEnteredValue']
-                   for value in requests[4]['setDataValidation']['rule']['condition']['values']]
+                   for value in requests[5]['setDataValidation']['rule']['condition']['values']]
         self.assertIn(chosen, options)
         self.assertEqual(requests[1]['updateCells']['rows'][2]['values'][1]['userEnteredValue']['formulaValue'][:7],
                          '=SUMIFS')

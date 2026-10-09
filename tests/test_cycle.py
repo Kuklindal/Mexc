@@ -38,7 +38,7 @@ class Sheet:
             self.fail_once = False
             raise TimeoutError("Response lost after write")
 
-    async def send_weekly(self, sales):
+    async def send_weekly(self, sales, journal=None):
         pass
 
 

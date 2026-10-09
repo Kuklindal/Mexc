@@ -8,10 +8,12 @@ from unittest.mock import AsyncMock, patch
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, Step, steps_for_spec
 from adspower import AdsPowerTimeout, AdsPowerUnavailable
 from mexc_client import MexcChatUnavailable
-from trade_modes import (_finish_cash_network_return, _finish_completed_cycle,
-                          _handle_forward_rejection, _record_forward,
-                          begin_mode, choose_mode_amount, configured_mode_profiles,
-                          next_profile, run_mode)
+from rollover import load_state, save_state
+from trade_modes import (_eflp_target_reached, _finish_cash_network_return, _finish_completed_cycle,
+                           _finish_terminal_cycle,
+                           _handle_forward_rejection, _record_forward,
+                           begin_mode, choose_mode_amount, configured_mode_profiles,
+                           next_profile, restore_eflp_progress, run_mode)
 from volume_policy import record_purchase
 import test_auto as fixtures
 
@@ -74,6 +76,114 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         env['CASH_VOLUME_P2_PROFILES'] = '5'
         with self.assertRaisesRegex(ValueError, 'ROLLOVER_PROFILES'):
             configured_mode_profiles('cash_volume', env)
+
+    async def test_cash_unique_twenty_fifth_cycle_returns_to_second_p1(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(25) | {
+            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+            'CASH_UNIQUE_P1_PROFILES': 'p1,p1_2',
+            'MEXC_P1_2_API_KEY': 'second-key', 'MEXC_P1_2_SECRET_KEY': 'second-secret',
+            'MEXC_P1_2_MEMBER_ID': 'second-member', 'MEXC_P1_2_NICKNAME': 'Second maker',
+            'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456787',
+            'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456786',
+            'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-browser',
+        }
+        state = begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                           p2_profiles=[str(i) for i in range(1, 26)], env=env)
+        state['unique_done'] = state['profiles'][:24]
+        state['cursor'] = 24
+        with patch.dict(os.environ, env), patch('trade_modes.choose_mode_amount',
+            new_callable=AsyncMock, return_value='100 RUB'), patch('trade_modes.run_command',
+            new_callable=AsyncMock) as trade:
+            with self.assertRaisesRegex(Paused, 'Цикл не был сохранён'):
+                await run_mode(self.journal, state, asyncio.Event(), None)
+        args = trade.await_args.args[0]
+        self.assertEqual(args.reverse_p1_profile, 'p1_2')
+        self.assertEqual(state['terminal_pending']['kind'], 'cash_regular')
+        self.assertEqual(state['terminal_pending']['p2'], '25')
+
+    def test_cash_unique_completed_switch_is_saved_once(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(25) | {
+            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+            'CASH_UNIQUE_P1_PROFILES': 'p1,p1_2',
+            'MEXC_P1_2_API_KEY': 'second-key', 'MEXC_P1_2_SECRET_KEY': 'second-secret',
+            'MEXC_P1_2_MEMBER_ID': 'second-member', 'MEXC_P1_2_NICKNAME': 'Second maker',
+            'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456787',
+            'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456786',
+            'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-browser',
+        }
+        state = begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                           p2_profiles=[str(i) for i in range(1, 26)], env=env)
+        cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'cash_unique',
+                                   'p1_profile': 'p1', 'p2_profile': '25',
+                                   'reverse_p1_profile': 'p1_2', 'buy_replenish': True})
+        self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+                                result={'quantity': '1800'},
+                                context={'amount': '1000', 'quantity': '1800'})
+        self.complete(cid)
+        self.journal.transition(cid, 'reverse_replenish_buy', 'p1', 'done', 'refilled')
+        state['active_cycle'] = cid
+        state['terminal_pending'] = {'kind': 'cash_regular', 'from': 'p1', 'to': 'p1_2',
+                                     'p2': '25', 'amount': '100 RUB', 'finish': False}
+        save_state(self.journal, state)
+        with patch.dict(os.environ, env), patch('trade_modes.save_state', wraps=save_state) as save:
+            _finish_terminal_cycle(self.journal, state, cid, '25')
+        self.assertEqual(save.call_count, 1)
+        restored = load_state(self.journal)
+        self.assertIsNone(restored['active_cycle'])
+        self.assertTrue(restored['terminal_pending']['verified'])
+        self.assertEqual(restored['terminal_pending']['cycle_id'], cid)
+
+    def test_finished_week_cannot_start_duplicate_final_order(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'EFLP_P1_PROFILES': 'p1',
+                            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        state['status'] = 'done'
+        save_state(self.journal, state)
+        with self.assertRaisesRegex(ValueError, 'повторный финальный ордер'):
+            begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                       p2_profiles=['1'], env=env)
+        with self.assertRaisesRegex(ValueError, 'повторный финальный ордер'):
+            begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                       p2_profiles=['1'], env=env)
+
+    async def test_eflp_final_cycle_preserves_reserve_and_has_no_reverse_on_last_p1(self):
+        from trade_modes import _final_order
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = {'mode': 'eflp_unique', 'p1_profile': 'p1'}
+        ad = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL', 'coinName': 'USDT',
+              'advStatus': 'OPEN', 'fiatUnit': 'RUB', 'availableQuantity': '100',
+              'price': '100', 'minSingleTransAmount': '100', 'maxSingleTransAmount': '20000'}
+        fake = type('Client', (), {'get_ad': AsyncMock(return_value=ad),
+                                   'close': AsyncMock()})()
+        with (patch('trade_modes.profile_from_env', return_value=type('P', (), {
+                'key': 'p1', 'sell_adv_no': env['MEXC_P1_SELL_ADV_NO']})()),
+             patch('trade_modes.settings_for_profile', return_value=type('S', (), {
+                'api_key': 'x', 'secret_key': 'y', 'base_url': 'https://example.test',
+                'recv_window': 1000, 'proxy_url': None})()),
+             patch('trade_modes.MexcP2PClient', return_value=fake),
+             patch('trade_modes.random.randint', return_value=1100)):
+            amount, quantity = await _final_order(state, None, env=env)
+        self.assertEqual(quantity, '89.0000')
+        self.assertEqual(amount, '8900.00 RUB')
+
+    async def test_final_reserve_must_keep_sell_ad_above_its_minimum(self):
+        from trade_modes import _final_order
+        env = env_for(1)
+        ad = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL', 'coinName': 'USDT',
+              'advStatus': 'OPEN', 'fiatUnit': 'RUB', 'availableQuantity': '100',
+              'price': '100', 'minSingleTransAmount': '1300', 'maxSingleTransAmount': '20000'}
+        fake = type('Client', (), {'get_ad': AsyncMock(return_value=ad),
+                                   'close': AsyncMock()})()
+        with (patch('trade_modes.settings_for_profile', return_value=type('S', (), {
+                'api_key': 'x', 'secret_key': 'y', 'base_url': 'https://example.test',
+                'recv_window': 1000, 'proxy_url': None})()),
+             patch('trade_modes.MexcP2PClient', return_value=fake)):
+            with self.assertRaisesRegex(Paused, '12 USDT'):
+                await _final_order({'mode': 'eflp_unique', 'p1_profile': 'p1'}, None, env=env)
 
     def test_unique_eflp_profiles_come_from_env_in_order(self):
         env = env_for(21) | {'EFLP_UNIQUE_P2_PROFILES': ','.join(str(i) for i in range(20, 0, -1))}
@@ -147,12 +257,13 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         save_state(self.journal, state)
         env['MEXC_P2_1_MEMBER_ID'] = env['MEXC_P1_MEMBER_ID']
         with patch.dict(os.environ, env):
-            with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
-                await run_mode(self.journal, state, asyncio.Event(), None)
-        trade.assert_not_awaited()
+            with patch('trade_modes.choose_mode_amount', new_callable=AsyncMock,
+                       side_effect=Paused('Тест остановил новый ордер')):
+                with self.assertRaisesRegex(Paused, 'Тест остановил'):
+                    await run_mode(self.journal, state, asyncio.Event(), None)
         self.assertEqual(state['profiles'], ['2', '3'])
         self.assertEqual(state['cursor'], 1)
-        self.assertEqual(state['status'], 'done')
+        self.assertEqual(state['status'], 'paused')
 
     async def test_saved_eflp_active_cycle_is_not_skipped_without_reconciliation(self):
         from rollover import save_state
@@ -333,49 +444,65 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('reverse_wait_release', cash)
 
     async def test_eflp_unique_stops_after_twenty_completed_profiles(self):
-        from rollover import save_state
-        self.journal.abandon(self.cycle_id)
-        env = env_for(20) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
-        env.update({f'MEXC_P2_{index}_PAYMENT_ID': str(1000 + index)
-                    for index in range(1, 21)})
-        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
-                           p2_profiles=[str(index) for index in range(1, 21)], env=env)
-        state['unique_done'] = list(state['profiles'])
-        save_state(self.journal, state)
-        with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
-            await run_mode(self.journal, state, asyncio.Event(), None)
-        trade.assert_not_awaited()
-        self.assertEqual(state['status'], 'done')
+        state = {'mode': 'eflp_unique', 'unique_done': [str(i) for i in range(20)]}
+        self.assertTrue(_eflp_target_reached(state))
 
     async def test_eflp_unique_stops_after_all_selected_when_fewer_than_twenty(self):
-        from rollover import save_state
-
-        self.journal.abandon(self.cycle_id)
-        env = env_for(2) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
-        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
-                           p2_profiles=['1', '2'], env=env)
-        state['unique_done'] = ['1', '2']
-        save_state(self.journal, state)
-        with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
-            await run_mode(self.journal, state, asyncio.Event(), None)
-        trade.assert_not_awaited()
-        self.assertEqual(state['status'], 'done')
+        state = {'mode': 'eflp_unique', 'unique_done': ['1', '2']}
+        self.assertFalse(_eflp_target_reached(state))
 
     async def test_eflp_unique_keeps_twenty_cap_for_larger_pool(self):
-        from rollover import save_state
+        state = {'mode': 'eflp_volume', 'unique_done': [str(i) for i in range(20)],
+                 'eflp_volume_by_profile': {'1': '19999.9999'}}
+        self.assertFalse(_eflp_target_reached(state))
+        state['eflp_volume_by_profile']['2'] = '0.0001'
+        self.assertTrue(_eflp_target_reached(state))
 
+    def test_new_eflp_mode_restores_weekly_volume_and_completed_unique_profiles(self):
         self.journal.abandon(self.cycle_id)
-        env = env_for(21) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
-        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
-                           p2_profiles=[str(i) for i in range(1, 22)], env=env)
-        state['unique_done'] = state['profiles'][:20]
-        save_state(self.journal, state)
-        with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
-            await run_mode(self.journal, state, asyncio.Event(), None)
-        trade.assert_not_awaited()
-        self.assertEqual(state['status'], 'done')
+        env = env_for(3) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
 
-    async def test_eflp_volume_notifies_when_each_p2_reaches_target(self):
+        def sale(profile, quantity, mode, *, complete=True, p1='p1'):
+            cid = self.journal.create({'mode': 'api', 'scheduler_mode': mode,
+                'p1_profile': p1, 'p2_profile': profile,
+                'members': {'p2': env[f'MEXC_P2_{profile}_MEMBER_ID']}})
+            self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+                result={'quantity': quantity}, context={'amount': '1000', 'quantity': quantity})
+            if complete:
+                self.complete(cid, quantity)
+            else:
+                self.journal.abandon(cid)
+            return cid
+
+        first = sale('1', '800', 'eflp_volume')
+        sale('1', '100', 'eflp_unique')
+        sale('2', '75', 'eflp_unique', complete=False)
+        sale('1', '600', 'cash_volume')
+        sale('3', '700', 'eflp_volume', p1='p1_2')
+        old = sale('1', '1200', 'eflp_volume')
+        self.journal.db.execute("UPDATE sales SET completed_at=? WHERE cycle_id=?",
+            ((datetime.now(timezone.utc) - timedelta(days=14)).isoformat(), old))
+        self.journal.db.commit()
+
+        volume = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                            p2_profiles=['1', '2', '3'], env=env)
+        self.assertEqual(volume['eflp_volume_by_profile'], {'1': '900', '2': '75'})
+        self.assertEqual(volume['unique_done'], ['1'])
+        self.assertEqual(volume['completed_count'], 1)
+        self.assertEqual(volume['eflp_counted_cycles'].count(first), 1)
+        _record_forward(self.journal, volume, first)
+        self.assertEqual(volume['eflp_volume_by_profile']['1'], '900')
+
+        from rollover import save_state
+        volume['status'] = 'stopped'
+        save_state(self.journal, volume)
+        unique = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                            p2_profiles=['1', '2', '3'], env=env)
+        self.assertEqual(unique['unique_done'], ['1'])
+        self.assertEqual(unique['completed_count'], 1)
+        self.assertEqual(next_profile(unique)[0], '2')
+
+    async def test_sheet_progress_is_restored_before_new_eflp_order(self):
         from rollover import save_state
 
         self.journal.abandon(self.cycle_id)
@@ -384,54 +511,123 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                            p2_profiles=['1'], env=env)
         cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
                                    'p1_profile': 'p1', 'p2_profile': '1',
-                                   'nicknames': {'p1': 'Maker', 'p2': 'Buyer'}})
+                                   'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
         self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
-                                result={'quantity': '20050'},
-                                context={'amount': '100000', 'quantity': '20050'})
+            result={'quantity': '20050'}, context={'amount': '100000', 'quantity': '20050'})
         self.complete(cid, '20050')
         state['active_cycle'] = cid
         save_state(self.journal, state)
-        _finish_completed_cycle(self.journal, state, cid, '1')
-        event = self.journal.step(cid, 'eflp_profile_done')
-        self.assertEqual(event['status'], 'done')
-        notices = [row for row in self.journal.pending('telegram')
-                   if row['step'] == 'eflp_profile_done']
-        self.assertEqual(len(notices), 1)
-        self.assertIn('П1: Maker', notices[0]['message'])
-        self.assertIn('П2: Buyer', notices[0]['message'])
-        self.assertIn('20050', notices[0]['message'])
+        sheets = type('Sheets', (), {'read_eflp_sales': AsyncMock(return_value=self.journal.sales())})()
+        with patch.dict(os.environ, env), patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
+            with self.assertRaisesRegex(Paused, 'Нет доступного П2'):
+                await run_mode(self.journal, state, asyncio.Event(), None, sheets=sheets)
+        sheets.read_eflp_sales.assert_awaited_once_with(self.journal)
+        trade.assert_not_awaited()
+        self.assertEqual(state['eflp_volume_by_profile']['1'], '20050')
+        self.assertEqual(state['completed_count'], 1)
+        self.assertEqual(state['status'], 'paused')
 
-    async def test_eflp_final_notice_survives_failed_send_and_restart(self):
-        from rollover import cycle_rowid, save_state
+    async def test_sheet_failure_does_not_block_return_of_existing_eflp_cycle(self):
+        from rollover import save_state
+        from sheets import GoogleSheetsError
 
         self.journal.abandon(self.cycle_id)
-        env = env_for(20) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
         state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
-                           p2_profiles=[str(i) for i in range(1, 21)], env=env)
+                           p2_profiles=['1'], env=env)
         cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_unique',
-                                   'p1_profile': 'p1', 'p2_profile': '20',
-                                   'nicknames': {'p1': 'Maker', 'p2': 'Buyer 20'}})
-        self.complete(cid, '80')
-        state.update(unique_done=list(state['profiles']), last_cycle_rowid=cycle_rowid(self.journal, cid))
+            'p1_profile': 'p1', 'p2_profile': '1',
+            'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+            result={'quantity': '100'}, context={'amount': '1000', 'quantity': '100'})
+        self.complete(cid, '100')
+        state['active_cycle'] = cid
         save_state(self.journal, state)
+        sheets = type('Sheets', (), {'read_eflp_sales': AsyncMock(
+            side_effect=GoogleSheetsError('нет доступа'))})()
+        with patch.dict(os.environ, env), patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
+            with self.assertRaisesRegex(Paused, 'нет доступа'):
+                await run_mode(self.journal, state, asyncio.Event(), None, sheets=sheets)
+        trade.assert_not_awaited()
+        self.assertIsNone(state['active_cycle'])
+        self.assertEqual(state['completed_count'], 1)
+
+    def test_eflp_volume_waits_for_return_when_unfinished_sale_crosses_target(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        completed = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+            'p1_profile': 'p1', 'p2_profile': '1',
+            'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(completed, 'forward_complete', 'both', 'done', 'sold',
+            result={'quantity': '19950'}, context={'amount': '1000', 'quantity': '19950'})
+        self.complete(completed, '19950')
+        pending = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+            'p1_profile': 'p1', 'p2_profile': '1',
+            'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(pending, 'forward_complete', 'both', 'done', 'sold',
+            result={'quantity': '100'}, context={'amount': '1000', 'quantity': '100'})
+        state = {'mode': 'eflp_volume', 'p1_profile': 'p1', 'profiles': ['1']}
+        restore_eflp_progress(self.journal, state, self.journal.sales(), env=env)
+        self.assertEqual(state['eflp_volume_by_profile']['1'], '20050')
+        self.assertEqual(state['unique_done'], ['1'])
+        self.assertEqual(state['eflp_done'], [])
+
+    def test_eflp_cycle_from_previous_week_does_not_fill_new_week(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+            'p1_profile': 'p1', 'p2_profile': '1',
+            'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+            result={'quantity': '20050'}, context={'amount': '1000', 'quantity': '20050'})
+        self.complete(cid, '20050')
+        self.journal.db.execute('UPDATE sales SET completed_at=? WHERE cycle_id=?',
+            ((datetime.now(timezone.utc) - timedelta(days=14)).isoformat(), cid))
+        self.journal.db.commit()
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        _finish_completed_cycle(self.journal, state, cid, '1')
+        self.assertEqual(state['completed_count'], 0)
+        self.assertEqual(state['eflp_volume_by_profile'], {})
+        self.assertEqual(state['eflp_done'], [])
+
+    async def test_eflp_volume_notifies_when_each_p2_reaches_target(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+                                   'p1_profile': 'p1', 'p2_profile': '1', 'forward_only': True})
+        self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+                                result={'quantity': '100'}, context={'amount': '1000', 'quantity': '100'})
+        self.journal.transition(cid, 'cycle', 'both', 'completed', 'done', cycle_status='completed')
+        state['active_cycle'] = cid
+        state['terminal_pending'] = {'kind': 'eflp_last', 'from': 'p1', 'to': None,
+                                     'p2': '1', 'amount': '1000 RUB', 'quantity': '100'}
+        with patch.dict(os.environ, env):
+            _finish_terminal_cycle(self.journal, state, cid, '1')
+        event = self.journal.step(cid, 'eflp_profile_done')
+        self.assertEqual(event['status'], 'done')
+        self.assertEqual(state['terminal_pending']['verified'], True)
+        notice = next(row for row in self.journal.pending('telegram')
+                      if row['step'] == 'eflp_profile_done')
+        self.assertIn('Объём Eflp', notice['message'])
+
+    async def test_eflp_final_notice_survives_failed_send_and_restart(self):
+        from sheets import Reporter
+        cid = self.cycle_id
+        self.journal.transition(cid, 'eflp_profile_done', 'system', 'done',
+                                '✅ Уникальные Eflp: П1 Maker завершён.')
         telegram = type('Telegram', (), {'enabled': True,
             'send': AsyncMock(side_effect=[False, True])})()
-        with patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
-            await run_mode(self.journal, state, asyncio.Event(), telegram)
-            self.assertEqual(state['status'], 'done')
-            self.assertEqual(telegram.send.await_count, 1)
-            pending = [row for row in self.journal.pending('telegram')
-                       if row['step'] == 'eflp_mode_done']
-            self.assertEqual(len(pending), 1)
-            self.assertIn('П1: Maker', pending[0]['message'])
-            self.assertIn('Уникальных П2: 20', pending[0]['message'])
-            await run_mode(self.journal, state, asyncio.Event(), telegram)
-        trade.assert_not_awaited()
+        reporter = Reporter(self.journal, telegram, None)
+        await reporter.flush()
+        self.assertEqual(len([row for row in self.journal.pending('telegram')
+                              if row['step'] == 'eflp_profile_done']), 1)
+        await reporter.flush()
         self.assertEqual(telegram.send.await_count, 2)
-        self.assertFalse(any(row['step'] == 'eflp_mode_done'
+        self.assertFalse(any(row['step'] == 'eflp_profile_done'
                              for row in self.journal.pending('telegram')))
-        self.assertEqual(self.journal.db.execute(
-            "SELECT COUNT(*) FROM events WHERE step='eflp_mode_done'").fetchone()[0], 1)
 
     async def test_unique_requires_twenty_and_remembers_selected_roles(self):
         self.journal.abandon(self.cycle_id)

@@ -109,9 +109,40 @@ def sale_p1_name(sale: dict) -> str:
     return os.getenv(f'MEXC_{profile.upper()}_NICKNAME', '').strip() or profile
 
 
-def eflp_meta_values(sale: dict) -> list[str]:
-    return [sale.get('p1_profile') or 'p1', sale.get('scheduler_mode') or '',
+def _complete_sale_cycle(journal: Journal | None, sale: dict) -> bool:
+    if journal is None:
+        return False
+    cycle = journal.cycle(sale['cycle_id'])
+    if not cycle or cycle['status'] != 'completed':
+        return False
+    required = ('forward_complete', 'reverse_complete', 'reverse_replenish')
+    if cycle['spec'].get('buy_replenish'):
+        required += ('reverse_replenish_buy',)
+    return all((step := journal.step(sale['cycle_id'], name)) and step['status'] == 'done'
+               for name in required)
+
+
+def eflp_meta_values(sale: dict, *, completed: bool = False) -> list[str]:
+    mode = sale.get('scheduler_mode') or ''
+    if completed and mode in {'eflp_volume', 'eflp_unique', 'cash_unique'}:
+        mode += '_done'
+    return [sale.get('p1_profile') or 'p1', mode,
             sale.get('p2_member_id') or '']
+
+
+def cash_unique_formulas(sales: list[dict], row_count: int) -> list[list[str]]:
+    configured = [key.strip() for key in os.getenv('CASH_UNIQUE_P1_PROFILES', '').split(',') if key.strip()]
+    accounts = {sale.get('p1_profile') or 'p1': sale_p1_name(sale) for sale in sales
+                if sale.get('scheduler_mode') == 'cash_unique'}
+    for key in configured:
+        accounts.setdefault(key, os.getenv(f'MEXC_{key.upper()}_NICKNAME', '').strip() or key)
+    rows = [['', ''] for _ in range(max(2, row_count, len(accounts) + 1))]
+    rows[0] = ['П1 — уникальные наличка', 'Уникальных П2']
+    for index, key in enumerate(dict.fromkeys([*configured, *sorted(accounts)]), 2):
+        rows[index - 1] = [accounts[key],
+            f'=COUNTUNIQUEIFS($T$2:$T;$R$2:$R;"{key}";$S$2:$S;"cash_unique_done";'
+            '$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7);$T$2:$T;"<>")']
+    return rows
 
 
 def eflp_formulas(sales: list[dict], row_count: int, *, first_data_row: int = 2,
@@ -122,7 +153,7 @@ def eflp_formulas(sales: list[dict], row_count: int, *, first_data_row: int = 2,
     rows[0] = [EFLP_MARKER, 'Уникальных П2', 'Общая сумма продаж (USDT)', 'Итого USDT']
     for row_number, key in enumerate(sorted(accounts), first_data_row):
         rows[row_number - first_data_row + 1] = [accounts[key],
-            f'=COUNTUNIQUEIFS($T$2:$T;$R$2:$R;"{key}";$S$2:$S;"eflp*";$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7);$T$2:$T;"<>")',
+            f'=COUNTUNIQUEIFS($T$2:$T;$R$2:$R;"{key}";$S$2:$S;"eflp*_done";$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7);$T$2:$T;"<>")',
             f'=SUMIFS($A$2:$A;$R$2:$R;"{key}";$S$2:$S;"eflp*";$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7))',
             f'=IF(AND({unique_col}{row_number}>=20;{sales_col}{row_number}>20000);90;0)']
     return rows
@@ -301,7 +332,53 @@ class GoogleSheets:
         # A timeout after a successful write can safely be retried at the same row.
         await self.request("PUT", f"A{row}:E{row}", values)
 
-    async def send_weekly(self, sales: list[dict]):
+    async def read_eflp_sales(self, journal: Journal) -> list[dict]:
+        """Read Eflp rows, accepting only sales that match the local journal."""
+        target = self.spreadsheet_id + "/" + self.tab
+        if journal.sheet_target() not in {None, target}:
+            raise GoogleSheetsError('Журнал привязан к другой Google Таблице/вкладке')
+        visible = (await self.request('GET', 'A:E')).get('values', [])
+        metadata = (await self.request('GET', 'R:T')).get('values', [])
+        if visible and visible[0] != HEADER:
+            raise GoogleSheetsError('Заголовки продаж Google Таблицы отличаются от ожидаемых')
+        if metadata and metadata[0] != EFLP_META_HEADER:
+            raise GoogleSheetsError('Служебные заголовки Eflp отличаются от ожидаемых')
+        by_id = {int(sale['id']): sale for sale in journal.sales()}
+        confirmed = []
+        for sale_id in range(1, max(len(visible), len(metadata))):
+            row = visible[sale_id] if sale_id < len(visible) else []
+            meta = metadata[sale_id] if sale_id < len(metadata) else []
+            if not meta or len(meta) < 2 or meta[1] not in {
+                    'eflp_volume', 'eflp_unique', 'cash_unique',
+                    'eflp_volume_done', 'eflp_unique_done', 'cash_unique_done'}:
+                continue
+            sale = by_id.get(sale_id)
+            if not sale:
+                raise GoogleSheetsError('В таблице есть продажа Eflp без соответствующей записи в журнале; '
+                                        'перенесите полный журнал перед запуском')
+            expected = sale_values(sale)
+            try:
+                same = (len(row) == 5 and sheet_number(row[0]) == Decimal(str(expected[0]))
+                        and row[1:] == expected[1:]
+                        and meta in (eflp_meta_values(sale),
+                                     eflp_meta_values(sale, completed=_complete_sale_cycle(journal, sale))))
+            except (ValueError, TypeError, ArithmeticError):
+                same = False
+            if not same:
+                raise GoogleSheetsError('Продажа Eflp в таблице отличается от журнала; '
+                                        'новый ордер остановлен до сверки')
+            confirmed.append(sale)
+        confirmed_ids = {sale['id'] for sale in confirmed}
+        for sale in by_id.values():
+            if (sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique', 'cash_unique'}
+                    and sale['sent'] and sale['id'] not in confirmed_ids):
+                raise GoogleSheetsError('Продажа Eflp помечена доставленной, но отсутствует в таблице; '
+                                        'новый ордер остановлен до сверки')
+        return confirmed + [sale for sale in by_id.values()
+                            if sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique', 'cash_unique'}
+                            and not sale['sent'] and sale['id'] not in confirmed_ids]
+
+    async def send_weekly(self, sales: list[dict], journal: Journal | None = None):
         eflp = (any(sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'} for sale in sales)
                 or bool(os.getenv('EFLP_P1_PROFILES', '').strip()))
         existing = (await self.request("GET", "F:J")).get("values", [])
@@ -320,6 +397,12 @@ class GoogleSheets:
         new_layout = bool(eflp_existing and eflp_existing[0][:4] == new_eflp_header)
         if any(any(cell != '' for cell in row) for row in eflp_existing) and not (old_layout or new_layout):
             raise GoogleSheetsError('Столбцы N:Q заняты; сводка Eflp не перезаписала чужие данные')
+        cash_existing = (await self.request('GET', 'V:W')).get('values', [])
+        cash_header = ['П1 — уникальные наличка', 'Уникальных П2']
+        if cash_existing and any(any(cell != '' for cell in row) for row in cash_existing):
+            if cash_existing[0] != cash_header:
+                raise GoogleSheetsError('Столбцы V:W заняты; сводка наличных не перезаписала чужие данные')
+        cash_rows = cash_unique_formulas(sales, len(cash_existing))
         existing_dates = (await self.request('GET', 'U1:U2',
                                              value_render_option='FORMULA')).get('values', [])
         if existing_dates and existing_dates != [[WEEK_START_FORMULA], [WEEK_SALES_FORMULA]]:
@@ -328,7 +411,8 @@ class GoogleSheets:
                      eflp_formulas(sales, len(eflp_existing)))
         by_row = {int(sale['id']): sale for sale in sales}
         metadata = [EFLP_META_HEADER] + [
-            eflp_meta_values(by_row[row]) if row in by_row else []
+            eflp_meta_values(by_row[row], completed=_complete_sale_cycle(journal, by_row[row]))
+            if row in by_row else []
             for row in range(1, max(by_row, default=0) + 1)]
         existing_meta = (await self.request('GET', 'Q:S' if old_layout else 'R:T')).get('values', [])
         if old_layout and any((await self.request('GET', 'T:T')).get('values', [])):
@@ -341,7 +425,8 @@ class GoogleSheets:
                          by_row[index].get('p2_member_id') or '']
                         if old_layout and index in by_row else
                         metadata[index] if index < len(metadata) else [])
-            if row and (row + [''] * (3 - len(row))) != expected:
+            legacy = (eflp_meta_values(by_row[index]) if index in by_row else [])
+            if row and (row + [''] * (3 - len(row))) not in (expected, legacy):
                 raise GoogleSheetsError('Служебные строки Eflp расходятся с журналом; запись остановлена')
         metadata.extend([] for _ in range(max(0, len(existing_meta) - len(metadata))))
         sheet_id = await self.get_sheet_id()
@@ -368,6 +453,10 @@ class GoogleSheets:
             {"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
                                          "endRowIndex": len(metadata), "startColumnIndex": 17, "endColumnIndex": 20},
                               "rows": [{"values": [cell(value) for value in row]} for row in metadata],
+                              "fields": "userEnteredValue"}},
+            {"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
+                                         "endRowIndex": len(cash_rows), "startColumnIndex": 21, "endColumnIndex": 23},
+                              "rows": [{"values": [cell(value) for value in row]} for row in cash_rows],
                               "fields": "userEnteredValue"}},
             {"setDataValidation": {"range": {"sheetId": sheet_id, "startRowIndex": 0,
                                              "endRowIndex": 1, "startColumnIndex": 6, "endColumnIndex": 7},
@@ -403,7 +492,7 @@ class Reporter:
 
     def telegram_text(self, event: dict) -> str:
         if event['step'] in {'rollover_switch_notice', 'ad_rejection_alert',
-                             'eflp_profile_done', 'eflp_mode_done'}:
+                             'eflp_profile_done', 'eflp_mode_done', 'cash_unique_profile_done'}:
             return event['message']
         cid = event["cycle_id"]
         cycle = self.journal.cycle(cid)
@@ -426,7 +515,7 @@ class Reporter:
                 await self.sheets.prepare(self.journal)
                 for sale in sales:
                     await self.sheets.send(sale)
-                await self.sheets.send_weekly(self.journal.sales())
+                await self.sheets.send_weekly(self.journal.sales(), self.journal)
                 for sale in sales:
                     self.journal.sale_delivered(sale["id"])
                 self.sheet_error_reported = False
@@ -442,7 +531,8 @@ class Reporter:
             for event in self.journal.pending("telegram"):
                 important = (event["status"] in {"error", "paused"}
                               or event['step'] in {'rollover_switch_notice', 'ad_rejection_alert',
-                                                   'eflp_profile_done', 'eflp_mode_done'})
+                                                   'eflp_profile_done', 'eflp_mode_done',
+                                                   'cash_unique_profile_done'})
                 if not important:
                     # Suppress old queued progress messages too; retain the full local history.
                     self.journal.delivered("telegram", event["id"])

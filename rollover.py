@@ -248,11 +248,11 @@ def begin(journal, mode, selected=None, env=os.environ):
     return state
 
 
-async def run(journal, state, stop_event, telegram, telegram_keyboard=None):
+async def run(journal, state, stop_event, telegram, telegram_keyboard=None, sheets=None):
     """Launches only confirmed complete cycles. A limit holds the affected profile."""
-    if state.get('mode') in {'volume', 'unique', 'cash_volume', 'eflp_volume', 'eflp_unique'}:
+    if state.get('mode') in {'volume', 'unique', 'cash_volume', 'cash_unique', 'eflp_volume', 'eflp_unique'}:
         from trade_modes import run_mode
-        return await run_mode(journal, state, stop_event, telegram, telegram_keyboard)
+        return await run_mode(journal, state, stop_event, telegram, telegram_keyboard, sheets=sheets)
     from main import build_parser
     if 'last_cycle_rowid' not in state:
         known = set(state.pop('known_cycle_ids', []))

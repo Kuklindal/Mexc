@@ -121,6 +121,7 @@ class TelegramControl:
         else:
             rows.append((('💵 Объём наличка', 'cash_volume'),))
             rows.append((('📈 Объём Eflp', 'eflp_volume'), ('👥 Уникальные Eflp', 'eflp_unique')))
+            rows.append((('👥 Уникальные наличка', 'cash_unique'),))
 
         if (not self.running or force_idle) and not pending and not series_active:
             rows.append((('➕ Добавить П2', 'add_profile'),))
@@ -364,11 +365,12 @@ class TelegramControl:
         if scheduler:
             mode_label = {'all': 'все профили (старый)', 'single': 'один профиль (старый)',
                           'volume': 'Объём (старый)', 'unique': 'Уникальные (старый)',
-                          'cash_volume': 'Объём наличка', 'eflp_volume': 'Объём Eflp',
+                          'cash_volume': 'Объём наличка', 'cash_unique': 'Уникальные наличка',
+                          'eflp_volume': 'Объём Eflp',
                           'eflp_unique': 'Уникальные Eflp'}
             lines.append('Режим: ' + mode_label.get(scheduler.get('mode'), 'неизвестный'))
             lines.append(f"Завершено циклов: {scheduler.get('completed_count', 0)}")
-            if scheduler.get('mode') in {'unique', 'cash_volume', 'eflp_volume', 'eflp_unique'}:
+            if scheduler.get('mode') in {'unique', 'cash_volume', 'cash_unique', 'eflp_volume', 'eflp_unique'}:
                 from trade_profiles import profile_from_env
                 p1_key = scheduler.get('p1_profile', 'p1')
                 try:
@@ -382,14 +384,13 @@ class TelegramControl:
                         p2_nickname(name) for name in scheduler['profiles']))
                 if scheduler.get('mode') in {'eflp_volume', 'eflp_unique'}:
                     if scheduler.get('mode') == 'eflp_volume':
-                        current_profile = scheduler.get('current_profile')
-                        if current_profile:
-                            lines.append('Объём этого П2: '
-                                         + scheduler.get('eflp_volume_by_profile', {}).get(current_profile, '0')
-                                         + ' / 20000 USDT')
-                        lines.append(f'П2 выполнили план: {len(scheduler.get("eflp_done", []))}/{len(scheduler["profiles"])}')
+                        lines.append('Объём этого П1: '
+                                     + scheduler.get('eflp_volume_total', '0') + ' / 20000 USDT')
+                        lines.append(f'Уникальных П2: {len(scheduler.get("unique_done", []))}/20')
                     else:
-                        lines.append(f'Уникальных П2 завершили: {len(scheduler.get("unique_done", []))}/{min(20, len(scheduler["profiles"]))}')
+                        lines.append(f'Уникальных П2 завершили: {len(scheduler.get("unique_done", []))}/20')
+                if scheduler.get('mode') == 'cash_unique':
+                    lines.append(f'Уникальных П2 завершили: {len(scheduler.get("unique_done", []))}/25')
             dust = scheduler.get('return_dust_usdt', {})
             if dust:
                 lines.append('Остаток округления на П2: ' + ', '.join(
@@ -476,7 +477,8 @@ class TelegramControl:
         self.nonce = secrets.token_hex(6)
         self.stop_event = asyncio.Event()
         self.task = asyncio.create_task(self.work_rollover(state))
-        labels = {'cash_volume': 'Объём наличка', 'eflp_volume': 'Объём Eflp',
+        labels = {'cash_volume': 'Объём наличка', 'cash_unique': 'Уникальные наличка',
+                  'eflp_volume': 'Объём Eflp',
                   'eflp_unique': 'Уникальные Eflp'}
         from trade_profiles import profile_from_env
         p1_name = profile_from_env(p1_profile, os.environ).nickname
@@ -505,32 +507,17 @@ class TelegramControl:
             from trade_modes import configured_mode_profiles
             p1, chosen = configured_mode_profiles('cash_volume')
             return await self.launch_trade_mode('cash_volume', p1, chosen)
-        if action in {'eflp_volume', 'eflp_unique'}:
-            from rollover import load_state, profiles_from_env
-            from trade_profiles import eflp_p1_profiles, ready_p1_profiles, profile_prefix
+        if action in {'eflp_volume', 'eflp_unique', 'cash_unique'}:
+            from rollover import load_state
+            from trade_profiles import cash_unique_p1_profiles, eflp_p1_profiles
             from trade_modes import configured_mode_profiles
             saved = load_state(self.journal)
             if self.running or self.unfinished() or (saved and saved['status'] not in {'done', 'stopped'}):
                 return await self.reply('Сначала заверши или продолжи сохранённую серию.')
-            fixed_p2 = set(configured_mode_profiles(action)[1])
-            choices = [item for item in ready_p1_profiles(eflp_p1_profiles(os.environ), os.environ,
-                                                          include_main=False)
-                        if item.key not in fixed_p2
-                        and os.getenv(f'{profile_prefix(item.key)}_BUY_ADV_NO', '').strip()
-                        and os.getenv(f'{profile_prefix(item.key)}_FIAT', '').strip()]
-            if not choices:
-                return await self.reply('Нет настроенного П1 с объявлениями продажи и покупки USDT, '
-                                        'профилем AdsPower, FIAT и вне списка П2.')
-            self.menu = 'cash_p1'
-            self.selected_mode = action
-            self.cash_p1 = None
-            self.cash_p2.clear()
-            labels = {'cash_volume': 'Объём наличка', 'eflp_volume': 'Объём Eflp',
-                      'eflp_unique': 'Уникальные Eflp'}
-            source = ('EFLP_VOLUME_P2_PROFILES' if action == 'eflp_volume'
-                      else 'EFLP_UNIQUE_P2_PROFILES')
-            suffix = f' П2 возьму из {source} в .env и сразу запущу серию.'
-            return await self.reply(f'Выбери П1 для режима «{labels[action]}».{suffix}')
+            _, fixed_p2 = configured_mode_profiles(action)
+            makers = (cash_unique_p1_profiles(os.environ) if action == 'cash_unique'
+                      else eflp_p1_profiles(os.environ))
+            return await self.launch_trade_mode(action, makers[0], fixed_p2)
         if action.startswith('cash_p1:'):
             from rollover import profiles_from_env
             from trade_profiles import eflp_p1_profiles, ready_p1_profiles, profile_prefix
@@ -879,7 +866,7 @@ class TelegramControl:
         before = self.journal.db.execute('SELECT COALESCE(MAX(id),0) FROM events').fetchone()[0]
         try:
             await run(self.journal, state, self.stop_event, self.telegram,
-                      telegram_keyboard=lambda: self.keyboard(force_idle=True))
+                      telegram_keyboard=lambda: self.keyboard(force_idle=True), sheets=self.sheets)
         except OperatorStopped:
             if not self.shutdown_event.is_set():
                 await self.reply('⏹ Серия остановлена. Таймеры и этапы сохранены; нажми «Продолжить».')

@@ -364,6 +364,38 @@ class AdsPower:
         if response.status_code != 200 or not isinstance(payload, dict) or payload.get('code') != 0:
             raise AdsPowerError('AdsPower не подтвердил закрытие временного профиля')
 
+    async def ensure_stopped(self) -> None:
+        """Close exactly this profile and confirm it is no longer active."""
+        if not self.api_key or not self.profile_id:
+            raise AdsPowerError('Для закрытия профиля нужны ключ AdsPower и его ID')
+        headers = {'Authorization': 'Bearer ' + self.api_key}
+        async with httpx.AsyncClient(timeout=max(15, self.command_timeout), trust_env=False) as client:
+            requested = False
+            for attempt in range(12):
+                try:
+                    response = await client.get(self.base_url + '/api/v1/browser/active',
+                                                params={'user_id': self.profile_id}, headers=headers)
+                    payload = response.json()
+                except (httpx.RequestError, ValueError) as exc:
+                    raise AdsPowerUnavailable(
+                        f'Не удалось проверить закрытие профиля AdsPower ({type(exc).__name__})') from None
+                if response.status_code != 200 or not isinstance(payload, dict):
+                    raise AdsPowerError('AdsPower не подтвердил состояние закрываемого профиля')
+                if payload.get('code') == 0:
+                    data = payload.get('data')
+                    if not isinstance(data, dict):
+                        raise AdsPowerError('AdsPower не вернул состояние закрываемого профиля')
+                    if data.get('status') != 'Active':
+                        return
+                    if not requested:
+                        await self.stop_profile()
+                        requested = True
+                elif payload.get('code') != -1:
+                    raise AdsPowerError('AdsPower отклонил проверку закрываемого профиля')
+                if attempt != 11:
+                    await asyncio.sleep(2)
+        raise AdsPowerUnavailable('AdsPower не подтвердил закрытие профиля за 24 секунды')
+
     async def close_other_local_profiles(self, keep_profile_ids=None) -> int:
         """Keep the static P1 and any active trading-role browser profiles."""
         if os.getenv('ADSPOWER_CLOSE_OTHER_PROFILES', 'true').strip().lower() in {'0', 'false', 'no', 'off'}:

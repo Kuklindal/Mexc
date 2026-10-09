@@ -64,7 +64,7 @@ def eflp_p2_payment_id(key: str, fiat: str, env: Mapping[str, str]) -> str:
 
 def mode_pay_method_id(mode: str, fiat: str, env: Mapping[str, str]) -> str:
     """Payment type for cash's first order or both Eflp order participants."""
-    if mode == 'cash_volume':
+    if mode in {'cash_volume', 'cash_unique'}:
         field = 'MEXC_PAY_METHOD_ID'
         value = (env.get(field) or '578').strip()
     elif mode in {'eflp_volume', 'eflp_unique'}:
@@ -84,6 +84,16 @@ def eflp_p1_profiles(env: Mapping[str, str]) -> list[str]:
     if (not all(key == 'p1' or re.fullmatch(r'p1_[a-z0-9_]{1,29}', key)
                 for key in keys) or len(keys) != len(set(keys))):
         raise ValueError('EFLP_P1_PROFILES: укажите разные ключи p1,p1_2,p1_3 через запятую')
+    return keys
+
+
+def cash_unique_p1_profiles(env: Mapping[str, str]) -> list[str]:
+    """Ordered cash makers, configured independently of cash volume."""
+    raw = (env.get('CASH_UNIQUE_P1_PROFILES') or '').strip()
+    keys = [part.strip().lower() for part in raw.split(',')]
+    if (not raw or not all(key == 'p1' or re.fullmatch(r'p1_[a-z0-9_]{1,29}', key)
+                           for key in keys) or len(keys) != len(set(keys))):
+        raise ValueError('CASH_UNIQUE_P1_PROFILES: укажите разные ключи p1,p1_2 через запятую')
     return keys
 
 
