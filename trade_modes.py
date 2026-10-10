@@ -341,6 +341,7 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
         current_week = weekly_start(datetime.now(timezone.utc)).isoformat()
     completed_same_plan = (previous and previous['status'] == 'done'
                            and (previous['mode'] == mode == 'cash_unique'
+                                and previous.get('p1_profiles') == cash_unique_p1_profiles(env)
                                 and len(previous.get('unique_done', [])) >= 25
                                 or previous['mode'] in {'eflp_volume', 'eflp_unique'}
                                 and mode in {'eflp_volume', 'eflp_unique'}))
@@ -353,15 +354,13 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
     journal.ensure_can_create()
     p1_profiles = (eflp_p1_profiles(env) if mode in {'eflp_volume', 'eflp_unique'} else
                    cash_unique_p1_profiles(env) if mode == 'cash_unique' else [p1_profile])
-    if mode == 'cash_unique' and len(p1_profiles) != 2:
-        raise ValueError('CASH_UNIQUE_P1_PROFILES: укажите ровно два П1 в порядке работы')
     if mode in {'cash_unique', 'eflp_volume', 'eflp_unique'}:
         if p1_profile != p1_profiles[0]:
             raise ValueError('Автоматическая серия должна начинаться с первого П1 в .env')
         for maker_key in p1_profiles:
             maker = profile_from_env(maker_key, env)
             if not (env.get(f'{maker.prefix}_BUY_ADV_NO') or '').strip():
-                raise ValueError(f'{maker.prefix}_BUY_ADV_NO: нужен для перехода между П1')
+                raise ValueError(f'{maker.prefix}_BUY_ADV_NO: нужен для обратного ордера')
             if mode in {'eflp_volume', 'eflp_unique'}:
                 fiat = eflp_p1_fiat(maker_key, env)
                 mode_pay_method_id(mode, fiat, env)
@@ -1215,6 +1214,16 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                 eflp_target_done = (state['mode'] in {'eflp_volume', 'eflp_unique'}
                                     and _eflp_target_reached(state))
                 cash_unique_done = state['mode'] == 'cash_unique' and len(state['unique_done']) >= 25
+                if cash_unique_done and len(state['p1_profiles']) == 1:
+                    state['status'] = 'done'
+                    save_state(journal, state)
+                    if telegram and getattr(telegram, 'enabled', False):
+                        await telegram.send(
+                            f'✅ Уникальные наличка завершены: '
+                            f'{profile_from_env(state["p1_profile"], os.environ).nickname}, '
+                            f'{len(state["unique_done"])}/25 П2 за неделю.',
+                            reply_markup=telegram_keyboard() if telegram_keyboard else None)
+                    return
                 if eflp_target_done or cash_unique_done:
                     next_maker = _next_maker(state)
                     target = (next_maker if eflp_target_done or next_maker

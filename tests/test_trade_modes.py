@@ -176,6 +176,46 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                 await run_mode(self.journal, state, asyncio.Event(), None)
         final_order.assert_awaited_once_with(state, 'p1_2')
 
+    async def test_single_cash_maker_finishes_at_twenty_five_without_final_order(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {
+            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+            'CASH_UNIQUE_P1_PROFILES': 'p1',
+        }
+        state = begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        self.assertEqual(state['p1_profiles'], ['p1'])
+        state['unique_done'] = [f'previous-{index}' for index in range(25)]
+        with (patch.dict(os.environ, env),
+              patch('trade_modes._final_order', new_callable=AsyncMock) as final_order,
+              patch('trade_modes.run_command', new_callable=AsyncMock) as trade):
+            await run_mode(self.journal, state, asyncio.Event(), None)
+        self.assertEqual(state['status'], 'done')
+        self.assertIsNone(state.get('terminal_pending'))
+        final_order.assert_not_awaited()
+        trade.assert_not_awaited()
+        with self.assertRaisesRegex(ValueError, 'серия уже завершена'):
+            begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                       p2_profiles=['1'], env=env)
+
+    async def test_single_cash_maker_twenty_fifth_cycle_returns_to_self(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {
+            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+            'CASH_UNIQUE_P1_PROFILES': 'p1',
+        }
+        state = begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        state['unique_done'] = [f'previous-{index}' for index in range(24)]
+        with (patch.dict(os.environ, env),
+              patch('trade_modes.choose_mode_amount', new_callable=AsyncMock,
+                    return_value='100 RUB'),
+              patch('trade_modes.run_command', new_callable=AsyncMock) as trade):
+            with self.assertRaisesRegex(Paused, 'Цикл не был сохранён'):
+                await run_mode(self.journal, state, asyncio.Event(), None)
+        self.assertIsNone(state.get('terminal_pending'))
+        self.assertIsNone(trade.await_args.args[0].reverse_p1_profile)
+
     def test_cash_unique_completed_switch_is_saved_once(self):
         self.journal.abandon(self.cycle_id)
         env = env_for(25) | {

@@ -93,7 +93,7 @@ def cash_unique_p1_profiles(env: Mapping[str, str]) -> list[str]:
     keys = [part.strip().lower() for part in raw.split(',')]
     if (not raw or not all(key == 'p1' or re.fullmatch(r'p1_[a-z0-9_]{1,29}', key)
                            for key in keys) or len(keys) != len(set(keys))):
-        raise ValueError('CASH_UNIQUE_P1_PROFILES: укажите разные ключи p1,p1_2 через запятую')
+        raise ValueError('CASH_UNIQUE_P1_PROFILES: укажите p1 или разные ключи П1 через запятую')
     return keys
 
 
