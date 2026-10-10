@@ -340,6 +340,29 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.call.call_args_list[4].args[2], 's')
         self.assertIn(ORDER, self.call.call_args_list[4].args[1]['expression'])
 
+    async def test_missing_merchant_button_is_retryable_before_approval(self):
+        target = {'type': 'page', 'targetId': 'control',
+                  'url': 'https://www.mexc.com/ru-RU/buy-crypto/control'}
+        self.call.side_effect = [
+            {'targetInfos': [target]}, {'sessionId': 's'},
+            *[{'result': {'value': False}} for _ in range(15)],
+        ]
+        with patch('adspower.asyncio.sleep', new=AsyncMock()):
+            with self.assertRaisesRegex(AdsPowerUnavailable, 'Кнопка проверки ордера'):
+                await self.browser.open_merchant_order(self.call, ORDER)
+        self.browser.server_verification_state.assert_awaited_once_with(ORDER)
+        self.assertEqual(self.call.await_count, 17)
+
+        self.call.reset_mock(side_effect=True)
+        self.call.side_effect = [
+            {'targetInfos': [target]}, {'sessionId': 's'},
+            *[{'result': {'value': False}} for _ in range(15)],
+        ]
+        self.browser.server_verification_state.reset_mock()
+        self.browser.server_verification_state.return_value = 'passed'
+        with patch('adspower.asyncio.sleep', new=AsyncMock()):
+            self.assertEqual(await self.browser.open_merchant_order(self.call, ORDER), 'passed')
+
     async def test_invalid_order_cannot_open_page(self):
         with self.assertRaises(AdsPowerError):
             await self.browser.open_order("not-an-order&url=evil")

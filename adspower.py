@@ -24,7 +24,7 @@ class AdsPowerTimeout(AdsPowerError):
 
 
 class AdsPowerUnavailable(AdsPowerError):
-    """Temporary failure reaching the local AdsPower API before a browser command."""
+    """Retryable preflight failure before any exchange state-changing action."""
     pass
 
 
@@ -783,8 +783,16 @@ class AdsPower:
                     return state
                 await asyncio.sleep(1)
             break
-        raise AdsPowerError(f"Кнопка проверки ордера {order_no} недоступна в портале мерчанта П1. "
-                            "Не удалось подтвердить, требуется ли проверка; оплата не отправлена")
+        # Opening the merchant row is navigation, not approval. Before retrying
+        # the preflight, recognize verification completed elsewhere meanwhile.
+        try:
+            state = await self.server_verification_state(order_no)
+        except AdsPowerError:
+            state = None
+        if state in {'passed', 'not_required'}:
+            return state
+        raise AdsPowerUnavailable(f"Кнопка проверки ордера {order_no} недоступна в портале мерчанта П1. "
+                                  "Состояние будет повторно сверено; оплата не отправлена")
 
     async def approve(self, order_no: str) -> None:
         click_attempted = False

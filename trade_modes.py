@@ -983,11 +983,14 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
         state['last_error'] = str(exc)[:300]
         if isinstance(exc, MexcReadUnavailable):
             state['mexc_read_waiting'] = True
+        if isinstance(exc, AdsPowerUnavailable):
+            state['adspower_waiting'] = True
         save_state(journal, state)
         try:
             await wait_until(datetime.now(timezone.utc) + timedelta(seconds=30), stop_event)
         finally:
             state.pop('mexc_read_waiting', None)
+            state.pop('adspower_waiting', None)
             if not stop_event.is_set():
                 state['status'] = 'running'
             save_state(journal, state)
@@ -1020,6 +1023,7 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
         save_state(journal, state)
 
     state.pop('mexc_read_waiting', None)
+    state.pop('adspower_waiting', None)
     state['status'] = 'running'
     save_state(journal, state)
     sheet_checked = False

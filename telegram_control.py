@@ -89,15 +89,24 @@ class TelegramControl:
         self.shutdown_event.set()
 
     def resume_after_restart(self) -> bool:
-        """Resume running work or a legacy pause caused by an unavailable MEXC read."""
+        """Resume running work or a narrowly identified legacy retryable preflight."""
         if os.getenv('AUTO_RESUME_ON_BOOT', 'false').lower() != 'true':
             return False
         from rollover import load_state, save_state
         state = load_state(self.journal)
         legacy_read_pause = (state and state.get('status') == 'paused'
                              and state.get('last_error') == 'MexcReadUnavailable')
+        legacy_check_pause = False
+        if state and state.get('status') == 'paused' and state.get('active_cycle'):
+            event = self.journal.db.execute(
+                'SELECT step,status,message FROM events WHERE cycle_id=? ORDER BY id DESC LIMIT 1',
+                (state['active_cycle'],)).fetchone()
+            legacy_check_pause = bool(
+                event and event['step'] == 'forward_check' and event['status'] == 'error'
+                and 'Кнопка проверки ордера ' in event['message']
+                and 'недоступна в портале мерчанта П1' in event['message'])
         if not state or not (state.get('resume_on_boot') or state.get('status') in {'running', 'waiting'}
-                             or legacy_read_pause):
+                             or legacy_read_pause or legacy_check_pause):
             return False
         state.pop('resume_on_boot', None)
         save_state(self.journal, state)
@@ -355,6 +364,8 @@ class TelegramControl:
             bot_state = 'Останавливается'
         elif self.running and scheduler and scheduler.get('mexc_read_waiting'):
             bot_state = 'Ждёт ответа MEXC; повтор чтения каждые 30 секунд'
+        elif self.running and scheduler and scheduler.get('adspower_waiting'):
+            bot_state = 'Ждёт AdsPower; повтор через 30 секунд'
         elif (self.running and scheduler and scheduler.get('status') == 'waiting'
               and scheduler.get('last_error') and not cycle):
             bot_state = 'Повторяет подключение'
