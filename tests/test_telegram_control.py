@@ -90,6 +90,16 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             save_state(self.journal, state)
             self.assertFalse(self.control().resume_after_restart())
 
+            # The old scheduler paused on a read-only timeout before the retry
+            # handler was installed. A service restart may safely resume it.
+            state['last_error'] = 'MexcReadUnavailable'
+            save_state(self.journal, state)
+            recovered = self.control()
+            with patch.object(recovered, 'work_rollover', new=AsyncMock()) as worker:
+                self.assertTrue(recovered.resume_after_restart())
+                await recovered.task
+                worker.assert_awaited_once()
+
     async def test_chat_recovery_requires_explicit_confirmation_and_never_duplicates(self):
         self.uncertain_chat()
         control = self.control()

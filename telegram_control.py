@@ -89,12 +89,15 @@ class TelegramControl:
         self.shutdown_event.set()
 
     def resume_after_restart(self) -> bool:
-        """Resume only a series interrupted while running, never an operator pause."""
+        """Resume running work or a legacy pause caused by an unavailable MEXC read."""
         if os.getenv('AUTO_RESUME_ON_BOOT', 'false').lower() != 'true':
             return False
         from rollover import load_state, save_state
         state = load_state(self.journal)
-        if not state or not (state.get('resume_on_boot') or state.get('status') in {'running', 'waiting'}):
+        legacy_read_pause = (state and state.get('status') == 'paused'
+                             and state.get('last_error') == 'MexcReadUnavailable')
+        if not state or not (state.get('resume_on_boot') or state.get('status') in {'running', 'waiting'}
+                             or legacy_read_pause):
             return False
         state.pop('resume_on_boot', None)
         save_state(self.journal, state)
