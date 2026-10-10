@@ -63,12 +63,12 @@ def configured_mode_profiles(mode: str, env=os.environ) -> tuple[str | None, lis
 
 
 def _eflp_target_reached(state: dict) -> bool:
-    """Both requirements apply to the current P1, across both Eflp modes."""
+    """Volume and unique modes have independent weekly completion targets."""
     volume = sum((Decimal(value) for value in state.get('eflp_volume_by_profile', {}).values()),
                  Decimal('0'))
     unique = len(state.get('unique_done', []))
     if state['mode'] == 'eflp_volume':
-        return volume >= Decimal('20000') and unique >= 20
+        return volume >= Decimal('20000')
     return unique >= 20
 
 
@@ -422,9 +422,7 @@ def next_profile(state, now=None, journal=None):
     waits = []
     for offset in range(len(names)):
         name = names[(state['cursor'] + offset) % len(names)]
-        if (state['mode'] in {'unique', 'eflp_unique', 'cash_unique'} and name in state['unique_done']
-                or state['mode'] == 'eflp_volume' and len(state['unique_done']) < 20
-                and name in state['unique_done']):
+        if state['mode'] in {'unique', 'eflp_unique', 'cash_unique'} and name in state['unique_done']:
             continue
         deadline = _cooldown(state, name, now, journal)
         if deadline is False:

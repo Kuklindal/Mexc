@@ -451,12 +451,19 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         state = {'mode': 'eflp_unique', 'unique_done': ['1', '2']}
         self.assertFalse(_eflp_target_reached(state))
 
-    async def test_eflp_unique_keeps_twenty_cap_for_larger_pool(self):
-        state = {'mode': 'eflp_volume', 'unique_done': [str(i) for i in range(20)],
+    async def test_eflp_volume_reaches_target_with_one_p2(self):
+        state = {'mode': 'eflp_volume', 'unique_done': ['1'],
                  'eflp_volume_by_profile': {'1': '19999.9999'}}
         self.assertFalse(_eflp_target_reached(state))
-        state['eflp_volume_by_profile']['2'] = '0.0001'
+        state['eflp_volume_by_profile']['1'] = '20000'
         self.assertTrue(_eflp_target_reached(state))
+
+    def test_eflp_volume_reuses_completed_p2_but_unique_mode_does_not(self):
+        state = {'mode': 'eflp_volume', 'profiles': ['1'], 'cursor': 0,
+                 'unique_done': ['1'], 'cooldowns': {}}
+        self.assertEqual(next_profile(state), ('1', None))
+        state['mode'] = 'eflp_unique'
+        self.assertEqual(next_profile(state), (None, None))
 
     def test_new_eflp_mode_restores_weekly_volume_and_completed_unique_profiles(self):
         self.journal.abandon(self.cycle_id)
@@ -490,6 +497,7 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(volume['unique_done'], ['1'])
         self.assertEqual(volume['completed_count'], 1)
         self.assertEqual(volume['eflp_counted_cycles'].count(first), 1)
+        self.assertEqual(next_profile(volume)[0], '1')
         _record_forward(self.journal, volume, first)
         self.assertEqual(volume['eflp_volume_by_profile']['1'], '900')
 
@@ -518,9 +526,13 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         state['active_cycle'] = cid
         save_state(self.journal, state)
         sheets = type('Sheets', (), {'read_eflp_sales': AsyncMock(return_value=self.journal.sales())})()
-        with patch.dict(os.environ, env), patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
-            with self.assertRaisesRegex(Paused, 'Нет доступного П2'):
+        with (patch.dict(os.environ, env),
+              patch('trade_modes.run_command', new_callable=AsyncMock) as trade,
+              patch('trade_modes._final_order', new_callable=AsyncMock,
+                    side_effect=Paused('final order preflight')) as final_order):
+            with self.assertRaisesRegex(Paused, 'final order preflight'):
                 await run_mode(self.journal, state, asyncio.Event(), None, sheets=sheets)
+        final_order.assert_awaited_once_with(state, None)
         sheets.read_eflp_sales.assert_awaited_once_with(self.journal)
         trade.assert_not_awaited()
         self.assertEqual(state['eflp_volume_by_profile']['1'], '20050')

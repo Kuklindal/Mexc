@@ -400,7 +400,7 @@ class TelegramControl:
                     if scheduler.get('mode') == 'eflp_volume':
                         lines.append('Объём этого П1: '
                                      + scheduler.get('eflp_volume_total', '0') + ' / 20000 USDT')
-                        lines.append(f'Уникальных П2: {len(scheduler.get("unique_done", []))}/20')
+                        lines.append(f'Уникальных П2: {len(scheduler.get("unique_done", []))}')
                     else:
                         lines.append(f'Уникальных П2 завершили: {len(scheduler.get("unique_done", []))}/20')
                 if scheduler.get('mode') == 'cash_unique':
