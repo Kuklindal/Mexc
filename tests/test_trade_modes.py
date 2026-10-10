@@ -102,6 +102,80 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state['terminal_pending']['kind'], 'cash_regular')
         self.assertEqual(state['terminal_pending']['p2'], '25')
 
+    async def test_cash_unique_counts_cash_volume_and_allows_small_batches(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(3) | {
+            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+            'CASH_UNIQUE_P1_PROFILES': 'p1,p1_2',
+            'MEXC_P1_2_API_KEY': 'second-key', 'MEXC_P1_2_SECRET_KEY': 'second-secret',
+            'MEXC_P1_2_MEMBER_ID': 'second-member', 'MEXC_P1_2_NICKNAME': 'Second maker',
+            'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456787',
+            'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456786',
+            'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-browser',
+        }
+        cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'cash_volume',
+                                   'p1_profile': 'p1', 'p2_profile': '1',
+                                   'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+                                result={'quantity': '100'},
+                                context={'amount': '1000', 'quantity': '100'})
+        self.complete(cid, '100')
+        network = self.journal.create({'mode': 'api', 'scheduler_mode': 'cash_volume',
+                                       'cash_return_route': 'network',
+                                       'p1_profile': 'p1', 'p2_profile': '3',
+                                       'members': {'p2': env['MEXC_P2_3_MEMBER_ID']}})
+        self.journal.transition(network, 'forward_complete', 'both', 'done', 'sold',
+                                result={'quantity': '100'},
+                                context={'amount': '1000', 'quantity': '100'})
+        self.journal.transition(network, 'cash_network_return', 'both', 'done', 'returned')
+        self.journal.transition(network, 'cycle', 'both', 'completed', 'done',
+                                cycle_status='completed')
+        state = begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        self.assertEqual(state['unique_done'], ['1', '3'])
+        self.assertEqual(state['completed_count'], 0)
+        self.assertEqual(next_profile(state), (None, None))
+        sheets = type('Sheets', (), {'read_eflp_sales': AsyncMock(return_value=self.journal.sales())})()
+        with patch.dict(os.environ, env), patch('trade_modes.run_command', new_callable=AsyncMock) as trade:
+            await run_mode(self.journal, state, asyncio.Event(), None, sheets=sheets)
+        trade.assert_not_awaited()
+        sheets.read_eflp_sales.assert_awaited_once_with(self.journal)
+        self.assertEqual(state['status'], 'done')
+        self.assertTrue(state['cash_unique_partial'])
+
+        resumed = begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                             p2_profiles=['2'], env=env)
+        self.assertEqual(resumed['unique_done'], ['1', '3'])
+        self.assertEqual(next_profile(resumed), ('2', None))
+
+        resumed['status'] = 'done'
+        resumed['p1_profile'] = 'p1_2'
+        save_state(self.journal, resumed)
+        second = begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                            p2_profiles=['2'], env=env)
+        self.assertEqual(second['p1_profile'], 'p1_2')
+
+    async def test_cash_unique_existing_twenty_five_moves_to_second_p1(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {
+            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+            'CASH_UNIQUE_P1_PROFILES': 'p1,p1_2',
+            'MEXC_P1_2_API_KEY': 'second-key', 'MEXC_P1_2_SECRET_KEY': 'second-secret',
+            'MEXC_P1_2_MEMBER_ID': 'second-member', 'MEXC_P1_2_NICKNAME': 'Second maker',
+            'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456787',
+            'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456786',
+            'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-browser',
+        }
+        state = begin_mode(self.journal, 'cash_unique', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        state['unique_done'] = [f'previous-{index}' for index in range(25)]
+        with (patch.dict(os.environ, env),
+              patch('trade_modes._final_order', new_callable=AsyncMock,
+                    side_effect=Paused('final preflight')) as final_order):
+            with self.assertRaisesRegex(Paused, 'final preflight'):
+                await run_mode(self.journal, state, asyncio.Event(), None)
+        final_order.assert_awaited_once_with(state, 'p1_2')
+
     def test_cash_unique_completed_switch_is_saved_once(self):
         self.journal.abandon(self.cycle_id)
         env = env_for(25) | {

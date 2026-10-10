@@ -496,7 +496,7 @@ class TelegramControl:
                   'eflp_volume': 'Объём Eflp',
                   'eflp_unique': 'Уникальные Eflp'}
         from trade_profiles import profile_from_env
-        p1_name = profile_from_env(p1_profile, os.environ).nickname
+        p1_name = profile_from_env(state['p1_profile'], os.environ).nickname
         skipped = [name for name in p2_profiles if name not in state['profiles']]
         return await self.reply(f'Запускаю «{labels[mode]}». П1: {p1_name}. П2 по очереди: '
                                 + ', '.join(p2_nickname(name) for name in state['profiles']) + '.'

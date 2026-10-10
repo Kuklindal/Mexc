@@ -115,16 +115,20 @@ def _complete_sale_cycle(journal: Journal | None, sale: dict) -> bool:
     cycle = journal.cycle(sale['cycle_id'])
     if not cycle or cycle['status'] != 'completed':
         return False
-    required = ('forward_complete', 'reverse_complete', 'reverse_replenish')
-    if cycle['spec'].get('buy_replenish'):
-        required += ('reverse_replenish_buy',)
+    if (sale.get('scheduler_mode') == 'cash_volume'
+            and cycle['spec'].get('cash_return_route') == 'network'):
+        required = ('forward_complete', 'cash_network_return')
+    else:
+        required = ('forward_complete', 'reverse_complete', 'reverse_replenish')
+        if cycle['spec'].get('buy_replenish'):
+            required += ('reverse_replenish_buy',)
     return all((step := journal.step(sale['cycle_id'], name)) and step['status'] == 'done'
                for name in required)
 
 
 def eflp_meta_values(sale: dict, *, completed: bool = False) -> list[str]:
     mode = sale.get('scheduler_mode') or ''
-    if completed and mode in {'eflp_volume', 'eflp_unique', 'cash_unique'}:
+    if completed and mode in {'eflp_volume', 'eflp_unique', 'cash_volume', 'cash_unique'}:
         mode += '_done'
     return [sale.get('p1_profile') or 'p1', mode,
             sale.get('p2_member_id') or '']
@@ -133,14 +137,14 @@ def eflp_meta_values(sale: dict, *, completed: bool = False) -> list[str]:
 def cash_unique_formulas(sales: list[dict], row_count: int) -> list[list[str]]:
     configured = [key.strip() for key in os.getenv('CASH_UNIQUE_P1_PROFILES', '').split(',') if key.strip()]
     accounts = {sale.get('p1_profile') or 'p1': sale_p1_name(sale) for sale in sales
-                if sale.get('scheduler_mode') == 'cash_unique'}
+                if sale.get('scheduler_mode') in {'cash_volume', 'cash_unique'}}
     for key in configured:
         accounts.setdefault(key, os.getenv(f'MEXC_{key.upper()}_NICKNAME', '').strip() or key)
     rows = [['', ''] for _ in range(max(2, row_count, len(accounts) + 1))]
     rows[0] = ['П1 — уникальные наличка', 'Уникальных П2']
     for index, key in enumerate(dict.fromkeys([*configured, *sorted(accounts)]), 2):
         rows[index - 1] = [accounts[key],
-            f'=COUNTUNIQUEIFS($T$2:$T;$R$2:$R;"{key}";$S$2:$S;"cash_unique_done";'
+            f'=COUNTUNIQUEIFS($T$2:$T;$R$2:$R;"{key}";$S$2:$S;"cash*_done";'
             '$U$2:$U;">="&$U$1;$U$2:$U;"<"&($U$1+7);$T$2:$T;"<>")']
     return rows
 
@@ -349,8 +353,8 @@ class GoogleSheets:
             row = visible[sale_id] if sale_id < len(visible) else []
             meta = metadata[sale_id] if sale_id < len(metadata) else []
             if not meta or len(meta) < 2 or meta[1] not in {
-                    'eflp_volume', 'eflp_unique', 'cash_unique',
-                    'eflp_volume_done', 'eflp_unique_done', 'cash_unique_done'}:
+                    'eflp_volume', 'eflp_unique', 'cash_volume', 'cash_unique',
+                    'eflp_volume_done', 'eflp_unique_done', 'cash_volume_done', 'cash_unique_done'}:
                 continue
             sale = by_id.get(sale_id)
             if not sale:
@@ -370,12 +374,12 @@ class GoogleSheets:
             confirmed.append(sale)
         confirmed_ids = {sale['id'] for sale in confirmed}
         for sale in by_id.values():
-            if (sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique', 'cash_unique'}
+            if (sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique', 'cash_volume', 'cash_unique'}
                     and sale['sent'] and sale['id'] not in confirmed_ids):
                 raise GoogleSheetsError('Продажа Eflp помечена доставленной, но отсутствует в таблице; '
                                         'новый ордер остановлен до сверки')
         return confirmed + [sale for sale in by_id.values()
-                            if sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique', 'cash_unique'}
+                            if sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique', 'cash_volume', 'cash_unique'}
                             and not sale['sent'] and sale['id'] not in confirmed_ids]
 
     async def send_weekly(self, sales: list[dict], journal: Journal | None = None):

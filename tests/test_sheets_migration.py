@@ -226,12 +226,54 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
 
     def test_cash_unique_weekly_block_uses_only_finished_cycles(self):
         sales = [dict(p1_profile='p1_2', p1_nickname='Cash maker',
-                      scheduler_mode='cash_unique', p2_member_id='buyer-1')]
+                      scheduler_mode='cash_unique', p2_member_id='buyer-1'),
+                 dict(p1_profile='p1_2', p1_nickname='Cash maker',
+                      scheduler_mode='cash_volume', p2_member_id='buyer-2')]
         rows = cash_unique_formulas(sales, 0)
         self.assertEqual(rows[0], ['П1 — уникальные наличка', 'Уникальных П2'])
         self.assertEqual(rows[1][0], 'Cash maker')
-        self.assertIn('"cash_unique_done"', rows[1][1])
+        self.assertIn('"cash*_done"', rows[1][1])
         self.assertIn('$U$1+7', rows[1][1])
+
+    def test_cash_volume_metadata_marks_completed_cycles(self):
+        sale = {'p1_profile': 'p1', 'scheduler_mode': 'cash_volume',
+                'p2_member_id': 'buyer-1'}
+        self.assertEqual(eflp_meta_values(sale)[1], 'cash_volume')
+        self.assertEqual(eflp_meta_values(sale, completed=True)[1], 'cash_volume_done')
+
+    def test_cash_network_return_counts_as_completed_volume_cycle(self):
+        spec = {'mode': 'api', 'scheduler_mode': 'cash_volume',
+                'cash_return_route': 'network'}
+        self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?',
+                                (json.dumps(spec), self.cid))
+        self.journal.db.commit()
+        self.journal.transition(self.cid, 'cash_network_return', 'both', 'done', 'returned')
+        self.journal.transition(self.cid, 'cycle', 'both', 'completed', 'done',
+                                cycle_status='completed')
+        self.assertTrue(_complete_sale_cycle(self.journal, self.journal.sales()[0]))
+
+    async def test_cash_volume_sale_is_read_for_cash_unique_progress(self):
+        spec = {'mode': 'api', 'scheduler_mode': 'cash_volume',
+                'p1_profile': 'p1', 'p2_profile': '2',
+                'members': {'p2': 'member-2'}}
+        self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?',
+                                (json.dumps(spec), self.cid))
+        self.journal.db.commit()
+        sale = self.journal.sales()[0]
+        visible = [HEADER, sale_values(sale)]
+        metadata = [EFLP_META_HEADER, eflp_meta_values(sale)]
+
+        async def request(method, cell_range):
+            return {'values': visible if cell_range == 'A:E' else metadata}
+
+        self.sheets.request = request
+        self.assertEqual(await self.sheets.read_eflp_sales(self.journal), [sale])
+        for name in ('reverse_complete', 'reverse_replenish'):
+            self.journal.transition(self.cid, name, 'both', 'done', name)
+        self.journal.transition(self.cid, 'cycle', 'both', 'completed', 'done',
+                                cycle_status='completed')
+        metadata[1] = eflp_meta_values(sale, completed=True)
+        self.assertEqual(await self.sheets.read_eflp_sales(self.journal), [sale])
 
     def test_cash_unique_metadata_switches_to_done_after_full_cycle(self):
         spec = {'mode': 'api', 'scheduler_mode': 'cash_unique', 'buy_replenish': True,

@@ -190,16 +190,21 @@ def restore_eflp_progress(journal, state: dict, sales: list[dict], *, env=os.env
 
 def restore_cash_unique_progress(journal, state: dict, sales: list[dict], *, env=os.environ,
                                  now: datetime | None = None) -> None:
-    """Count only confirmed cash-unique returns in the operational week."""
+    """Count distinct P2 with completed cash returns in the operational week."""
     from sheets import weekly_start
 
     week = weekly_start(now or datetime.now(timezone.utc))
-    member_profiles = {str(env.get(f'{profile_prefix(name)}_MEMBER_ID') or '').strip(): name
-                       for name in state['profiles']}
+    member_profiles = {member: name for name in profiles_from_env(env)
+                       if (member := str(env.get(f'{profile_prefix(name)}_MEMBER_ID') or '').strip())}
+    for name in state['profiles']:
+        member = str(env.get(f'{profile_prefix(name)}_MEMBER_ID') or '').strip()
+        if member:
+            member_profiles[member] = name
     done = []
+    done_members = set()
     completed = []
     for sale in sales:
-        if (sale.get('scheduler_mode') != 'cash_unique'
+        if (sale.get('scheduler_mode') not in {'cash_volume', 'cash_unique'}
                 or sale.get('p1_profile') != state['p1_profile']):
             continue
         try:
@@ -207,22 +212,33 @@ def restore_cash_unique_progress(journal, state: dict, sales: list[dict], *, env
             if completed_at.tzinfo is None:
                 raise ValueError
         except (KeyError, TypeError, ValueError):
-            raise Paused('У продажи «Уникальные наличка» нет достоверной даты') from None
+            raise Paused('У продажи наличных нет достоверной даты') from None
         if weekly_start(completed_at) != week:
             continue
         cycle = journal.cycle(sale['cycle_id'])
         if not cycle or cycle['status'] != 'completed':
             continue
+        if (sale['scheduler_mode'] == 'cash_volume'
+                and cycle['spec'].get('cash_return_route') == 'network'):
+            required = ('forward_complete', 'cash_network_return')
+        else:
+            required = ('forward_complete', 'reverse_complete', 'reverse_replenish')
+            if cycle['spec'].get('buy_replenish'):
+                required += ('reverse_replenish_buy',)
         if any(not (step := journal.step(sale['cycle_id'], name)) or step['status'] != 'done'
-               for name in ('forward_complete', 'reverse_complete', 'reverse_replenish',
-                            'reverse_replenish_buy')):
+               for name in required):
             continue
-        profile = member_profiles.get(str(sale.get('p2_member_id') or '').strip())
-        if not profile:
-            profile = sale.get('p2_profile')
-            if profile not in state['profiles']:
-                continue
-        completed.append(sale['cycle_id'])
+        member = str(sale.get('p2_member_id') or '').strip()
+        if not member:
+            raise Paused('У завершённой продажи наличных нет MEMBER_ID П2; уникальность не подтверждена')
+        profile = member_profiles.get(member, f'member:{member}')
+        if member in done_members:
+            if sale['scheduler_mode'] == 'cash_unique':
+                completed.append(sale['cycle_id'])
+            continue
+        done_members.add(member)
+        if sale['scheduler_mode'] == 'cash_unique':
+            completed.append(sale['cycle_id'])
         if profile not in done:
             done.append(profile)
     state['unique_done'] = done
@@ -253,8 +269,6 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
             if p1_profile not in cash_unique_p1_profiles(env):
                 raise ValueError('П1 отсутствует в CASH_UNIQUE_P1_PROFILES')
             chosen, _ = split_eflp_p2_profiles(p1_profile, chosen, env)
-            if len(chosen) < 25:
-                raise ValueError('Для «Уникальные наличка» требуется минимум 25 разных П2 вне аккаунта П1')
         if not chosen or len(chosen) != len(set(chosen)) or any(name not in names for name in chosen):
             raise ValueError('Выберите хотя бы один настроенный профиль П2 без повторов')
         if p1_profile in chosen:
@@ -321,13 +335,18 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
     previous = load_state(journal)
     if previous and previous['status'] not in {'done', 'stopped'}:
         raise ValueError('Сначала остановите или продолжите сохранённую серию')
+    current_week = None
+    if mode == 'cash_unique':
+        from sheets import weekly_start
+        current_week = weekly_start(datetime.now(timezone.utc)).isoformat()
     completed_same_plan = (previous and previous['status'] == 'done'
                            and (previous['mode'] == mode == 'cash_unique'
+                                and len(previous.get('unique_done', [])) >= 25
                                 or previous['mode'] in {'eflp_volume', 'eflp_unique'}
                                 and mode in {'eflp_volume', 'eflp_unique'}))
     if completed_same_plan:
         from sheets import weekly_start
-        current_week = weekly_start(datetime.now(timezone.utc)).isoformat()
+        current_week = current_week or weekly_start(datetime.now(timezone.utc)).isoformat()
         week_field = 'cash_unique_week_start' if mode == 'cash_unique' else 'eflp_week_start'
         if previous.get(week_field) == current_week:
             raise ValueError('Эта серия уже завершена за текущую неделю; новый запуск создаст повторный финальный ордер')
@@ -347,16 +366,29 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
                 fiat = eflp_p1_fiat(maker_key, env)
                 mode_pay_method_id(mode, fiat, env)
             eligible, _ = split_eflp_p2_profiles(maker_key, list(p2_profiles or chosen), env)
-            if len(eligible) < (25 if mode == 'cash_unique' else 1):
+            if not eligible:
                 raise ValueError(f'Для П1 {maker_key} недостаточно отличающихся П2')
             if mode in {'eflp_volume', 'eflp_unique'}:
                 for p2_key in eligible:
                     eflp_p2_payment_id(p2_key, fiat, env)
+    active_p1 = p1_profile
+    if (mode == 'cash_unique' and previous and previous.get('mode') == mode
+            and previous.get('status') in {'done', 'stopped'}
+            and previous.get('cash_unique_week_start') == current_week
+            and previous.get('p1_profiles') == p1_profiles):
+        if previous.get('terminal_pending'):
+            raise ValueError('Сначала продолжите сохранённый финальный переход П1')
+        active_p1 = previous.get('p1_profile', p1_profile)
+    active_profiles = chosen
+    if mode == 'cash_unique' and active_p1 != p1_profile:
+        active_profiles, _ = split_eflp_p2_profiles(active_p1, list(p2_profiles or chosen), env)
+        if not active_profiles:
+            raise ValueError(f'Для П1 {active_p1} нет отличающегося П2')
     state = {
-        'status': 'ready', 'mode': mode, 'p1_profile': p1_profile,
+        'status': 'ready', 'mode': mode, 'p1_profile': active_p1,
         'p1_profiles': p1_profiles, 'all_profiles': list(p2_profiles or chosen),
         'cash_policy': 'rolling24_p1' if mode == 'cash_volume' else None,
-        'profiles': chosen, 'selected': None, 'cursor': 0,
+        'profiles': active_profiles, 'selected': None, 'cursor': 0,
         'completed_count': 0, 'active_cycle': None, 'pending_return': None,
         'cooldowns': {key: value for key, value in previous.get('cooldowns', {}).items()
                       if mode != 'cash_volume' or value.get('reason') not in {'volume', 'volume_rolling', 'order_cap'}}
@@ -775,7 +807,7 @@ async def _apply_terminal_switch(journal, state) -> None:
                        returned.adspower_profile_id).ensure_stopped()
     if target and not pending.get('finish'):
         eligible, _ = split_eflp_p2_profiles(target, state['all_profiles'], os.environ)
-        if len(eligible) < (25 if state['mode'] == 'cash_unique' else 1):
+        if not eligible:
             raise Paused('Для следующего П1 недостаточно П2 после исключения совпадающего аккаунта')
         state['p1_profile'] = target
         state['profiles'] = eligible
@@ -1018,6 +1050,8 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
         else:
             sales = journal.sales()
         restore_cash_unique_progress(journal, state, sales)
+        if sheets and hasattr(sheets, 'send_weekly'):
+            await sheets.send_weekly(journal.sales(), journal)
         save_state(journal, state)
 
     state.pop('mexc_read_waiting', None)
@@ -1182,7 +1216,9 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                                     and _eflp_target_reached(state))
                 cash_unique_done = state['mode'] == 'cash_unique' and len(state['unique_done']) >= 25
                 if eflp_target_done or cash_unique_done:
-                    target = (_next_maker(state) if eflp_target_done else state['p1_profiles'][0])
+                    next_maker = _next_maker(state)
+                    target = (next_maker if eflp_target_done or next_maker
+                              else state['p1_profiles'][0])
                     candidates, _ = split_eflp_p2_profiles(
                         target or state['p1_profile'], state['profiles'], os.environ)
                     if not candidates:
@@ -1197,7 +1233,8 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                                                           'eflp_cross' if target else 'eflp_last'),
                                                  'from': state['p1_profile'], 'to': target,
                                                  'p2': profile, 'amount': amount, 'quantity': quantity,
-                                                 'finish': cash_unique_done or target is None}
+                                                 'finish': (cash_unique_done and next_maker is None
+                                                            or target is None)}
                     save_state(journal, state)
                     continue
                 profile, deadline = next_profile(state, journal=journal)
@@ -1215,6 +1252,19 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                         await Reporter(journal, telegram, None, keyboard=telegram_keyboard).flush()
                 if profile is None:
                     if deadline is None:
+                        if (state['mode'] == 'cash_unique'
+                                and all(name in state['unique_done'] for name in state['profiles'])):
+                            state['status'] = 'done'
+                            state['cash_unique_partial'] = True
+                            save_state(journal, state)
+                            if telegram and getattr(telegram, 'enabled', False):
+                                await telegram.send(
+                                    f'✅ Выбранные П2 завершили циклы для П1 '
+                                    f'{profile_from_env(state["p1_profile"], os.environ).nickname}: '
+                                    f'{len(state["unique_done"])}/25 уникальных за неделю. '
+                                    'Дополните UNIQUE_P2_PROFILES и запустите режим снова.',
+                                    reply_markup=telegram_keyboard() if telegram_keyboard else None)
+                            return
                         raise Paused('Нет доступного П2; проверьте таймеры и настройки')
                     state['status'] = 'waiting'
                     state.pop('last_error', None)
