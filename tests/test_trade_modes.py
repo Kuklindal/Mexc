@@ -336,8 +336,8 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         previous = self.journal.create(dict(self.spec, p2_profile='1',
                                             members={'p1': 'main-member', 'p2': 'member-1'}))
         self.journal.transition(previous, 'forward_complete', 'both', 'done', 'sale',
-                                result={'quantity': '68000'},
-                                context={'amount': '6800000', 'quantity': '68000'})
+                                result={'quantity': '67000'},
+                                context={'amount': '6700000', 'quantity': '67000'})
         self.journal.abandon(previous)
         spec = dict(self.spec, automatic=True, scheduler_mode='cash_volume',
                     cash_policy='rolling24_p1', p1_profile='p1', p2_profile='1',
@@ -735,18 +735,18 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                 await choose_mode_amount('eflp_volume', 'p1', '1', {}, env)
         client.close.assert_awaited_once()
 
-    async def test_cash_amount_uses_journal_across_runs_and_stops_before_70k(self):
+    async def test_cash_amount_uses_journal_across_runs_and_stops_at_68k(self):
         self.journal.abandon(self.cycle_id)
         env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
         previous = self.journal.create(dict(self.spec, p2_profile='1',
                                             members={'p1': 'main-member', 'p2': 'member-1'}))
         self.journal.transition(previous, 'forward_complete', 'both', 'done', 'sale',
-                                result={'quantity': '68800'},
-                                context={'amount': '6880000', 'quantity': '68800'})
+                                result={'quantity': '68000'},
+                                context={'amount': '6800000', 'quantity': '68000'})
         self.journal.abandon(previous)
         sell = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL',
                 'coinName': 'USDT', 'fiatUnit': 'RUB', 'advStatus': 'OPEN',
-                'price': '100', 'maxSingleTransAmount': '200000',
+                'price': '100', 'maxSingleTransAmount': '100000',
                 'minSingleTransAmount': '1000', 'availableQuantity': '3000'}
         buy = dict(sell, advNo=env['MEXC_P1_BUY_ADV_NO'], side='BUY')
         client = type('Client', (), {})()
@@ -786,8 +786,8 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                            p2_profiles=['1', '2'], env=env)
         old = self.journal.create(dict(self.spec, p2_profile='1', members={'p2': 'member-1'}))
         self.journal.transition(old, 'forward_complete', 'both', 'done', 'sale',
-                                result={'quantity': '68800'},
-                                context={'amount': '6880000', 'quantity': '68800'})
+                                result={'quantity': '67000'},
+                                context={'amount': '6700000', 'quantity': '67000'})
         self.journal.abandon(old)
         state['last_cycle_rowid'] = self.journal.db.execute(
             'SELECT rowid FROM cycles WHERE id=?', (old,)).fetchone()[0]

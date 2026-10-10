@@ -7,7 +7,7 @@ import os
 
 TARGET_USDT = Decimal('70000')
 CEILING_USDT = Decimal('71000')
-CASH_TARGET_USDT = Decimal('69000')
+CASH_TARGET_USDT = Decimal('68000')
 CASH_CEILING_USDT = Decimal('70000')
 
 

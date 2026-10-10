@@ -418,14 +418,15 @@ class TelegramControl:
             profile = spec.get('p2_profile', 'default')
             lines.append(f"👤 Сейчас П2: {p2_nickname(profile, spec.get('nicknames', {}).get('p2'))}")
             if scheduler and scheduler.get('mode') == 'cash_volume' and spec.get('cash_policy') == 'rolling24_p1':
-                from volume_policy import rolling_cash_purchases
+                from volume_policy import (CASH_TARGET_USDT, CASH_CEILING_USDT,
+                                           rolling_cash_purchases)
                 try:
                     window = rolling_cash_purchases(self.journal, profile,
                                                     member_id=spec.get('members', {}).get('p2'))
                 except (ValueError, TypeError):
                     lines.append('⚠️ Не удалось сверить покупки П2 за 24 часа; новый ордер не откроется')
                 else:
-                    lines.append(f"Покупки П2 за 24 ч: {window['quantity']} / 69000 USDT (макс. 70000)")
+                    lines.append(f"Покупки П2 за 24 ч: {window['quantity']} / {CASH_TARGET_USDT} USDT (макс. {CASH_CEILING_USDT})")
                     if window.get('uncertain_until'):
                         lines.append('⚠️ Есть первая сделка без подтверждённого итога; новые покупки этого П2 ждут сверки')
             elif scheduler and scheduler.get('mode') in {'volume', 'cash_volume'}:
