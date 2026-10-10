@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, Step, steps_for_spec
 from adspower import AdsPowerTimeout, AdsPowerUnavailable
-from mexc_client import MexcChatUnavailable
+from mexc_client import MexcChatUnavailable, MexcReadUnavailable
 from rollover import load_state, save_state
 from trade_modes import (_eflp_target_reached, _finish_cash_network_return, _finish_completed_cycle,
                            _finish_terminal_cycle,
@@ -855,6 +855,46 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
         wait.assert_awaited_once()
         self.assertEqual(state['completed_count'], 1)
+
+    async def test_cash_read_timeout_before_new_cycle_retries_without_creating_order(self):
+        self.journal.abandon(self.cycle_id)
+        state = begin_mode(self.journal, 'cash_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env_for(1) | {
+                               'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'})
+        read = AsyncMock(side_effect=[
+            MexcReadUnavailable('MEXC read request failed (ConnectTimeout); no action was sent'),
+            '180000 RUB',
+        ])
+        with patch('trade_modes.choose_mode_amount', read), \
+                patch('trade_modes.run_command', new_callable=AsyncMock,
+                      side_effect=OperatorStopped('stop')) as trade, \
+                patch('trade_modes.wait_until', new=AsyncMock()) as wait:
+            with self.assertRaises(OperatorStopped):
+                await run_mode(self.journal, state, asyncio.Event(), None)
+        self.assertEqual(read.await_count, 2)
+        trade.assert_awaited_once()
+        wait.assert_awaited_once()
+        self.assertEqual(len(self.journal.cycles()), 1)
+        self.assertNotIn('mexc_read_waiting', state)
+
+    async def test_cash_network_return_read_timeout_retries_same_cycle(self):
+        self.journal.abandon(self.cycle_id)
+        state = begin_mode(self.journal, 'cash_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env_for(1) | {
+                               'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'})
+        cycle_id = self.journal.create(dict(self.spec, automatic=True,
+            scheduler_mode='cash_volume', p1_profile='p1', p2_profile='1',
+            cash_return_route='network', series={'count': 1}))
+        state['active_cycle'] = cycle_id
+        with patch('trade_modes._finish_cash_network_return', new_callable=AsyncMock,
+                   side_effect=[MexcReadUnavailable('MEXC read request failed (ConnectTimeout)'),
+                                OperatorStopped('stop')]) as finish, \
+                patch('trade_modes.wait_until', new=AsyncMock()) as wait:
+            with self.assertRaises(OperatorStopped):
+                await run_mode(self.journal, state, asyncio.Event(), None)
+        self.assertEqual(finish.await_count, 2)
+        wait.assert_awaited_once()
+        self.assertEqual(state['active_cycle'], cycle_id)
 
     async def test_cash_ads_runtime_timeout_waits_and_resumes_same_cycle(self):
         self.journal.abandon(self.cycle_id)

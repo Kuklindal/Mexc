@@ -978,6 +978,20 @@ def _switch_rejected_cash_reverse(journal, state, cycle_id, profile):
 async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None, sheets=None):
     from main import build_parser
 
+    async def wait_transient(exc):
+        state['status'] = 'waiting'
+        state['last_error'] = str(exc)[:300]
+        if isinstance(exc, MexcReadUnavailable):
+            state['mexc_read_waiting'] = True
+        save_state(journal, state)
+        try:
+            await wait_until(datetime.now(timezone.utc) + timedelta(seconds=30), stop_event)
+        finally:
+            state.pop('mexc_read_waiting', None)
+            if not stop_event.is_set():
+                state['status'] = 'running'
+            save_state(journal, state)
+
     async def refresh_eflp_progress():
         if sheets:
             from sheets import GoogleSheetsError
@@ -1005,6 +1019,7 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
         restore_cash_unique_progress(journal, state, sales)
         save_state(journal, state)
 
+    state.pop('mexc_read_waiting', None)
     state['status'] = 'running'
     save_state(journal, state)
     sheet_checked = False
@@ -1054,7 +1069,10 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                 _record_forward(journal, state, cycle_id)
                 if (state['mode'] == 'cash_volume'
                         and cycle['spec'].get('cash_return_route') == 'network'):
-                    await _finish_cash_network_return(journal, state, cycle_id, profile, stop_event)
+                    try:
+                        await _finish_cash_network_return(journal, state, cycle_id, profile, stop_event)
+                    except MexcReadUnavailable as exc:
+                        await wait_transient(exc)
                     continue
                 if cycle['status'] == 'completed':
                     if state.get('terminal_pending'):
@@ -1110,12 +1128,7 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                                           notify_prepare_errors=False, telegram_keyboard=telegram_keyboard)
                     except (MexcReadUnavailable, MexcChatUnavailable, MexcMutationUnknown,
                             AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable) as exc:
-                        state['status'] = 'waiting'
-                        state['last_error'] = str(exc)[:300]
-                        save_state(journal, state)
-                        await wait_until(datetime.now(timezone.utc) + timedelta(seconds=30), stop_event)
-                        state['status'] = 'running'
-                        save_state(journal, state)
+                        await wait_transient(exc)
                         continue
                     except MexcAPIError as exc:
                         if exc.code != 700003 or exc.http_status != 400:
@@ -1173,7 +1186,11 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                     if not candidates:
                         raise Paused('Нет П2, отличного от обоих П1, для финального ордера')
                     profile = state.get('last_profile') if state.get('last_profile') in candidates else candidates[-1]
-                    amount, quantity = await _final_order(state, target)
+                    try:
+                        amount, quantity = await _final_order(state, target)
+                    except MexcReadUnavailable as exc:
+                        await wait_transient(exc)
+                        continue
                     state['terminal_pending'] = {'kind': ('cash_final' if cash_unique_done else
                                                           'eflp_cross' if target else 'eflp_last'),
                                                  'from': state['p1_profile'], 'to': target,
@@ -1207,8 +1224,12 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                 next_cash_maker = (_next_maker(state)
                                    if state['mode'] == 'cash_unique' and len(state['unique_done']) == 24
                                    else None)
-                amount = await choose_mode_amount(state['mode'], state['p1_profile'], profile, state,
-                                                  journal=journal, reverse_p1_key=next_cash_maker)
+                try:
+                    amount = await choose_mode_amount(state['mode'], state['p1_profile'], profile, state,
+                                                      journal=journal, reverse_p1_key=next_cash_maker)
+                except MexcReadUnavailable as exc:
+                    await wait_transient(exc)
+                    continue
                 if amount is None:
                     if state['mode'] == 'cash_volume':
                         _defer_cash_limit(journal, state, profile)
@@ -1256,12 +1277,7 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                 continue
             except (MexcReadUnavailable, MexcChatUnavailable, MexcMutationUnknown,
                     AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable) as exc:
-                state['status'] = 'waiting'
-                state['last_error'] = str(exc)[:300]
-                save_state(journal, state)
-                await wait_until(datetime.now(timezone.utc) + timedelta(seconds=30), stop_event)
-                state['status'] = 'running'
-                save_state(journal, state)
+                await wait_transient(exc)
                 continue
             except MexcAPIError as exc:
                 if exc.code != 700003 or exc.http_status != 400:
