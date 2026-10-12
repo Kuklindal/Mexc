@@ -284,6 +284,54 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quantity, '89.0000')
         self.assertEqual(amount, '8900.00 RUB')
 
+    async def test_eflp_volume_switch_leaves_100_usdt_in_old_sell_ad(self):
+        from trade_modes import _final_order
+        env = {'MEXC_P1_2_BUY_ADV_NO': 'next-buy', 'MEXC_P1_2_FIAT': 'GEL'}
+        old_profile = type('P', (), {'key': 'p1', 'sell_adv_no': 'old-sell'})()
+        next_profile = type('P', (), {'key': 'p1_2', 'prefix': 'MEXC_P1_2'})()
+        settings = type('S', (), {'api_key': 'x', 'secret_key': 'y',
+                                  'base_url': 'https://example.test',
+                                  'recv_window': 1000, 'proxy_url': None})()
+        old_ad = {'advNo': 'old-sell', 'side': 'SELL', 'coinName': 'USDT',
+                  'advStatus': 'OPEN', 'fiatUnit': 'GEL', 'availableQuantity': '250.1234',
+                  'price': '2.5', 'minSingleTransAmount': '20',
+                  'maxSingleTransAmount': '1000'}
+        next_buy = dict(old_ad, advNo='next-buy', side='BUY', availableQuantity='1000')
+        old_client = type('Client', (), {'get_ad': AsyncMock(return_value=old_ad),
+                                         'close': AsyncMock()})()
+        next_client = type('Client', (), {'get_ad': AsyncMock(return_value=next_buy),
+                                          'close': AsyncMock()})()
+        with (patch('trade_modes.profile_from_env', side_effect=[old_profile, next_profile]),
+              patch('trade_modes.settings_for_profile', return_value=settings),
+              patch('trade_modes.MexcP2PClient', side_effect=[old_client, next_client]),
+              patch('trade_modes.random.randint') as random_reserve):
+            amount, quantity = await _final_order(
+                {'mode': 'eflp_volume', 'p1_profile': 'p1'}, 'p1_2', env=env)
+        self.assertEqual(quantity, '150.1234')
+        self.assertEqual(amount, '375.30 GEL')
+        self.assertEqual(Decimal(old_ad['availableQuantity']) - Decimal(quantity), Decimal('100'))
+        random_reserve.assert_not_called()
+        old_client.close.assert_awaited_once()
+        next_client.close.assert_awaited_once()
+
+    async def test_eflp_volume_switch_rejects_reserve_below_ad_minimum(self):
+        from trade_modes import _final_order
+        env = env_for(1)
+        ad = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL', 'coinName': 'USDT',
+              'advStatus': 'OPEN', 'fiatUnit': 'RUB', 'availableQuantity': '300',
+              'price': '100', 'minSingleTransAmount': '10001',
+              'maxSingleTransAmount': '40000'}
+        fake = type('Client', (), {'get_ad': AsyncMock(return_value=ad),
+                                   'close': AsyncMock()})()
+        with (patch('trade_modes.settings_for_profile', return_value=type('S', (), {
+                'api_key': 'x', 'secret_key': 'y', 'base_url': 'https://example.test',
+                'recv_window': 1000, 'proxy_url': None})()),
+              patch('trade_modes.MexcP2PClient', return_value=fake)):
+            with self.assertRaisesRegex(Paused, '100 USDT'):
+                await _final_order({'mode': 'eflp_volume', 'p1_profile': 'p1'},
+                                   'p1_2', env=env)
+        fake.close.assert_awaited_once()
+
     async def test_final_reserve_must_keep_sell_ad_above_its_minimum(self):
         from trade_modes import _final_order
         env = env_for(1)

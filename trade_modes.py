@@ -79,7 +79,7 @@ def _next_maker(state: dict) -> str | None:
 
 
 async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -> tuple[str, str]:
-    """Buy the old SELL ad's residual except 10–12 USDT; check live limits."""
+    """Buy the old SELL ad's residual while keeping its mode-specific reserve."""
     maker = profile_from_env(state['p1_profile'], env)
     settings = settings_for_profile(maker.key)
     client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url,
@@ -92,16 +92,23 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
         maximum = Decimal(str(ad['maxSingleTransAmount']))
         if not all(value.is_finite() and value > 0 for value in (available, price, minimum, maximum)):
             raise Paused('Некорректный остаток, цена или лимиты SELL-объявления П1')
-        reserve_floor = max(1000, int((minimum / price * 100).to_integral_value(rounding=ROUND_UP)))
-        if reserve_floor > 1200:
-            raise Paused('Для сохранения доступности SELL-объявления его минимум превышает резерв 12 USDT')
-        reserve = Decimal(random.randint(reserve_floor, 1200)) / 100
+        volume_transition = state['mode'] == 'eflp_volume' and next_maker is not None
+        if volume_transition:
+            reserve = Decimal('100')
+            if reserve * price < minimum:
+                raise Paused('Для сохранения доступности SELL-объявления его минимум превышает резерв 100 USDT')
+        else:
+            reserve_floor = max(1000, int((minimum / price * 100).to_integral_value(rounding=ROUND_UP)))
+            if reserve_floor > 1200:
+                raise Paused('Для сохранения доступности SELL-объявления его минимум превышает резерв 12 USDT')
+            reserve = Decimal(random.randint(reserve_floor, 1200)) / 100
+        reserve_label = '100 USDT' if volume_transition else '10–12 USDT'
         quantity = (available - reserve).quantize(Decimal('0.0001'), rounding=ROUND_DOWN)
         if quantity <= 0:
-            raise Paused('Остатка SELL-объявления П1 недостаточно для финального выкупа с резервом 10–12 USDT')
+            raise Paused(f'Остатка SELL-объявления П1 недостаточно для финального выкупа с резервом {reserve_label}')
         fiat_amount = quantity * price
         if not minimum <= fiat_amount <= maximum:
-            raise Paused('Весь остаток SELL-объявления минус 10–12 USDT не помещается в лимиты одного ордера')
+            raise Paused(f'Весь остаток SELL-объявления минус {reserve_label} не помещается в лимиты одного ордера')
         if next_maker:
             next_profile = profile_from_env(next_maker, env)
             next_settings = settings_for_profile(next_maker)
