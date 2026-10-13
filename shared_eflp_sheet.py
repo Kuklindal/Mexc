@@ -14,7 +14,7 @@ from journal import process_lock
 from sheets import (EFLP_META_HEADER, EFLP_WEEKLY_MARKER, HEADER, SHARED_CYCLE_HEADER,
                     WEEK_SALES_FORMULA, WEEK_START_FORMULA, GoogleSheetsError,
                     _complete_sale_cycle, eflp_meta_values, eflp_weekly_formulas,
-                    sale_values, sheet_number, week_choices)
+                    sale_values, sheet_number, validate_eflp_visitors_column, week_choices)
 
 
 @asynccontextmanager
@@ -232,6 +232,7 @@ async def send_weekly(sheet, sales, journal):
         if existing and any(any(value != '' for value in row) for row in existing):
             if existing[0][0] != EFLP_WEEKLY_MARKER:
                 raise GoogleSheetsError('Столбцы F:J заняты другой сводкой')
+        validate_eflp_visitors_column(existing)
         selected, choices = week_choices(all_sales,
             existing[0][1] if existing and len(existing[0]) > 1 else None)
         rows = eflp_weekly_formulas(all_sales, selected, len(existing))

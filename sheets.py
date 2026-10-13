@@ -24,6 +24,7 @@ HEADER = ["Сумма продажи (USDT)", "Дата (Красноярск)",
 WEEKLY_MARKER = "Недельная сводка MEXC"
 EFLP_WEEKLY_MARKER = "Недельная сводка Eflp"
 EFLP_MARKER = "П1"
+EFLP_VISITORS_HEADER = "Уникальные П2 (полный цикл)"
 OLD_EFLP_MARKER = "Eflp: аккаунт П1"
 OLD_EFLP_META_HEADER = ["П1 для сводки Eflp", "Режим", "MEMBER_ID П2"]
 EFLP_META_HEADER = ["Ключ П1 для сводки Eflp", "Режим", "MEMBER_ID П2"]
@@ -167,13 +168,38 @@ def eflp_formulas(sales: list[dict], row_count: int, *, first_data_row: int = 2,
     return rows
 
 
+def eflp_unique_profiles_formula(key: str) -> str:
+    """Show one P2 nickname per completed member in the selected week."""
+    conditions = ';'.join((f'$R$2:$R="{key}"',
+                           'REGEXMATCH($S$2:$S;"^eflp_(volume|unique)_done$")',
+                           '$U$2:$U>=$U$1', '$U$2:$U<($U$1+7)', '$T$2:$T<>""'))
+    return (f'=IFERROR(LET(members;FILTER($T$2:$T;{conditions});'
+            f'names;FILTER($D$2:$D;{conditions});'
+            'TEXTJOIN(", ";TRUE;MAP(UNIQUE(members);'
+            'LAMBDA(member;INDEX(names;MATCH(member;members;0))))));"")')
+
+
 def eflp_weekly_formulas(sales: list[dict], selected: str, row_count: int) -> list[list[str]]:
     table = eflp_formulas(sales, max(2, row_count - 1), first_data_row=3,
                           unique_col='G', sales_col='H')
     rows = [[EFLP_WEEKLY_MARKER, selected, 'До (не включительно)',
              '=TEXT($U$1+7;"dd.mm.yyyy hh:mm")&" МСК"', '']]
-    rows.extend([row + [''] for row in table])
+    rows.extend([row + [EFLP_VISITORS_HEADER if index == 0 else '']
+                 for index, row in enumerate(table)])
+    accounts = {sale.get('p1_profile') or 'p1' for sale in sales
+                if sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}}
+    for index, key in enumerate(sorted(accounts), 2):
+        rows[index][4] = eflp_unique_profiles_formula(key)
     return rows
+
+
+def validate_eflp_visitors_column(existing: list[list]) -> None:
+    """Do not replace unrelated values in the previously unused J column."""
+    if (existing and existing[0] and existing[0][0] == EFLP_WEEKLY_MARKER
+            and any(len(row) > 4 and row[4] != '' for row in existing)
+            and (len(existing) < 2 or len(existing[1]) < 5
+                 or existing[1][4] != EFLP_VISITORS_HEADER)):
+        raise GoogleSheetsError('Столбец J занят; список уникальных П2 не перезаписал чужие данные')
 
 
 def sheet_number(value) -> Decimal:
@@ -445,6 +471,8 @@ class GoogleSheets:
                 not existing[0] or existing[0][0] not in
                 ({WEEKLY_MARKER, EFLP_WEEKLY_MARKER} if eflp else {WEEKLY_MARKER})):
             raise GoogleSheetsError("Столбцы F:J заняты; недельная сводка не перезаписала чужие данные")
+        if eflp:
+            validate_eflp_visitors_column(existing)
         selected, choices = week_choices(sales, existing[0][1] if existing and len(existing[0]) > 1 else None)
         rows = (eflp_weekly_formulas(sales, selected, len(existing)) if eflp else
                 weekly_formulas(sales, selected, len(existing)))

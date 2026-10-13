@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 from journal import Journal
-from sheets import (EFLP_META_HEADER, HEADER, GoogleSheets, SHARED_CYCLE_HEADER,
+from sheets import (EFLP_META_HEADER, EFLP_VISITORS_HEADER, HEADER, GoogleSheets, SHARED_CYCLE_HEADER,
                     eflp_meta_values, sale_values)
 from trade_modes import next_profile, restore_eflp_progress
 
@@ -92,6 +92,11 @@ class SharedEflpSheetTests(unittest.IsolatedAsyncioTestCase):
         await self.sheet.send_weekly(self.unique.sales(), self.unique)
         self.assertEqual(self.columns['R:T'][1], eflp_meta_values(first, completed=True))
         self.assertEqual(self.columns['R:T'][2], eflp_meta_values(second, completed=True))
+        report = self.sheet.batch_update.await_args.args[0][1]['updateCells']['rows']
+        self.assertEqual(report[1]['values'][4]['userEnteredValue']['stringValue'],
+                         EFLP_VISITORS_HEADER)
+        self.assertIn('"p1_3"', report[2]['values'][4]['userEnteredValue']['formulaValue'])
+        self.assertIn('"p1_4"', report[3]['values'][4]['userEnteredValue']['formulaValue'])
 
         # The second journal can count an already completed P2 from the same
         # tab, even though that sale belongs to the first journal.

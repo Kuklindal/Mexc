@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 from journal import Journal
 from datetime import datetime, timedelta, timezone
 
-from sheets import (_complete_sale_cycle, EFLP_MARKER, EFLP_WEEKLY_MARKER, OLD_EFLP_MARKER,
+from sheets import (_complete_sale_cycle, EFLP_MARKER, EFLP_WEEKLY_MARKER, EFLP_VISITORS_HEADER, OLD_EFLP_MARKER,
                      EFLP_META_HEADER, OLD_EFLP_META_HEADER,
                      GoogleSheets, GoogleSheetsError, HEADER, Reporter,
                      WEEKLY_MARKER, WEEK_START_FORMULA, WEEK_SALES_FORMULA,
@@ -157,6 +157,13 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('COUNTUNIQUEIFS', value(2, 1))
         self.assertIn('SUMIFS', value(2, 2))
         self.assertEqual(value(2, 3), '=IF(AND(G3>=20;H3>20000);90;0)')
+        self.assertEqual(value(1, 4), EFLP_VISITORS_HEADER)
+        visitors = value(2, 4)
+        self.assertIn('UNIQUE(members)', visitors)
+        self.assertIn('INDEX(names;MATCH(member;members;0))', visitors)
+        self.assertIn('^eflp_(volume|unique)_done$', visitors)
+        self.assertIn('$U$1+7', visitors)
+        self.assertIn('"p1_3"', visitors)
         self.assertEqual(writes[2]['updateCells']['rows'][0]['values'], [{}, {}, {}, {}])
 
     async def test_existing_profile_ids_become_saved_nicknames_without_changing_sales(self):
@@ -312,6 +319,13 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.existing_eflp = [['custom data']]
         with self.assertRaises(GoogleSheetsError):
             await self.sheets.send_weekly(self.journal.sales())
+        self.sheets.batch_update.assert_not_awaited()
+
+    async def test_eflp_summary_rejects_occupied_visitors_column(self):
+        self.existing_summary = [[EFLP_WEEKLY_MARKER], ['', '', '', '', 'Мои данные']]
+        with patch.dict(os.environ, {'EFLP_P1_PROFILES': 'p1'}):
+            with self.assertRaisesRegex(GoogleSheetsError, 'Столбец J занят'):
+                await self.sheets.send_weekly(self.journal.sales())
         self.sheets.batch_update.assert_not_awaited()
 
     async def test_weekly_summary_does_not_overwrite_occupied_neighbor_cells(self):
