@@ -16,6 +16,16 @@ def ad(status='CLOSE', number=AD_NO):
 
 
 class EflpAdTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reverse_replenish_validates_sell_ad_as_sell(self):
+        runner = CycleRunner.__new__(CycleRunner)
+        runner.spec = {'scheduler_mode': 'eflp_volume', 'fiat': 'TJS'}
+        runner.clients = {'p1': MagicMock(get_ad=AsyncMock(return_value={
+            **ad('OPEN'), 'side': 'SELL'}))}
+        runner.browser = MagicMock()
+        runner.reverse_browser = None
+        result = await runner.ensure_eflp_ad_online(AD_NO, 'reverse', side='SELL')
+        self.assertEqual(result['side'], 'SELL')
+
     async def test_offline_ad_is_published_before_trading(self):
         client = MagicMock(get_ad=AsyncMock(return_value=ad('OPEN')))
         browser = MagicMock(ensure_started=AsyncMock(), ensure_mexc_page=AsyncMock(),
@@ -91,13 +101,13 @@ class EflpAdTests(unittest.IsolatedAsyncioTestCase):
         runner.check_browser_ad = AsyncMock()
         runner.ensure_eflp_ad_online = AsyncMock()
         plan = {'method': 'quantity_only', 'adv_no': AD_NO, 'quantity': '100',
-                'side': 'BUY', 'fiat': 'TJS'}
+                'side': 'SELL', 'fiat': 'TJS'}
         runner.quantity_plan.return_value = plan
-        result = await runner.execute(Step('reverse_replenish_buy', 'p1', ''),
+        result = await runner.execute(Step('reverse_replenish', 'p1', ''),
                                       plan, recovery=False)
         self.assertEqual(result, plan)
         runner.browser.replenish_ad.assert_awaited_once_with(plan)
-        runner.ensure_eflp_ad_online.assert_awaited_once_with(AD_NO, 'reverse')
+        runner.ensure_eflp_ad_online.assert_awaited_once_with(AD_NO, 'reverse', side='SELL')
 
     async def test_explicit_quantity_refusal_publishes_then_retries_once(self):
         runner = CycleRunner.__new__(CycleRunner)
@@ -122,3 +132,26 @@ class EflpAdTests(unittest.IsolatedAsyncioTestCase):
         await runner.execute(Step('reverse_replenish_buy', 'p1', ''), plan, recovery=False)
         self.assertEqual(runner.browser.replenish_ad.await_count, 2)
         self.assertEqual(runner.ensure_eflp_ad_online.await_count, 2)
+        self.assertTrue(all(call.kwargs.get('side') == 'BUY'
+                            for call in runner.ensure_eflp_ad_online.await_args_list))
+
+    async def test_recovery_of_sell_replenishment_checks_without_adding_again(self):
+        runner = CycleRunner.__new__(CycleRunner)
+        runner.spec = {'mode': 'api', 'scheduler_mode': 'eflp_volume', 'fiat': 'TJS'}
+        runner.automatic = False
+        runner.clients = {'p1': MagicMock(get_ad=AsyncMock(return_value={
+            **ad('OPEN'), 'side': 'SELL'}))}
+        runner.browser = MagicMock(replenish_ad=AsyncMock())
+        runner.reverse_browser = None
+        runner.maker_browser = None
+        runner.snapshot = AsyncMock(return_value={'state': 'DONE'})
+        runner.check_state = MagicMock()
+        runner.check_replenished = MagicMock()
+        runner.check_browser_ad = AsyncMock()
+        runner.ensure_eflp_ad_online = AsyncMock()
+        plan = {'method': 'quantity_only', 'adv_no': AD_NO, 'quantity': '100',
+                'side': 'SELL', 'fiat': 'TJS'}
+        await runner.execute(Step('reverse_replenish', 'p1', ''), plan, recovery=True)
+        runner.browser.replenish_ad.assert_not_awaited()
+        runner.ensure_eflp_ad_online.assert_awaited_once()
+        self.assertEqual(runner.ensure_eflp_ad_online.await_args.kwargs['side'], 'SELL')
