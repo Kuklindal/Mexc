@@ -1068,6 +1068,9 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
     async def refresh_eflp_progress():
         if sheets:
             from sheets import GoogleSheetsError
+            state['status'] = 'waiting'
+            state['sheets_waiting'] = True
+            save_state(journal, state)
             try:
                 sales = await sheets.read_eflp_sales(journal)
             except GoogleSheetsRateLimited:
@@ -1077,9 +1080,16 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
             except Exception as exc:
                 raise Paused(f'Не удалось прочитать прогресс Eflp из Google Таблицы '
                              f'({type(exc).__name__}); новый ордер не открыт') from exc
+            finally:
+                state.pop('sheets_waiting', None)
+                if not stop_event.is_set():
+                    state['status'] = 'running'
+                save_state(journal, state)
         else:
             sales = journal.sales()
         restore_eflp_progress(journal, state, sales)
+        if 'Google Sheets HTTP 429' in state.get('last_error', ''):
+            state.pop('last_error', None)
         save_state(journal, state)
 
     async def refresh_cash_unique_progress():

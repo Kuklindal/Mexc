@@ -729,6 +729,10 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_eflp_rate_limit_waits_and_retries_without_losing_progress(self):
         from sheets import GoogleSheetsRateLimited
 
+        async def final_order(*args):
+            self.assertNotIn('last_error', state)
+            raise Paused('final order preflight')
+
         self.journal.abandon(self.cycle_id)
         env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
         state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
@@ -740,19 +744,22 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
             result={'quantity': '20050'}, context={'amount': '100000', 'quantity': '20050'})
         self.complete(cid, '20050')
         state['active_cycle'] = cid
+        state['last_error'] = ('Не удалось сверить прогресс Eflp с Google Таблицей: '
+                               'Google Sheets HTTP 429; проверьте настройки')
         save_state(self.journal, state)
         sheets = type('Sheets', (), {'read_eflp_sales': AsyncMock(side_effect=[
             GoogleSheetsRateLimited('Google Sheets HTTP 429'), self.journal.sales()])})()
         with (patch.dict(os.environ, env),
               patch('trade_modes.wait_until', new_callable=AsyncMock) as wait,
               patch('trade_modes._final_order', new_callable=AsyncMock,
-                    side_effect=Paused('final order preflight'))):
+                    side_effect=final_order)):
             with self.assertRaisesRegex(Paused, 'final order preflight'):
                 await run_mode(self.journal, state, asyncio.Event(), None, sheets=sheets)
         self.assertEqual(wait.await_count, 1)
         self.assertEqual(sheets.read_eflp_sales.await_count, 2)
         self.assertEqual(state['eflp_volume_by_profile']['1'], '20050')
         self.assertNotIn('sheets_waiting', state)
+        self.assertEqual(state['last_error'], 'final order preflight')
 
     def test_eflp_volume_waits_for_return_when_unfinished_sale_crosses_target(self):
         self.journal.abandon(self.cycle_id)
