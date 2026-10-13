@@ -113,9 +113,11 @@ def rolling_cash_purchases(journal, profile: str, now: datetime | None = None,
             AND s.status IN ('done','in_flight','unknown')
         LEFT JOIN steps completed ON completed.cycle_id=c.id
             AND completed.name='forward_complete' AND completed.status='done'
+        LEFT JOIN steps cancelled ON cancelled.cycle_id=c.id
+            AND cancelled.name='forward_cancel_confirmed' AND cancelled.status='done'
         LEFT JOIN events e ON e.id=(SELECT MIN(id) FROM events
             WHERE cycle_id=c.id AND step='forward_create' AND status IN ('in_flight','done'))
-        WHERE completed.cycle_id IS NULL""").fetchall()
+        WHERE completed.cycle_id IS NULL AND cancelled.cycle_id IS NULL""").fetchall()
     for row in unresolved:
         spec = json.loads(row['spec'])
         saved_member = spec.get('members', {}).get('p2')

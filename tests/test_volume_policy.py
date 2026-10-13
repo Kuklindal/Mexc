@@ -84,4 +84,10 @@ class VolumePolicyTests(unittest.TestCase):
             blocked = rolling_cash_purchases(journal, 'one', now, 'member-one')
             self.assertEqual(blocked['quantity'], '4000')
             self.assertEqual(rolling_cash_retry_at(blocked), now + timedelta(hours=23, minutes=30))
+            journal.transition(uncertain, 'forward_cancel_confirmed', 'system', 'done',
+                               'Both accounts confirmed cancellation',
+                               result={'order_no': 'unknown-order'})
+            resolved = rolling_cash_purchases(journal, 'one', now, 'member-one')
+            self.assertIsNone(resolved['uncertain_until'])
+            self.assertEqual(resolved['quantity'], '4000')
             journal.close()
