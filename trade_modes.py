@@ -95,25 +95,31 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
         maximum = Decimal(str(ad['maxSingleTransAmount']))
         if not all(value.is_finite() and value > 0 for value in (available, price, minimum, maximum)):
             raise Paused('Некорректный остаток, цена или лимиты SELL-объявления П1')
-        eflp_reserve = state['mode'] in {'eflp_volume', 'eflp_unique'}
-        if eflp_reserve:
+        eflp_mode = state['mode'] in {'eflp_volume', 'eflp_unique'}
+        if state['mode'] == 'eflp_volume':
             reserve = Decimal('100')
+        elif state['mode'] == 'eflp_unique':
+            reserve = Decimal('0')
         else:
             reserve_floor = max(1000, int((minimum / price * 100).to_integral_value(rounding=ROUND_UP)))
             if reserve_floor > 1200:
                 raise Paused('Для сохранения доступности SELL-объявления его минимум превышает резерв 12 USDT')
             reserve = Decimal(random.randint(reserve_floor, 1200)) / 100
-        reserve_label = '100 USDT' if eflp_reserve else '10–12 USDT'
+        reserve_label = '100 USDT' if state['mode'] == 'eflp_volume' else '10–12 USDT'
         quantity = (available - reserve).quantize(Decimal('0.0001'), rounding=ROUND_DOWN)
         if quantity <= 0:
+            if state['mode'] == 'eflp_unique':
+                raise Paused('В SELL-объявлении П1 нет доступных USDT для финального выкупа')
             raise Paused(f'Остатка SELL-объявления П1 недостаточно для финального выкупа с резервом {reserve_label}')
         fiat_amount = quantity * price
-        if not eflp_reserve and not minimum <= fiat_amount <= maximum:
+        if not eflp_mode and not minimum <= fiat_amount <= maximum:
             raise Paused(f'Весь остаток SELL-объявления минус {reserve_label} не помещается в лимиты одного ордера')
-        target_minimum = min(minimum, (reserve * price).quantize(Decimal('0.01'), rounding=ROUND_DOWN),
-                             fiat_amount.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
+        target_minimum = min(minimum, fiat_amount.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
+        if reserve:
+            target_minimum = min(target_minimum, (reserve * price).quantize(
+                Decimal('0.01'), rounding=ROUND_DOWN))
         target_maximum = max(maximum, fiat_amount.quantize(Decimal('0.01'), rounding=ROUND_UP))
-        if eflp_reserve and target_minimum < Decimal('0.01'):
+        if eflp_mode and target_minimum < Decimal('0.01'):
             raise Paused('Финальный ордер Eflp меньше 0.01 в валюте объявления; лимиты изменить нельзя')
         if next_maker:
             next_profile = profile_from_env(next_maker, env)
@@ -133,7 +139,7 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
                     raise Paused('Финальный перевод не помещается в лимиты BUY-объявления следующего П1')
             finally:
                 await next_client.close()
-        if eflp_reserve and (target_minimum < minimum or target_maximum > maximum):
+        if eflp_mode and (target_minimum < minimum or target_maximum > maximum):
             browser = maker_browser(maker, env)
             await browser.ensure_started()
             await browser.ensure_mexc_page()
