@@ -70,9 +70,23 @@ async def main() -> None:
                 raise RuntimeError(f'AdsPower не открыл вкладку {host}')
             created_target_ids.add(target_id)
             pages.append({'type': 'page', 'targetId': target_id, 'url': url})
+        if '--open-api' in sys.argv:
+            for host in ('www.mexc.com', 'www.mexc.co'):
+                url = f'https://{host}/api/platform/p2p/api/merchant/order'
+                if any(target.get('url') == url for target in pages):
+                    continue
+                created = await call('Target.createTarget', {
+                    'url': url, 'background': True}, timeout=30)
+                target_id = created.get('targetId')
+                if not target_id:
+                    raise RuntimeError(f'AdsPower не открыл страницу API {host}')
+                created_target_ids.add(target_id)
+                pages.append({'type': 'page', 'targetId': target_id, 'url': url})
         print('Вкладок MEXC:', len(pages), flush=True)
         for target in pages:
-            listed_host = urlsplit(target.get('url', '')).hostname
+            listed_url = urlsplit(target.get('url', ''))
+            listed_host = (listed_url.hostname or '—') + (
+                ' API' if listed_url.path.startswith('/api/') else '')
             try:
                 attached = await call('Target.attachToTarget', {
                     'targetId': target['targetId'], 'flatten': True}, timeout=12)
