@@ -46,6 +46,37 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                                  ['Target.getTargets', 'Target.activateTarget',
                                   'Target.attachToTarget', 'Runtime.evaluate'])
 
+    async def test_eflp_quantity_uses_authorized_alternate_domain(self):
+        adv_no = 'a1835908380845933569'
+        self.browser.alternative_mexc_domains = True
+        co_reads = 0
+        async def answer(method, params=None, session=None, *, timeout=None):
+            nonlocal co_reads
+            if method == 'Target.getTargets':
+                return {'targetInfos': [{'targetId': 'com', 'type': 'page',
+                    'url': 'https://www.mexc.com/ru-RU/buy-crypto/'}]}
+            if method == 'Target.createTarget':
+                self.assertEqual(params['url'],
+                    'https://www.mexc.co/ru-RU/buy-crypto/create-advertising')
+                return {'targetId': 'co'}
+            if method == 'Target.attachToTarget':
+                return {'sessionId': params['targetId']}
+            if method == 'Runtime.evaluate':
+                if session == 'com':
+                    return {'result': {'value': {'error':'read_before_rejected','code':401}}}
+                if 'null' in params['expression'] and co_reads == 0:
+                    co_reads += 1
+                    return {'result': {'value': {'error': 'origin'}}}
+                return {'result': {'value': {'id': adv_no, 'availableQuantity': 100}}}
+            return {}
+        self.call.side_effect = answer
+        with patch('adspower.asyncio.sleep', new=AsyncMock()):
+            result = await self.browser._ad_quantity(adv_no, {'quantity': '10'})
+        self.assertEqual(result['id'], adv_no)
+        evaluations = [c for c in self.call.call_args_list if c.args[0] == 'Runtime.evaluate']
+        self.assertEqual([c.args[2] for c in evaluations], ['com', 'co', 'co', 'co'])
+        self.assertIn('"quantity"', evaluations[-1].args[1]['expression'])
+
     async def test_local_api_read_timeout_retries_without_browser_command(self):
         response = httpx.Response(200, json={'code': 0, 'data': {'status': 'Active',
             'ws': {'puppeteer': 'ws://127.0.0.1:9222/devtools/browser/one'}}})

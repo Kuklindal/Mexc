@@ -1724,6 +1724,10 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 if scheduler_mode == 'cash_volume' and reverse_maker == 'p2':
                     browser.command_timeout = 30
                     maker_browser.command_timeout = 30
+                if scheduler_mode in {'eflp_volume', 'eflp_unique'}:
+                    browser.alternative_mexc_domains = True
+                    if reverse_browser:
+                        reverse_browser.alternative_mexc_domains = True
             browser_ids = ({'p1': browser.profile_id, 'p2': maker_browser.profile_id if maker_browser else '',
                             **({'reverse_p1': reverse_browser.profile_id} if reverse_browser else {})}
                            if browser else {})

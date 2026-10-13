@@ -45,7 +45,8 @@ def _safe_error_location(exc: Exception) -> str:
 # The site's quantity endpoint changes only the available quantity. It does not
 # resave trade requirements like the public save_or_update endpoint does.
 AD_QUANTITY = r"""async (advNo, plan) => {
-    if (location.protocol !== 'https:' || !['mexc.com','www.mexc.com'].includes(location.hostname))
+    if (location.protocol !== 'https:' || !['mexc.com','www.mexc.com',
+            'mexc.co','www.mexc.co','mexc.io','www.mexc.io'].includes(location.hostname))
         return {error:'origin'};
     const root = '/api/platform/p2p/api/merchant/order';
     const read = async stage => {
@@ -193,10 +194,11 @@ def local_url(value: str, schemes: set[str]) -> str:
 
 
 class AdsPower:
-    def __init__(self, base_url: str, api_key: str, profile_id: str):
+    def __init__(self, base_url: str, api_key: str, profile_id: str, *, alternative_mexc_domains: bool = False):
         self.base_url = local_url(base_url.rstrip('/'), {"http", "https"})
         self.api_key, self.profile_id = api_key.strip(), profile_id.strip()
         self.command_timeout = 10
+        self.alternative_mexc_domains = alternative_mexc_domains
 
     @classmethod
     def from_env(cls):
@@ -337,7 +339,9 @@ class AdsPower:
             def is_mexc(target):
                 url = urlsplit(target.get('url', ''))
                 return (target.get('type') == 'page' and url.scheme == 'https'
-                        and url.hostname in {'mexc.com', 'www.mexc.com'})
+                        and url.hostname in ({'mexc.com', 'www.mexc.com', 'mexc.co', 'www.mexc.co',
+                                               'mexc.io', 'www.mexc.io'} if self.alternative_mexc_domains
+                                             else {'mexc.com', 'www.mexc.com'}))
             pages = [target for target in targets if is_mexc(target)]
             if not pages:
                 created = await call('Target.createTarget', {
@@ -694,16 +698,76 @@ class AdsPower:
             raise AdsPowerError("Некорректный номер объявления")
         async with self.connection() as call:
             targets = (await call('Target.getTargets')).get('targetInfos', [])
+            allowed_hosts = ({'mexc.com', 'www.mexc.com', 'mexc.co', 'www.mexc.co',
+                              'mexc.io', 'www.mexc.io'} if self.alternative_mexc_domains
+                             else {'mexc.com', 'www.mexc.com'})
             targets = [t for t in targets if t.get('type') == 'page'
                        and urlsplit(t.get('url', '')).scheme == 'https'
-                       and urlsplit(t.get('url', '')).hostname in {'mexc.com', 'www.mexc.com'}]
+                       and urlsplit(t.get('url', '')).hostname in allowed_hosts]
             if not targets:
                 raise AdsPowerError("Откройте MEXC в профиле П1 AdsPower")
-            target = next((t for t in targets if 'create-advertising' in urlsplit(t['url']).path), targets[0])
-            await call('Target.activateTarget', {'targetId': target['targetId']})
-            session = (await call('Target.attachToTarget', {'targetId': target['targetId'], 'flatten': True}))['sessionId']
-            response = await call('Runtime.evaluate', {'expression': f'({AD_QUANTITY})({json.dumps(adv_no)}, {json.dumps(plan)})',
-                                 'awaitPromise': True, 'returnByValue': True}, session)
+            targets.sort(key=lambda t: 'create-advertising' not in urlsplit(t['url']).path)
+            sessions = {}
+
+            async def evaluate(target_id: str, intended: dict | None):
+                if target_id not in sessions:
+                    await call('Target.activateTarget', {'targetId': target_id})
+                    sessions[target_id] = (await call('Target.attachToTarget', {
+                        'targetId': target_id, 'flatten': True}))['sessionId']
+                return await call('Runtime.evaluate', {
+                    'expression': f'({AD_QUANTITY})({json.dumps(adv_no)}, {json.dumps(intended)})',
+                    'awaitPromise': True, 'returnByValue': True}, sessions[target_id])
+
+            def owns_ad(result: dict) -> bool:
+                value = result.get('result', {}).get('value')
+                return isinstance(value, dict) and value.get('id') == adv_no
+
+            if self.alternative_mexc_domains:
+                # Probe with a read-only request. The quantity POST is sent only
+                # in the one origin where this exact advertisement is visible.
+                selected = None
+                response = None
+                seen_hosts = set()
+                for target in targets:
+                    seen_hosts.add(urlsplit(target['url']).hostname)
+                    try:
+                        response = await evaluate(target['targetId'], None)
+                    except AdsPowerTimeout:
+                        continue
+                    if owns_ad(response):
+                        selected = target['targetId']
+                        break
+                if selected is None:
+                    for host in ('www.mexc.co', 'www.mexc.io'):
+                        if host in seen_hosts:
+                            continue
+                        created = await call('Target.createTarget', {
+                            'url': f'https://{host}/ru-RU/buy-crypto/create-advertising',
+                            'background': True}, timeout=30)
+                        target_id = created.get('targetId')
+                        if not target_id:
+                            continue
+                        for _ in range(15):
+                            await asyncio.sleep(2)
+                            try:
+                                response = await evaluate(target_id, None)
+                            except AdsPowerTimeout:
+                                continue
+                            if owns_ad(response):
+                                selected = target_id
+                                break
+                        if selected:
+                            break
+                        try:
+                            await call('Target.closeTarget', {'targetId': target_id})
+                        except AdsPowerError:
+                            pass
+                if selected and plan is not None:
+                    response = await evaluate(selected, plan)
+                elif selected is None and response is None:
+                    raise AdsPowerUnavailable('AdsPower: не удалось прочитать объявление ни на одном домене MEXC')
+            else:
+                response = await evaluate(targets[0]['targetId'], plan)
             value = response.get('result', {}).get('value')
             if 'exceptionDetails' in response or not isinstance(value, dict) or value.get('id') != adv_no:
                 reason = value.get('error', 'read_failed') if isinstance(value, dict) else 'read_failed'
