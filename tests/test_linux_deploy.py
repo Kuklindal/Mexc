@@ -1,4 +1,5 @@
 import importlib.util
+from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import subprocess
@@ -17,20 +18,30 @@ from main import build_parser
 class LinuxDeployTests(unittest.IsolatedAsyncioTestCase):
     async def test_browser_commands_only_change_requested_profile(self):
         calls = []
+        running = False
 
         async def handler(request):
+            nonlocal running
             calls.append((request.url.path, request.url.params.get('user_id')))
             if request.url.path.endswith('/active'):
-                status = 'Active' if len(calls) > 1 else 'Inactive'
+                status = 'Active' if running else 'Inactive'
                 return httpx.Response(200, json={'code': 0, 'data': {'status': status}})
+            if request.url.path.endswith('/start'):
+                running = True
+            elif request.url.path.endswith('/stop'):
+                running = False
             return httpx.Response(200, json={'code': 0, 'data': {}})
+
+        @asynccontextmanager
+        async def ready_connection(_):
+            yield AsyncMock(return_value={'targetInfos': []})
 
         original_client = httpx.AsyncClient
         configured = SimpleNamespace(base_url='http://127.0.0.1:50325', api_key='test-key')
         with patch.object(manage_adspower_profile.AdsPower, 'from_env', return_value=configured), \
                 patch('adspower.httpx.AsyncClient', side_effect=lambda **_: original_client(
                     transport=httpx.MockTransport(handler))), \
-                patch('adspower.AdsPower.endpoint', new=AsyncMock()), \
+                patch('adspower.AdsPower.connection', ready_connection), \
                 patch('adspower.asyncio.sleep', new=AsyncMock()):
             await manage_adspower_profile.manage_profile('browser-open', 'chosen123')
             await manage_adspower_profile.manage_profile('browser-close', 'chosen123')
@@ -39,7 +50,9 @@ class LinuxDeployTests(unittest.IsolatedAsyncioTestCase):
             ('/api/v1/browser/active', 'chosen123'),
             ('/api/v1/browser/start', 'chosen123'),
             ('/api/v1/browser/active', 'chosen123'),
+            ('/api/v1/browser/active', 'chosen123'),
             ('/api/v1/browser/stop', 'chosen123'),
+            ('/api/v1/browser/active', 'chosen123'),
         ])
         self.assertEqual(build_parser().parse_args(['browser-open', 'chosen123']).profile_id,
                          'chosen123')

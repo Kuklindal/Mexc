@@ -19,7 +19,7 @@ async def manage_profile(command: str, profile_id: str) -> None:
         await browser.ensure_started()
         print(f"AdsPower: профиль {profile_id} открыт", flush=True)
     elif command == "browser-close":
-        await browser.stop_profile()
+        await browser.ensure_stopped()
         print(f"AdsPower: профиль {profile_id} закрыт", flush=True)
     else:
         raise ValueError(f"Неизвестная команда управления AdsPower: {command}")

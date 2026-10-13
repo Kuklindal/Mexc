@@ -117,13 +117,35 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_profile_start_waits_for_generic_active_check_failure(self):
         refused = httpx.Response(200, json={'code': -1, 'msg': 'failed', 'data': {}})
         active = httpx.Response(200, json={'code': 0, 'data': {'status': 'Active'}})
+        @asynccontextmanager
+        async def ready_connection():
+            yield AsyncMock(return_value={'targetInfos': []})
         with patch('adspower.httpx.AsyncClient') as factory, \
                 patch('adspower.asyncio.sleep', new=AsyncMock()) as sleep, \
-                patch.object(self.browser, 'endpoint', new=AsyncMock(return_value='ws://127.0.0.1:9222/debug')):
+                patch.object(self.browser, 'connection', ready_connection):
             client = factory.return_value.__aenter__.return_value
             client.get = AsyncMock(side_effect=[refused, active])
             await self.browser.ensure_started()
         self.assertEqual(client.get.await_count, 2)
+        sleep.assert_awaited_once_with(5)
+
+    async def test_profile_start_waits_for_real_cdp_response(self):
+        active = httpx.Response(200, json={'code': 0, 'data': {'status': 'Active'}})
+        attempts = 0
+        @asynccontextmanager
+        async def starting_connection():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise AdsPowerUnavailable('CDP port not ready')
+            yield AsyncMock(return_value={'targetInfos': []})
+        with patch('adspower.httpx.AsyncClient') as factory, \
+                patch('adspower.asyncio.sleep', new=AsyncMock()) as sleep, \
+                patch.object(self.browser, 'connection', starting_connection):
+            client = factory.return_value.__aenter__.return_value
+            client.get = AsyncMock(return_value=active)
+            await self.browser.ensure_started()
+        self.assertEqual(attempts, 2)
         sleep.assert_awaited_once_with(5)
 
     async def test_payment_method_read_returns_only_unique_account_id(self):

@@ -353,6 +353,7 @@ class AdsPower:
         headers = {'Authorization': 'Bearer ' + self.api_key}
         async with httpx.AsyncClient(timeout=max(15, self.command_timeout), trust_env=False) as client:
             started = False
+            cdp_failures = 0
             for _ in range(24):
                 try:
                     response = await client.get(self.base_url + '/api/v1/browser/active',
@@ -370,8 +371,19 @@ class AdsPower:
                 if payload.get('code') != 0:
                     raise AdsPowerError('AdsPower отклонил проверку профиля')
                 if payload.get('data', {}).get('status') == 'Active':
-                    await self.endpoint()
-                    return
+                    try:
+                        async with self.connection() as call:
+                            await call('Target.getTargets', timeout=self.command_timeout)
+                        return
+                    except AdsPowerError:
+                        # Local API may report Active while the browser's CDP
+                        # port is still starting or belongs to a closing process.
+                        cdp_failures += 1
+                        if cdp_failures >= 6:
+                            raise AdsPowerUnavailable(
+                                'AdsPower пометил профиль активным, но браузер не отвечает на команды') from None
+                        await asyncio.sleep(5)
+                        continue
                 if not started:
                     response = await client.get(self.base_url + '/api/v1/browser/start',
                                                 params={'user_id': self.profile_id, 'headless': 1}, headers=headers)
