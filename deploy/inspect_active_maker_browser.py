@@ -52,16 +52,33 @@ async def main() -> None:
         targets = (await call('Target.getTargets', timeout=15)).get('targetInfos', [])
         pages = [target for target in targets if target.get('type') == 'page'
                  and 'mexc' in (urlsplit(target.get('url', '')).hostname or '')]
+        created_target_id = None
+        if '--open-co' in sys.argv and not any(
+                urlsplit(target.get('url', '')).hostname == 'www.mexc.co' for target in pages):
+            created = await call('Target.createTarget', {
+                'url': 'https://www.mexc.co/ru-RU/buy-crypto/create-advertising',
+                'background': True}, timeout=30)
+            created_target_id = created.get('targetId')
+            if not created_target_id:
+                raise RuntimeError('AdsPower не открыл вкладку www.mexc.co')
+            pages.append({'type': 'page', 'targetId': created_target_id,
+                          'url': 'https://www.mexc.co/ru-RU/buy-crypto/create-advertising'})
         print('Вкладок MEXC:', len(pages), flush=True)
         for target in pages:
             listed_host = urlsplit(target.get('url', '')).hostname
             try:
                 attached = await call('Target.attachToTarget', {
                     'targetId': target['targetId'], 'flatten': True}, timeout=12)
-                result = await call('Runtime.evaluate', {
-                    'expression': expression, 'awaitPromise': True,
-                    'returnByValue': True}, attached['sessionId'], timeout=15)
-                value = result.get('result', {}).get('value')
+                value = None
+                for attempt in range(10 if target.get('targetId') == created_target_id else 1):
+                    if attempt:
+                        await asyncio.sleep(2)
+                    result = await call('Runtime.evaluate', {
+                        'expression': expression, 'awaitPromise': True,
+                        'returnByValue': True}, attached['sessionId'], timeout=15)
+                    value = result.get('result', {}).get('value')
+                    if isinstance(value, dict) and value.get('ready') == 'complete' and 'code' in value:
+                        break
                 if result.get('exceptionDetails') or not isinstance(value, dict):
                     print('Вкладка:', listed_host, 'JS не ответил', flush=True)
                 else:
