@@ -48,10 +48,18 @@ AD_QUANTITY = r"""async (advNo, plan) => {
     if (location.protocol !== 'https:' || !['mexc.com','www.mexc.com'].includes(location.hostname))
         return {error:'origin'};
     const root = '/api/platform/p2p/api/merchant/order';
-    const read = async () => {
-        const response = await fetch(root + '/' + advNo, {method:'GET',credentials:'same-origin',cache:'no-store'});
-        const body = await response.json(), d = body.data;
-        if (!response.ok || body.code !== 0 || !d || d.id !== advNo) throw new Error('ad_read');
+    const read = async stage => {
+        let response, body;
+        try {
+            response = await fetch(root + '/' + advNo, {method:'GET',credentials:'same-origin',cache:'no-store'});
+            body = await response.json();
+        } catch (_) {
+            return {error:stage + '_network'};
+        }
+        if (!response.ok || body?.code !== 0)
+            return {error:stage + '_rejected',http:response.status,code:body?.code ?? null};
+        const d = body.data;
+        if (!d || d.id !== advNo) return {error:stage + '_mismatch'};
         return {id:d.id, availableQuantity:d.availableQuantity, frozenQuantity:d.frozenQuantity,
             overVerify:d.overVerify ?? null,
             coinName:d.coinName, currency:d.currency, tradeType:d.tradeType};
@@ -63,7 +71,8 @@ AD_QUANTITY = r"""async (advNo, plan) => {
         if (data.types.includes(6)) result.otherText = data.otherText;
         return JSON.stringify(result);
     };
-    const before = await read();
+    const before = await read('read_before');
+    if (before.error) return before;
     if (!plan) return before;
     const total = d => Number(d.availableQuantity) + Number(d.frozenQuantity);
     const sameTotal = (d, expected) => Number.isFinite(total(d)) && Number.isFinite(Number(expected))
@@ -73,11 +82,18 @@ AD_QUANTITY = r"""async (advNo, plan) => {
             || (plan.target_total !== undefined ? !sameTotal(before, plan.before_total)
                 : Number(before.availableQuantity) !== Number(plan.before_available))
             || verification(before.overVerify) !== verification(plan.over_verify)) return {error:'ad_changed'};
-    const response = await fetch(root + '/quantity', {method:'POST',credentials:'same-origin',
-        body:new URLSearchParams({id:advNo,quantity:plan.quantity})});
-    const body = await response.json();
-    if (!response.ok || body.code !== 0) return {error:'quantity_rejected',code:body.code,http:response.status};
-    const after = await read();
+    let response, body;
+    try {
+        response = await fetch(root + '/quantity', {method:'POST',credentials:'same-origin',
+            body:new URLSearchParams({id:advNo,quantity:plan.quantity})});
+        body = await response.json();
+    } catch (_) {
+        return {error:'quantity_reply_unknown'};
+    }
+    if (!response.ok || body?.code !== 0)
+        return {error:'quantity_rejected',code:body?.code ?? null,http:response.status};
+    const after = await read('read_after');
+    if (after.error) return after;
     if ((plan.target_total !== undefined ? !sameTotal(after, plan.target_total)
             : Number(after.availableQuantity) !== Number(plan.target_available))
             || verification(after.overVerify) !== verification(before.overVerify)) return {error:'result_mismatch'};
@@ -681,8 +697,17 @@ class AdsPower:
             value = response.get('result', {}).get('value')
             if 'exceptionDetails' in response or not isinstance(value, dict) or value.get('id') != adv_no:
                 reason = value.get('error', 'read_failed') if isinstance(value, dict) else 'read_failed'
-                raise AdsPowerError(f"MEXC: пополнение/чтение объявления через браузер не подтверждено ({reason}). "
-                                    "Повторного запроса не будет; проверьте остаток и дополнительную проверку на сайте")
+                detail = (f"; HTTP {value['http']}" if isinstance(value, dict) and isinstance(value.get('http'), int) else '')
+                detail += (f"; MEXC {value['code']}" if isinstance(value, dict) and isinstance(value.get('code'), int) else '')
+                message = f"MEXC: чтение/пополнение объявления через браузер не подтверждено ({reason}{detail})"
+                if reason in {'read_before_network', 'read_before_rejected'}:
+                    raise AdsPowerUnavailable(message + '; запрос пополнения не отправлен')
+                if plan and reason in {'read_failed', 'quantity_reply_unknown', 'read_after_network',
+                                       'read_after_rejected', 'read_after_mismatch', 'result_mismatch'}:
+                    raise AdsPowerClickUnknown(message + '; перед повтором требуется сверка остатка')
+                if not plan and reason == 'read_failed':
+                    raise AdsPowerUnavailable(message + '; запрос пополнения не отправлен')
+                raise AdsPowerError(message + '; проверьте профиль и объявление на MEXC')
             return value
 
     async def verification_state(self, call, session, order_no: str) -> str:

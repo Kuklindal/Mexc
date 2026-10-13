@@ -22,6 +22,29 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.browser.verification_state = AsyncMock(return_value="passed")
         self.browser.server_verification_state = AsyncMock(return_value="ready")
 
+    async def test_quantity_failure_stage_controls_safe_retry(self):
+        adv_no = 'a1781101617440872449'
+        page = {'targetId': 'mexc-tab', 'type': 'page',
+                'url': 'https://www.mexc.com/ru-RU/buy-crypto/create-advertising'}
+        for reason, plan, expected in (
+                ('read_before_network', {'quantity': '100'}, AdsPowerUnavailable),
+                ('quantity_reply_unknown', {'quantity': '100'}, AdsPowerClickUnknown),
+                ('read_after_network', {'quantity': '100'}, AdsPowerClickUnknown),
+                ('result_mismatch', {'quantity': '100'}, AdsPowerClickUnknown),
+                ('read_failed', {'quantity': '100'}, AdsPowerClickUnknown),
+                ('read_before_network', None, AdsPowerUnavailable)):
+            with self.subTest(reason=reason, plan=plan):
+                self.call.reset_mock(side_effect=True)
+                self.call.side_effect = [
+                    {'targetInfos': [page]}, {}, {'sessionId': 'mexc-session'},
+                    {'result': {'value': {'error': reason}}},
+                ]
+                with self.assertRaises(expected):
+                    await self.browser._ad_quantity(adv_no, plan)
+                self.assertEqual([call.args[0] for call in self.call.call_args_list],
+                                 ['Target.getTargets', 'Target.activateTarget',
+                                  'Target.attachToTarget', 'Runtime.evaluate'])
+
     async def test_local_api_read_timeout_retries_without_browser_command(self):
         response = httpx.Response(200, json={'code': 0, 'data': {'status': 'Active',
             'ws': {'puppeteer': 'ws://127.0.0.1:9222/devtools/browser/one'}}})

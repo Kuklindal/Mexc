@@ -16,6 +16,7 @@ async function run(responses, intent=plan) {
             calls.push({url,method:options.method,body:options.body?.toString()});
             assert.ok(responses.length, 'Unexpected additional request');
             const body=responses.shift();
+            if (body instanceof Error) throw body;
             return {ok:true,status:200,json:async()=>body};
         }
     });
@@ -60,5 +61,15 @@ async function run(responses, intent=plan) {
     r=await run([{code:0,data:ad}],null);
     assert.equal(r.calls[0].method,'GET');
     assert.equal(r.calls.length,1);
+
+    r=await run([new Error('temporary read failure')]);
+    assert.equal(r.result.error,'read_before_network');
+    assert.equal(r.calls.filter(c=>c.method==='POST').length,0);
+    r=await run([{code:0,data:ad},new Error('reply lost')]);
+    assert.equal(r.result.error,'quantity_reply_unknown');
+    assert.equal(r.calls.filter(c=>c.method==='POST').length,1);
+    r=await run([{code:0,data:ad},{code:0},new Error('read after write failed')]);
+    assert.equal(r.result.error,'read_after_network');
+    assert.equal(r.calls.filter(c=>c.method==='POST').length,1);
     console.log('Quantity-only requests: OK (mock fetch only)');
 })().catch(error=>{console.error(error);process.exitCode=1;});
