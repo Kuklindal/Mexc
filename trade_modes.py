@@ -850,6 +850,7 @@ async def _apply_terminal_switch(journal, state) -> None:
         state['p1_profile'] = target
         state['profiles'] = eligible
         state['cursor'] = 0
+        state.pop('last_profile', None)
         state['unique_done'] = []
         state['completed_count'] = 0
         if state['mode'] == 'cash_unique':
@@ -1281,6 +1282,11 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                 eflp_target_done = (state['mode'] in {'eflp_volume', 'eflp_unique'}
                                     and _eflp_target_reached(state))
                 cash_unique_done = state['mode'] == 'cash_unique' and len(state['unique_done']) >= 25
+                next_maker = (_next_maker(state)
+                              if state['mode'] in {'eflp_volume', 'eflp_unique', 'cash_unique'} else None)
+                eflp_pool_done = (state['mode'] == 'eflp_unique' and next_maker is not None
+                                  and bool(state['profiles'])
+                                  and all(name in state['unique_done'] for name in state['profiles']))
                 if cash_unique_done and len(state['p1_profiles']) == 1:
                     state['status'] = 'done'
                     save_state(journal, state)
@@ -1291,15 +1297,16 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                             f'{len(state["unique_done"])}/25 П2 за неделю.',
                             reply_markup=telegram_keyboard() if telegram_keyboard else None)
                     return
-                if eflp_target_done or cash_unique_done:
-                    next_maker = _next_maker(state)
+                if eflp_target_done or eflp_pool_done or cash_unique_done:
                     target = (next_maker if eflp_target_done or next_maker
                               else state['p1_profiles'][0])
                     candidates, _ = split_eflp_p2_profiles(
                         target or state['p1_profile'], state['profiles'], os.environ)
                     if not candidates:
                         raise Paused('Нет П2, отличного от обоих П1, для финального ордера')
-                    profile = state.get('last_profile') if state.get('last_profile') in candidates else candidates[-1]
+                    profile = (state.get('last_profile') if state.get('last_profile') in candidates else
+                               next((name for name in reversed(state.get('unique_done', []))
+                                     if name in candidates), candidates[-1]))
                     try:
                         amount, quantity = await _final_order(state, target)
                     except MexcReadUnavailable as exc:

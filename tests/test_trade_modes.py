@@ -9,7 +9,7 @@ from cycle import CashVolumeLimitReached, OperatorStopped, Paused, Step, steps_f
 from adspower import AdsPowerTimeout, AdsPowerUnavailable
 from mexc_client import MexcChatUnavailable, MexcReadUnavailable
 from rollover import load_state, save_state
-from trade_modes import (_eflp_target_reached, _finish_cash_network_return, _finish_completed_cycle,
+from trade_modes import (_apply_terminal_switch, _eflp_target_reached, _finish_cash_network_return, _finish_completed_cycle,
                            _finish_terminal_cycle,
                            _handle_forward_rejection, _record_forward,
                            begin_mode, choose_mode_amount, configured_mode_profiles,
@@ -612,6 +612,86 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
     async def test_eflp_unique_stops_after_all_selected_when_fewer_than_twenty(self):
         state = {'mode': 'eflp_unique', 'unique_done': ['1', '2']}
         self.assertFalse(_eflp_target_reached(state))
+
+    async def test_eflp_unique_small_pool_moves_funds_to_next_p1(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(2) | {
+            'EFLP_P1_PROFILES': 'p1,p1_2',
+            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+            'MEXC_P1_2_API_KEY': 'second-key', 'MEXC_P1_2_SECRET_KEY': 'second-secret',
+            'MEXC_P1_2_MEMBER_ID': 'second-member', 'MEXC_P1_2_NICKNAME': 'Second maker',
+            'MEXC_P1_2_FIAT': 'RUB',
+            'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456787',
+            'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456786',
+            'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-browser',
+        }
+        for name in ('1', '2'):
+            cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_unique',
+                'p1_profile': 'p1', 'p2_profile': name,
+                'members': {'p2': env[f'MEXC_P2_{name}_MEMBER_ID']}})
+            self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+                result={'quantity': '100'}, context={'amount': '1000', 'quantity': '100'})
+            self.complete(cid, '100')
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=['1', '2'], env=env)
+        self.assertEqual(state['unique_done'], ['1', '2'])
+        self.assertFalse(_eflp_target_reached(state))
+        with (patch.dict(os.environ, env),
+              patch('trade_modes._final_order', new=AsyncMock(return_value=('900 RUB', '90'))) as final,
+              patch('trade_modes.run_command', new=AsyncMock(side_effect=Paused('planned'))) as trade):
+            with self.assertRaisesRegex(Paused, 'planned'):
+                await run_mode(self.journal, state, asyncio.Event(), None)
+        final.assert_awaited_once_with(state, 'p1_2')
+        self.assertEqual(state['terminal_pending']['kind'], 'eflp_cross')
+        self.assertEqual(state['terminal_pending']['p2'], '2')
+        args = trade.await_args.args[0]
+        self.assertEqual(args.p2_profile, '2')
+        self.assertEqual(args.reverse_p1_profile, 'p1_2')
+        self.assertEqual(args.forward_quantity, '90')
+
+    async def test_eflp_unique_small_pool_on_last_p1_remains_partial(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'EFLP_P1_PROFILES': 'p1',
+                            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_unique',
+            'p1_profile': 'p1', 'p2_profile': '1',
+            'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+            result={'quantity': '100'}, context={'amount': '1000', 'quantity': '100'})
+        self.complete(cid, '100')
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        with patch.dict(os.environ, env), patch('trade_modes._final_order', new=AsyncMock()) as final:
+            await run_mode(self.journal, state, asyncio.Event(), None)
+        final.assert_not_awaited()
+        self.assertEqual(state['status'], 'done')
+        self.assertTrue(state['eflp_unique_partial'])
+
+    async def test_eflp_unique_completed_switch_starts_next_p1_with_fresh_last_profile(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(2) | {
+            'EFLP_P1_PROFILES': 'p1,p1_2',
+            'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788',
+            'MEXC_P1_2_API_KEY': 'second-key', 'MEXC_P1_2_SECRET_KEY': 'second-secret',
+            'MEXC_P1_2_MEMBER_ID': 'second-member', 'MEXC_P1_2_NICKNAME': 'Second maker',
+            'MEXC_P1_2_FIAT': 'RUB',
+            'MEXC_P1_2_SELL_ADV_NO': 'a1234567890123456787',
+            'MEXC_P1_2_BUY_ADV_NO': 'a1234567890123456786',
+            'MEXC_P1_2_ADSPOWER_PROFILE_ID': 'second-browser',
+        }
+        state = begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                           p2_profiles=['1', '2'], env=env)
+        state['last_profile'] = '2'
+        state['terminal_pending'] = {'kind': 'eflp_cross', 'from': 'p1', 'to': 'p1_2',
+                                     'p2': '2', 'verified': True, 'finish': False}
+        with patch.dict(os.environ, env), patch('adspower.AdsPower') as browser_cls:
+            browser_cls.return_value.ensure_stopped = AsyncMock()
+            await _apply_terminal_switch(self.journal, state)
+        browser_cls.return_value.ensure_stopped.assert_awaited_once()
+        self.assertEqual(state['p1_profile'], 'p1_2')
+        self.assertEqual(state['status'], 'running')
+        self.assertNotIn('last_profile', state)
+        self.assertIsNone(state['terminal_pending'])
 
     async def test_eflp_volume_reaches_target_with_one_p2(self):
         state = {'mode': 'eflp_volume', 'unique_done': ['1'],
