@@ -660,7 +660,16 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
                          Decimal(str(sell['availableQuantity'])))
             low_usdt = max(Decimal(50), p1_min, reverse_min_usdt, buy_min_usdt)
             high_usdt = min(Decimal(100), p1_max, reverse_max_usdt, buy_max_usdt)
-            amount = _fiat_amount(low_usdt, high_usdt, p1_price, fiat)
+            try:
+                amount = _fiat_amount(low_usdt, high_usdt, p1_price, fiat)
+            except Paused:
+                if mode != 'eflp_unique':
+                    raise
+                raise Paused(
+                    f'Для обычного цикла «Уникальные Eflp» нет общей суммы 50–100 USDT: '
+                    f'SELL П1 допускает {p1_min:.4f}–{p1_max:.4f} USDT, '
+                    f'BUY П1 допускает {buy_min_usdt:.4f}–{buy_max_usdt:.4f} USDT. '
+                    'Проверьте минимум, максимум и остатки обоих объявлений') from None
         if mode in {'volume', 'cash_volume'}:
             projected = Decimal(amount.split()[0]) / p1_price
             window = (rolling_cash_purchases(journal, p2_key,
