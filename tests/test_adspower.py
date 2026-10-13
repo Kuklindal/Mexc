@@ -27,12 +27,14 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         page = {'targetId': 'mexc-tab', 'type': 'page',
                 'url': 'https://www.mexc.com/ru-RU/buy-crypto/create-advertising'}
         for reason, plan, expected in (
+                ('origin', {'quantity': '100'}, AdsPowerUnavailable),
                 ('read_before_network', {'quantity': '100'}, AdsPowerUnavailable),
                 ('quantity_reply_unknown', {'quantity': '100'}, AdsPowerClickUnknown),
                 ('read_after_network', {'quantity': '100'}, AdsPowerClickUnknown),
                 ('result_mismatch', {'quantity': '100'}, AdsPowerClickUnknown),
                 ('read_failed', {'quantity': '100'}, AdsPowerClickUnknown),
                 ('ad_not_in_browser_list', {'quantity': '100'}, AdsPowerError),
+                ('origin', None, AdsPowerUnavailable),
                 ('read_before_network', None, AdsPowerUnavailable)):
             with self.subTest(reason=reason, plan=plan):
                 self.call.reset_mock(side_effect=True)

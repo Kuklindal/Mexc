@@ -948,7 +948,7 @@ class AdsPower:
                             f'MEXC отклонил изменение лимитов SELL-объявления до '
                             f'{plan["target_minimum"]}–{plan["target_maximum"]} {plan["fiat"]}{detail}; '
                             'финальный ордер не создан. Проверьте допустимые пределы объявления')
-                    if reason in {'read_before_network', 'read_before_rejected'}:
+                    if reason in {'origin', 'read_before_network', 'read_before_rejected'}:
                         raise AdsPowerUnavailable(
                             f'MEXC не дал прочитать SELL-объявление перед изменением лимита ({reason}{detail}); '
                             'запрос изменения не отправлен')
@@ -963,7 +963,7 @@ class AdsPower:
                            "проверьте, что в нём открыт аккаунт П1 этого цикла"
                            if reason == 'ad_not_in_browser_list' else
                            f"MEXC: чтение/пополнение объявления через браузер не подтверждено ({reason}{detail})")
-                if reason in {'read_before_network', 'read_before_rejected'}:
+                if reason in {'origin', 'read_before_network', 'read_before_rejected'}:
                     operation = 'публикации' if plan and plan.get('publish') else 'пополнения'
                     raise AdsPowerUnavailable(message + f'; запрос {operation} не отправлен')
                 if plan and plan.get('publish') and reason in {
