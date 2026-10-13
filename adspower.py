@@ -112,6 +112,49 @@ AD_QUANTITY = r"""async (advNo, plan) => {
 }"""
 
 
+# Same authenticated endpoint and state used by the MEXC "My Ads" publish
+# button. Read the exact ad before and after; never publish another account's ad.
+AD_PUBLISH = r"""async (advNo, expected) => {
+    if (location.protocol !== 'https:' || !['mexc.com','www.mexc.com',
+            'mexc.co','www.mexc.co','mexc.io','www.mexc.io'].includes(location.hostname))
+        return {error:'origin'};
+    const root = '/api/platform/p2p/api/merchant/order';
+    const read = async stage => {
+        let response, body;
+        try {
+            response = await fetch(root + '/' + advNo,
+                {method:'GET',credentials:'same-origin',cache:'no-store'});
+            body = await response.json();
+        } catch (_) { return {error:stage + '_network'}; }
+        if (!response.ok || body?.code !== 0)
+            return {error:stage + '_rejected',http:response.status,code:body?.code ?? null};
+        const d = body.data;
+        if (!d || d.id !== advNo) return {error:stage + '_mismatch'};
+        return {id:d.id,state:d.state,tradeType:d.tradeType,currency:d.currency,
+            coinName:d.coinName,availableQuantity:d.availableQuantity};
+    };
+    const before = await read('read_before');
+    if (before.error) return before;
+    if (before.tradeType !== (expected.side === 'BUY' ? 0 : 1)
+            || before.currency !== expected.fiat || before.coinName !== 'USDT')
+        return {error:'ad_changed'};
+    if (before.state === 1) return before;
+    if (before.state !== 0) return {error:'unsupported_state',state:before.state};
+    let response, body;
+    try {
+        response = await fetch(root + '/switch', {method:'PUT',credentials:'same-origin',
+            body:new URLSearchParams({id:advNo,state:'OPEN',authVersion:'v2'})});
+        body = await response.json();
+    } catch (_) { return {error:'publish_reply_unknown'}; }
+    if (!response.ok || body?.code !== 0)
+        return {error:'publish_rejected',http:response.status,code:body?.code ?? null};
+    const after = await read('read_after');
+    if (after.error) return after;
+    if (after.state !== 1) return {error:'publish_unconfirmed',state:after.state};
+    return after;
+}"""
+
+
 # Inspected on MEXC's merchant order dialog. Do not search/click by text globally.
 ORDER_VIEW = r"""(orderNo, click) => {
     if (location.protocol !== 'https:' || !['mexc.com', 'www.mexc.com'].includes(location.hostname))
@@ -680,6 +723,11 @@ class AdsPower:
     async def ad_details(self, adv_no: str) -> dict:
         return await self._ad_quantity(adv_no)
 
+    async def publish_ad(self, adv_no: str, side: str, fiat: str) -> dict:
+        if side not in {'BUY', 'SELL'} or not re.fullmatch(r'[A-Z]{3}', fiat):
+            raise AdsPowerError('Некорректная сторона или валюта объявления')
+        return await self._ad_quantity(adv_no, {'publish': True, 'side': side, 'fiat': fiat})
+
     async def replenish_ad(self, plan: dict) -> dict:
         quantity, before, target = (Decimal(plan[k]) for k in ('quantity', 'before_available', 'target_available'))
         if (not all(n.is_finite() for n in (quantity, before, target))
@@ -714,8 +762,9 @@ class AdsPower:
                     await call('Target.activateTarget', {'targetId': target_id})
                     sessions[target_id] = (await call('Target.attachToTarget', {
                         'targetId': target_id, 'flatten': True}))['sessionId']
+                script = AD_PUBLISH if intended and intended.get('publish') else AD_QUANTITY
                 return await call('Runtime.evaluate', {
-                    'expression': f'({AD_QUANTITY})({json.dumps(adv_no)}, {json.dumps(intended)})',
+                    'expression': f'({script})({json.dumps(adv_no)}, {json.dumps(intended)})',
                     'awaitPromise': True, 'returnByValue': True}, sessions[target_id])
 
             def owns_ad(result: dict) -> bool:
@@ -778,7 +827,15 @@ class AdsPower:
                            if reason == 'ad_not_in_browser_list' else
                            f"MEXC: чтение/пополнение объявления через браузер не подтверждено ({reason}{detail})")
                 if reason in {'read_before_network', 'read_before_rejected'}:
-                    raise AdsPowerUnavailable(message + '; запрос пополнения не отправлен')
+                    operation = 'публикации' if plan and plan.get('publish') else 'пополнения'
+                    raise AdsPowerUnavailable(message + f'; запрос {operation} не отправлен')
+                if plan and plan.get('publish') and reason in {
+                        'publish_reply_unknown', 'read_after_network', 'read_after_rejected',
+                        'publish_unconfirmed', 'read_failed'}:
+                    raise AdsPowerUnavailable(message + '; публикация будет сверена перед повтором')
+                if (plan and plan.get('publish') and reason == 'publish_rejected'
+                        and value.get('code') not in {401, 60017}):
+                    raise AdsPowerUnavailable(message + '; статус объявления будет проверен повторно')
                 if plan and reason in {'read_failed', 'quantity_reply_unknown', 'read_after_network',
                                        'read_after_rejected', 'read_after_mismatch', 'result_mismatch'}:
                     raise AdsPowerClickUnknown(message + '; перед повтором требуется сверка остатка')

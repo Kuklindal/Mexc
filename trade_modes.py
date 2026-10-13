@@ -16,6 +16,7 @@ from config import Settings, p2_nickname, p2_profile_name
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, run_command
 from mexc_client import MexcAPIError, MexcChatUnavailable, MexcMutationUnknown, MexcP2PClient, MexcReadUnavailable
 from adspower import AdsPowerClickUnknown, AdsPowerTimeout, AdsPowerUnavailable
+from eflp_ads import ensure_online, maker_browser
 from phrases import phrases_for_mode
 from rollover import (STATE_KEY, amount_from_ad, cycle_rowid, load_state, profiles_from_env,
                       save_state, wait_until)
@@ -85,7 +86,9 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
     client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url,
                           settings.recv_window, proxy_url=settings.proxy_url)
     try:
-        ad = await _ad(client, maker.sell_adv_no, 'SELL')
+        ad = await _ad(client, maker.sell_adv_no, 'SELL',
+                       eflp_browser=(lambda: maker_browser(maker, env))
+                       if state['mode'] in {'eflp_volume', 'eflp_unique'} else None)
         available = Decimal(str(ad['availableQuantity']))
         price = Decimal(str(ad['price']))
         minimum = Decimal(str(ad['minSingleTransAmount']))
@@ -117,7 +120,9 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
             try:
                 buy = await _ad(next_client, (env.get(f'{next_profile.prefix}_BUY_ADV_NO') or '').strip(),
                                 'BUY', 'RUB' if state['mode'] == 'cash_unique' else
-                                eflp_p1_fiat(next_maker, env))
+                                eflp_p1_fiat(next_maker, env),
+                                eflp_browser=(lambda: maker_browser(next_profile, env))
+                                if state['mode'] in {'eflp_volume', 'eflp_unique'} else None)
                 buy_amount = quantity * Decimal(str(buy['price']))
                 if not (Decimal(str(buy['minSingleTransAmount'])) <= buy_amount
                         <= Decimal(str(buy['maxSingleTransAmount']))
@@ -482,8 +487,11 @@ def next_profile(state, now=None, journal=None):
     return None, min(waits) if waits else None
 
 
-async def _ad(client, ad_no, side, fiat=None):
+async def _ad(client, ad_no, side, fiat=None, *, eflp_browser=None):
     ad = await client.get_ad(ad_no)
+    if eflp_browser and ad.get('advStatus') == 'CLOSE':
+        ad = await ensure_online(client, eflp_browser(), ad, ad_no, side,
+                                 fiat or ad.get('fiatUnit'))
     if (ad.get('advNo') != ad_no or ad.get('side') != side or ad.get('coinName') != 'USDT'
             or ad.get('advStatus') != 'OPEN' or (fiat and ad.get('fiatUnit') != fiat)):
         raise Paused(f'Объявление {ad_no} не соответствует владельцу, стороне, валюте или статусу OPEN')
@@ -543,7 +551,8 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
     clients = [MexcP2PClient(s.api_key, s.secret_key, s.base_url, s.recv_window,
                             proxy_url=s.proxy_url) for s in settings]
     try:
-        sell = await _ad(clients[0], p1.sell_adv_no, 'SELL')
+        sell = await _ad(clients[0], p1.sell_adv_no, 'SELL',
+                         eflp_browser=(lambda: maker_browser(p1, env)) if eflp else None)
         reverse = (await _ad(clients[1], p2.sell_adv_no, 'SELL', sell.get('fiatUnit'))
                    if p2 else None)
         buy = None
@@ -560,7 +569,9 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
                     buy_settings.base_url, buy_settings.recv_window,
                     proxy_url=buy_settings.proxy_url)
                 clients.append(buy_client)
-            buy = await _ad(buy_client, buy_no, 'BUY', sell.get('fiatUnit'))
+            buy = await _ad(buy_client, buy_no, 'BUY', sell.get('fiatUnit'),
+                            eflp_browser=(lambda: maker_browser(profile_from_env(buy_key, env), env))
+                            if eflp else None)
         fiat = sell.get('fiatUnit')
         if not fiat:
             raise Paused('У объявления П1 нет фиатной валюты')

@@ -347,6 +347,18 @@ class CycleRunner:
     def fiat_for(self, leg: str) -> str:
         return self.spec.get('reverse_fiat', self.spec['fiat']) if leg == 'reverse' else self.spec['fiat']
 
+    async def ensure_eflp_ad_online(self, adv_no: str, leg: str, ad: dict | None = None) -> dict | None:
+        if self.spec.get('scheduler_mode') not in {'eflp_volume', 'eflp_unique'}:
+            return ad
+        from eflp_ads import ensure_online
+        client = self.client_for('p1', leg)
+        browser = self.reverse_browser if leg == 'reverse' and self.reverse_browser else self.browser
+        if not browser:
+            raise Paused('Для публикации объявления Eflp нужен профиль П1 AdsPower')
+        return await ensure_online(client, browser, ad or await client.get_ad(adv_no),
+                                   adv_no, 'SELL' if leg == 'forward' else 'BUY',
+                                   self.fiat_for(leg))
+
     def check_stop(self):
         if self.stop_event is not None and self.stop_event.is_set():
             raise OperatorStopped("Остановлено оператором; прогресс сохранён, ордера MEXC не отменены")
@@ -1085,6 +1097,7 @@ class CycleRunner:
                 self.check_replenished(ad, saved)
                 if saved.get('method') == 'quantity_only':
                     await self.check_browser_ad(saved, browser=browser)
+                await self.ensure_eflp_ad_online(adv_no, leg, ad)
                 self.console.write(f"Доступный остаток объявления соответствует цели {saved['target_available']} USDT. "
                                    "Проверьте пополнение на MEXC; повторного запроса не будет.")
                 return saved
@@ -1095,7 +1108,10 @@ class CycleRunner:
                                                                                    fiat=self.fiat_for(leg)))
             self.console.write(f"Объявление {adv_no}: сейчас {plan['before_available']} USDT, добавить {quantity} USDT. "
                                f"Ожидаемый доступный остаток: {plan['target_available']} USDT.\n"
-                               f"Статус объявления: {ad.get('advStatus', 'неизвестен')}; публикация этим шагом не выполняется.")
+                               f"Статус объявления: {ad.get('advStatus', 'неизвестен')}; "
+                               + ("офлайн-объявление будет опубликовано после пополнения."
+                                  if self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'} else
+                                  "публикация этим шагом не выполняется."))
             if "target_max_limit" in plan:
                 self.console.write(f"Максимум одной сделки будет уменьшен: {plan['before_max_limit']} → "
                                    f"{plan['target_max_limit']} {self.spec['fiat']}, по стоимости объёма после пополнения. "
@@ -1129,6 +1145,8 @@ class CycleRunner:
                             str(self.spec['eflp_reverse_pay_method_id']) not in
                             {str(p.get('payMethod')) for p in payments if isinstance(p, dict)}):
                         raise Paused('Новый П1 не предлагает настроенный способ оплаты в BUY-объявлении')
+                if self.spec.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'}:
+                    await self.ensure_eflp_ad_online(adv_no, leg, ad)
                 if (leg == "forward" or p2_maker) and self.spec.get('scheduler_mode') not in {'eflp_volume', 'eflp_unique'}:
                     # A configured fallback is not evidence that the live checkbox is on.
                     browser = self.maker_browser if p2_maker else self.browser
@@ -1314,6 +1332,7 @@ class CycleRunner:
                 self.check_replenished(ad, data)
                 if data.get('method') == 'quantity_only':
                     await self.check_browser_ad(data, browser=browser)
+                await self.ensure_eflp_ad_online(data['adv_no'], leg, ad)
                 return data
             if data.get('method') == 'quantity_only':
                 try:
@@ -1333,8 +1352,26 @@ class CycleRunner:
                     await browser.replenish_ad(data)
                 except AdsPowerUnavailable as exc:
                     raise AdsPowerPreflightUnavailable(str(exc)) from None
+                except AdsPowerError as exc:
+                    if (self.spec.get('scheduler_mode') not in {'eflp_volume', 'eflp_unique'}
+                            or 'quantity_rejected' not in str(exc)):
+                        raise
+                    # An explicit refusal means no quantity change was accepted.
+                    # Only recover this path when the maker API confirms CLOSE.
+                    offline = await client.get_ad(data['adv_no'])
+                    if offline.get('advStatus') != 'CLOSE':
+                        raise
+                    await self.ensure_eflp_ad_online(data['adv_no'], leg, offline)
+                    current = await self.quantity_plan(await client.get_ad(data['adv_no']),
+                                                       data['adv_no'], data['quantity'],
+                                                       side=data.get('side', 'SELL'), browser=browser,
+                                                       fiat=self.fiat_for(leg))
+                    if current != data:
+                        raise Paused('Остаток объявления изменился после отказа MEXC; повторное пополнение запрещено')
+                    await browser.replenish_ad(data)
                 self.check_replenished(await client.get_ad(data['adv_no']), data)
                 await self.check_browser_ad(data, browser=browser)
+                await self.ensure_eflp_ad_online(data['adv_no'], leg)
                 return data
             if self.replenish_plan(ad, data["adv_no"], data["quantity"], fiat=self.fiat_for(leg)) != data:
                 raise Paused("Объявление изменилось после подтверждения. Пополнение не отправлено; проверьте его на MEXC.")
@@ -1363,7 +1400,21 @@ class CycleRunner:
             return {"order_no": data["order_no"], "verification": "seller_check_completed_on_mexc"}
         client = self.client_for(step.actor, leg) if step.actor != "both" else None
         if action == "create":
-            return {"order_no": await client.create_order(**data)}
+            await self.ensure_eflp_ad_online(data['adv_no'], leg)
+            try:
+                order_no = await client.create_order(**data)
+            except MexcAPIError as exc:
+                if (self.spec.get('scheduler_mode') not in {'eflp_volume', 'eflp_unique'}
+                        or exc.code != 85010):
+                    raise
+                # 85010 has several causes. Retry only when the maker's own
+                # API confirms that this exact ad became offline meanwhile.
+                maker_ad = await self.client_for('p1', leg).get_ad(data['adv_no'])
+                if maker_ad.get('advStatus') != 'CLOSE':
+                    raise
+                await self.ensure_eflp_ad_online(data['adv_no'], leg, maker_ad)
+                order_no = await client.create_order(**data)
+            return {"order_no": order_no}
         if action in {"message", "reply"}:
             await client.send_chat_text(data["order_no"], data["text"])
             receiver = "p1" if step.actor == "p2" else "p2"

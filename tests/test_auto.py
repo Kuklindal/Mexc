@@ -93,6 +93,7 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_eflp_first_order_uses_p1_card_method_and_cash_keeps_its_method(self):
         runner = self.runner()
+        self.exchange.ad['advStatus'] = 'OPEN'
         for mode in ('eflp_volume', 'eflp_unique'):
             runner.spec = dict(self.spec, scheduler_mode=mode, eflp_p1_pay_method_id=999)
             self.exchange.ad['paymentInfo'] = [{'id': 2604184, 'payMethod': 999}]
@@ -108,6 +109,7 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_eflp_rejects_card_method_missing_from_p1_ad(self):
         runner = self.runner()
+        self.exchange.ad['advStatus'] = 'OPEN'
         runner.spec = dict(self.spec, scheduler_mode='eflp_unique', eflp_p1_pay_method_id=999)
         with self.assertRaisesRegex(Paused, 'не найден в объявлении П1'):
             await runner.prepare(Step('forward_ad', 'p1', 'ad'), recovery=False)
