@@ -946,8 +946,15 @@ class TelegramControl:
         if callback:
             data = callback.get('data', '')
             valid = authorized and isinstance(data, str) and data.startswith(self.nonce + ':')
-            await self.telegram.request('answerCallbackQuery', {'callback_query_id': callback['id'],
-                'text': '' if valid else 'Кнопка недоступна. Открой меню командой /start.'})
+            try:
+                await self.telegram.request('answerCallbackQuery', {'callback_query_id': callback['id'],
+                    'text': '' if valid else 'Кнопка недоступна. Открой меню командой /start.'})
+            except TelegramRequestError as exc:
+                # Telegram may expire the callback acknowledgement while the
+                # server is overloaded. Authorization and the current menu
+                # nonce still decide whether its action can run.
+                if str(exc) != 'Telegram answerCallbackQuery: HTTP 400':
+                    raise
             if not valid:
                 return
             try:

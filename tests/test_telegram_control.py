@@ -9,7 +9,7 @@ import httpx
 
 from cycle import OperatorStopped
 from telegram_control import TelegramControl, daily_stats
-from notifier import TelegramNotifier
+from notifier import TelegramNotifier, TelegramRequestError
 from sheets import Reporter
 import test_auto as fixtures
 
@@ -405,6 +405,22 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(restarted, 'perform', new=AsyncMock()) as perform:
             await restarted.handle(update)
             await restarted.handle(self.callback(restarted, 'new', update_id=2, nonce=control.nonce))
+            perform.assert_not_awaited()
+
+    async def test_expired_callback_ack_does_not_drop_valid_action_or_run_old_button(self):
+        control = self.control()
+        control.telegram.request.side_effect = TelegramRequestError('Telegram answerCallbackQuery: HTTP 400')
+        with patch.object(control, 'perform', new=AsyncMock()) as perform:
+            await control.handle(self.callback(control, 'status'))
+            await control.handle(self.callback(control, 'new', update_id=2, nonce='old-menu'))
+            perform.assert_awaited_once_with('status')
+
+    async def test_other_callback_ack_failure_is_not_ignored(self):
+        control = self.control()
+        control.telegram.request.side_effect = TelegramRequestError('Telegram answerCallbackQuery: HTTP 502')
+        with patch.object(control, 'perform', new=AsyncMock()) as perform:
+            with self.assertRaises(TelegramRequestError):
+                await control.handle(self.callback(control, 'status'))
             perform.assert_not_awaited()
 
     async def test_start_menu_and_status_work_without_launching_trades(self):
