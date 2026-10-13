@@ -1183,7 +1183,7 @@ class CycleRunner:
                     if (window.get('uncertain_until')
                             or Decimal(window['quantity']) >= CASH_TARGET_USDT
                             or Decimal(window['quantity']) + projected > CASH_CEILING_USDT):
-                        raise CashVolumeLimitReached('Скользящий объём П2 достиг лимита 69–70 тыс. USDT; '
+                        raise CashVolumeLimitReached('Скользящий объём П2 достиг лимита 67–70 тыс. USDT; '
                                                      'новая покупка не отправлена')
                 self.console.write(f"После подтверждения П2 откроет сделку по объявлению {args['adv_no']} "
                                    f"на {self.spec['amount']} {self.spec['fiat']}.")
