@@ -285,6 +285,53 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(amount, '10000.00 RUB')
         random_reserve.assert_not_called()
 
+    async def test_eflp_final_order_raises_sell_limit_and_verifies_public_ad(self):
+        from trade_modes import _final_order
+        env = env_for(1)
+        ad = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL', 'coinName': 'USDT',
+              'advStatus': 'OPEN', 'fiatUnit': 'RUB', 'availableQuantity': '300',
+              'price': '100', 'minSingleTransAmount': '1300',
+              'maxSingleTransAmount': '10000'}
+        fake = type('Client', (), {'get_ad': AsyncMock(side_effect=[ad, dict(ad, maxSingleTransAmount='20000')]),
+                                   'close': AsyncMock()})()
+        browser = type('Browser', (), {'ensure_started': AsyncMock(),
+                                       'ensure_mexc_page': AsyncMock(),
+                                       'increase_ad_limit': AsyncMock(return_value={'maxTradeLimit': '20000'})})()
+        with (patch('trade_modes.settings_for_profile', return_value=type('S', (), {
+                'api_key': 'x', 'secret_key': 'y', 'base_url': 'https://example.test',
+                'recv_window': 1000, 'proxy_url': None})()),
+              patch('trade_modes.MexcP2PClient', return_value=fake),
+              patch('trade_modes.maker_browser', return_value=browser)):
+            amount, quantity = await _final_order(
+                {'mode': 'eflp_unique', 'p1_profile': 'p1'}, None, env=env)
+        self.assertEqual((amount, quantity), ('20000.00 RUB', '200.0000'))
+        self.assertEqual(browser.increase_ad_limit.await_args.args[0]['target_maximum'], '20000.00')
+        fake.close.assert_awaited_once()
+
+    async def test_eflp_final_limit_is_not_changed_if_next_buy_cannot_accept_order(self):
+        from trade_modes import _final_order
+        env = {'MEXC_P1_2_BUY_ADV_NO': 'next-buy', 'MEXC_P1_2_FIAT': 'GEL'}
+        maker = type('P', (), {'key': 'p1', 'sell_adv_no': 'old-sell'})()
+        next_maker = type('P', (), {'key': 'p1_2', 'prefix': 'MEXC_P1_2'})()
+        settings = type('S', (), {'api_key': 'x', 'secret_key': 'y',
+                                  'base_url': 'https://example.test',
+                                  'recv_window': 1000, 'proxy_url': None})()
+        sell = {'advNo': 'old-sell', 'side': 'SELL', 'coinName': 'USDT',
+                'advStatus': 'OPEN', 'fiatUnit': 'GEL', 'availableQuantity': '300',
+                'price': '2', 'minSingleTransAmount': '100', 'maxSingleTransAmount': '200'}
+        buy = dict(sell, advNo='next-buy', side='BUY', maxSingleTransAmount='100')
+        seller = type('Client', (), {'get_ad': AsyncMock(return_value=sell), 'close': AsyncMock()})()
+        buyer = type('Client', (), {'get_ad': AsyncMock(return_value=buy), 'close': AsyncMock()})()
+        browser = type('Browser', (), {'increase_ad_limit': AsyncMock()})()
+        with (patch('trade_modes.profile_from_env', side_effect=[maker, next_maker]),
+              patch('trade_modes.settings_for_profile', return_value=settings),
+              patch('trade_modes.MexcP2PClient', side_effect=[seller, buyer]),
+              patch('trade_modes.maker_browser', return_value=browser)):
+            with self.assertRaisesRegex(Paused, 'BUY-объявления'):
+                await _final_order({'mode': 'eflp_unique', 'p1_profile': 'p1'},
+                                   'p1_2', env=env)
+        browser.increase_ad_limit.assert_not_awaited()
+
     async def test_both_eflp_modes_leave_100_usdt_when_switching_p1(self):
         from trade_modes import _final_order
         env = {'MEXC_P1_2_BUY_ADV_NO': 'next-buy', 'MEXC_P1_2_FIAT': 'GEL'}

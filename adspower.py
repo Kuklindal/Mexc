@@ -112,6 +112,100 @@ AD_QUANTITY = r"""async (advNo, plan) => {
 }"""
 
 
+# Mirrors the merchant portal's edit-ad request. Only the maximum per order is
+# changed; all other editable fields come from the authenticated ad detail.
+AD_LIMIT = r"""async (advNo, plan) => {
+    if (location.protocol !== 'https:' || !['mexc.com','www.mexc.com',
+            'mexc.co','www.mexc.co','mexc.io','www.mexc.io'].includes(location.hostname))
+        return {error:'origin'};
+    const root = '/api/platform/p2p/api/merchant/order';
+    const read = async stage => {
+        try {
+            const response = await fetch(root + '/' + advNo,
+                {method:'GET',credentials:'same-origin',cache:'no-store'});
+            const body = await response.json();
+            if (!response.ok || body?.code !== 0)
+                return {error:stage + '_rejected',http:response.status,code:body?.code ?? null};
+            if (!body.data || body.data.id !== advNo)
+                return {error:stage + '_mismatch'};
+            return body.data;
+        } catch (_) { return {error:stage + '_network'}; }
+    };
+    const before = await read('read_before');
+    if (before.error) return before;
+    if (!plan) return {id:before.id};
+    const num = value => value !== null && value !== undefined && value !== ''
+        && Number.isFinite(Number(value)) ? Number(value) : NaN;
+    const same = (a,b) => Number.isFinite(num(a)) && num(a) === num(b);
+    const paymentIds = Array.isArray(before.paymethodIds) ? before.paymethodIds.join(',')
+        : String(before.paymethodIds ?? '');
+    if (before.coinName !== 'USDT' || before.currency !== plan.fiat
+            || before.tradeType !== 1 || before.state !== 1
+            || !same(before.availableQuantity,plan.before_available)
+            || !same(before.frozenQuantity ?? 0,plan.before_frozen)
+            || !same(before.price,plan.price)
+            || !same(before.minTradeLimit,plan.minimum)
+            || !paymentIds || !Number.isFinite(num(before.coinId))
+            || before.priceType !== 0 || !Number.isFinite(num(before.expirationTime))
+            || before.kycLevel == null || before.display == null || before.adsType == null
+            || before.merchantTradeEnable == null || before.onlyTradeKybUser == null)
+        return {error:'ad_changed'};
+    if (!Number.isFinite(num(plan.target_maximum)))
+        return {error:'invalid_limit'};
+    if (num(before.maxTradeLimit) >= num(plan.target_maximum))
+        return {id:before.id,maxTradeLimit:before.maxTradeLimit};
+    if (!same(before.maxTradeLimit,plan.before_maximum))
+        return {error:'ad_changed'};
+    const params = {
+        id:advNo, tradeType:'SELL', coinId:before.coinId, currency:before.currency,
+        priceType:before.priceType, price:before.price,
+        quantity:before.availableQuantity,
+        oldAvailableQuantity:before.availableQuantity,
+        newAvailableQuantity:before.availableQuantity,
+        minTradeLimit:before.minTradeLimit, maxTradeLimit:plan.target_maximum,
+        expirationTime:before.expirationTime,
+        autoResponse:before.autoResponse ?? '', tradeTerms:before.tradeTerms ?? '',
+        kycLevel:before.kycLevel ?? 1,
+        fiatCount:before.fiatCount ?? 0, fiatCountLess:before.fiatCountLess ?? 0,
+        minRegisterDate:before.minRegisterDate ?? 0,
+        maxPayLimit:before.maxPayLimit ?? 0,
+        display:before.display ?? 1, adsType:before.adsType ?? 0,
+        merchantTradeEnable:before.merchantTradeEnable ?? true,
+        onlyTradeKybUser:before.onlyTradeKybUser ?? false,
+        supportKycCountry:Array.isArray(before.supportKycCountry)
+            ? before.supportKycCountry.join(',') : (before.supportKycCountry ?? ''),
+        paymethodIds:paymentIds, apiVersion:'1.0.0', authVersion:'v2'
+    };
+    for (const field of ['countryCode','adDisplayAreaType','securityOrderPaymethodIds'])
+        if (before[field] !== undefined && before[field] !== null)
+            params[field] = Array.isArray(before[field]) ? before[field].join(',') : before[field];
+    if (before.overVerify !== undefined && before.overVerify !== null)
+        params.overVerify = typeof before.overVerify === 'string'
+            ? before.overVerify : JSON.stringify(before.overVerify);
+    let response, body;
+    try {
+        response = await fetch(root, {method:'PUT',credentials:'same-origin',
+            body:new URLSearchParams(params)});
+        body = await response.json();
+    } catch (_) { return {error:'limit_reply_unknown'}; }
+    if (!response.ok || body?.code !== 0)
+        return {error:'limit_rejected',http:response.status,code:body?.code ?? null};
+    const after = await read('read_after');
+    if (after.error) return after;
+    if (!same(after.maxTradeLimit,plan.target_maximum)
+            || !same(after.availableQuantity,before.availableQuantity)
+            || !same(after.frozenQuantity ?? 0,before.frozenQuantity ?? 0)
+            || !same(after.price,before.price)
+            || !same(after.minTradeLimit,before.minTradeLimit)
+            || after.state !== before.state || after.tradeType !== before.tradeType
+            || after.currency !== before.currency
+            || String(after.paymethodIds) !== String(before.paymethodIds)
+            || JSON.stringify(after.overVerify ?? null) !== JSON.stringify(before.overVerify ?? null))
+        return {error:'result_mismatch'};
+    return {id:after.id,maxTradeLimit:after.maxTradeLimit};
+}"""
+
+
 # Same authenticated endpoint and state used by the MEXC "My Ads" publish
 # button. Read the exact ad before and after; never publish another account's ad.
 AD_PUBLISH = r"""async (advNo, expected) => {
@@ -741,6 +835,23 @@ class AdsPower:
                 raise AdsPowerError("Некорректный общий остаток объявления; запрос не отправлен")
         return await self._ad_quantity(plan['adv_no'], plan)
 
+    async def increase_ad_limit(self, plan: dict) -> dict:
+        try:
+            old = Decimal(plan['before_maximum'])
+            target = Decimal(plan['target_maximum'])
+            minimum = Decimal(plan['minimum'])
+            price = Decimal(plan['price'])
+            available = Decimal(plan['before_available'])
+            frozen = Decimal(plan['before_frozen'])
+        except (KeyError, ValueError, ArithmeticError):
+            raise AdsPowerError('Некорректный план изменения лимита объявления') from None
+        if (not all(n.is_finite() for n in (old, target, minimum, price, available, frozen))
+                or not 0 < minimum <= old < target <= available * price
+                or available <= 0 or frozen < 0 or plan.get('side') != 'SELL'
+                or not re.fullmatch(r'[A-Z]{3}', plan.get('fiat', ''))):
+            raise AdsPowerError('Некорректный план изменения лимита объявления')
+        return await self._ad_quantity(plan['adv_no'], plan)
+
     async def _ad_quantity(self, adv_no: str, plan: dict | None = None) -> dict:
         if not re.fullmatch(r"a\d{15,25}", adv_no):
             raise AdsPowerError("Некорректный номер объявления")
@@ -762,7 +873,8 @@ class AdsPower:
                     await call('Target.activateTarget', {'targetId': target_id})
                     sessions[target_id] = (await call('Target.attachToTarget', {
                         'targetId': target_id, 'flatten': True}))['sessionId']
-                script = AD_PUBLISH if intended and intended.get('publish') else AD_QUANTITY
+                script = (AD_PUBLISH if intended and intended.get('publish') else
+                          AD_LIMIT if intended and intended.get('edit_limit') else AD_QUANTITY)
                 return await call('Runtime.evaluate', {
                     'expression': f'({script})({json.dumps(adv_no)}, {json.dumps(intended)})',
                     'awaitPromise': True, 'returnByValue': True}, sessions[target_id])
@@ -822,6 +934,23 @@ class AdsPower:
                 reason = value.get('error', 'read_failed') if isinstance(value, dict) else 'read_failed'
                 detail = (f"; HTTP {value['http']}" if isinstance(value, dict) and isinstance(value.get('http'), int) else '')
                 detail += (f"; MEXC {value['code']}" if isinstance(value, dict) and isinstance(value.get('code'), int) else '')
+                if plan and plan.get('edit_limit'):
+                    if reason == 'limit_rejected':
+                        raise AdsPowerError(
+                            f'MEXC отклонил увеличение максимума SELL-объявления до '
+                            f'{plan["target_maximum"]} {plan["fiat"]}{detail}; '
+                            'финальный ордер не создан. Проверьте предел в настройках объявления')
+                    if reason in {'read_before_network', 'read_before_rejected'}:
+                        raise AdsPowerUnavailable(
+                            f'MEXC не дал прочитать SELL-объявление перед изменением лимита ({reason}{detail}); '
+                            'запрос изменения не отправлен')
+                    if reason in {'limit_reply_unknown', 'read_after_network', 'read_after_rejected',
+                                  'read_after_mismatch', 'result_mismatch', 'read_failed'}:
+                        raise AdsPowerClickUnknown(
+                            f'Изменение лимита SELL-объявления не подтверждено ({reason}{detail}); '
+                            'проверьте цену, остаток и максимум на MEXC перед повтором')
+                    raise AdsPowerError(
+                        f'Лимит SELL-объявления не изменён ({reason}{detail}); финальный ордер не создан')
                 message = (f"MEXC: профиль AdsPower не показывает объявление {adv_no}; "
                            "проверьте, что в нём открыт аккаунт П1 этого цикла"
                            if reason == 'ad_not_in_browser_list' else
@@ -836,7 +965,8 @@ class AdsPower:
                 if (plan and plan.get('publish') and reason == 'publish_rejected'
                         and value.get('code') not in {401, 60017}):
                     raise AdsPowerUnavailable(message + '; статус объявления будет проверен повторно')
-                if plan and reason in {'read_failed', 'quantity_reply_unknown', 'read_after_network',
+                if plan and reason in {'read_failed', 'quantity_reply_unknown', 'limit_reply_unknown',
+                                       'read_after_network',
                                        'read_after_rejected', 'read_after_mismatch', 'result_mismatch'}:
                     raise AdsPowerClickUnknown(message + '; перед повтором требуется сверка остатка')
                 if not plan and reason == 'read_failed':

@@ -110,7 +110,7 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
         if quantity <= 0:
             raise Paused(f'Остатка SELL-объявления П1 недостаточно для финального выкупа с резервом {reserve_label}')
         fiat_amount = quantity * price
-        if not minimum <= fiat_amount <= maximum:
+        if fiat_amount < minimum or (fiat_amount > maximum and not eflp_reserve):
             raise Paused(f'Весь остаток SELL-объявления минус {reserve_label} не помещается в лимиты одного ордера')
         if next_maker:
             next_profile = profile_from_env(next_maker, env)
@@ -130,6 +130,38 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
                     raise Paused('Финальный перевод не помещается в лимиты BUY-объявления следующего П1')
             finally:
                 await next_client.close()
+        if eflp_reserve and fiat_amount > maximum:
+            target = fiat_amount.quantize(Decimal('0.01'), rounding=ROUND_UP)
+            browser = maker_browser(maker, env)
+            await browser.ensure_started()
+            await browser.ensure_mexc_page()
+            await browser.increase_ad_limit({
+                'edit_limit': True, 'adv_no': maker.sell_adv_no,
+                'side': 'SELL', 'fiat': ad['fiatUnit'],
+                'before_available': str(ad['availableQuantity']),
+                'before_frozen': str(ad.get('frozenQuantity') or 0),
+                'price': str(ad['price']), 'minimum': str(ad['minSingleTransAmount']),
+                'before_maximum': str(ad['maxSingleTransAmount']),
+                'target_maximum': format(target, 'f'),
+            })
+            # The browser response alone is insufficient: the public order API
+            # must also expose the new maximum before a final order is created.
+            for attempt in range(5):
+                updated = await client.get_ad(maker.sell_adv_no)
+                if (updated.get('advNo') != ad.get('advNo')
+                        or updated.get('side') != ad.get('side')
+                        or updated.get('fiatUnit') != ad.get('fiatUnit')
+                        or updated.get('coinName') != ad.get('coinName')
+                        or Decimal(str(updated.get('price'))) != price
+                        or Decimal(str(updated.get('availableQuantity'))) != available
+                        or Decimal(str(updated.get('minSingleTransAmount'))) != minimum):
+                    raise Paused('После изменения лимита SELL-объявление изменилось; проверьте его на MEXC')
+                if Decimal(str(updated.get('maxSingleTransAmount'))) >= target:
+                    break
+                if attempt < 4:
+                    await asyncio.sleep(2)
+            else:
+                raise Paused(f'MEXC не подтвердил лимит SELL-объявления {target} {ad["fiatUnit"]}; финальный ордер не создан')
         return f'{fiat_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)} {ad["fiatUnit"]}', format(quantity, 'f')
     finally:
         await client.close()
