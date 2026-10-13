@@ -20,13 +20,13 @@ from sheets import (EFLP_META_HEADER, EFLP_WEEKLY_MARKER, HEADER, SHARED_CYCLE_H
 @asynccontextmanager
 async def _sheet_lock(sheet):
     """Wait for the other Eflp process without blocking this event loop."""
-    for attempt in range(120):
+    for attempt in range(360):
         lock = process_lock(sheet.shared_lock)
         try:
             lock.__enter__()
         except RuntimeError:
-            if attempt == 119:
-                raise GoogleSheetsError('Общая вкладка Eflp занята другим ботом более 60 секунд') from None
+            if attempt == 359:
+                raise GoogleSheetsError('Общая вкладка Eflp занята другим ботом более 180 секунд') from None
             await asyncio.sleep(0.5)
             continue
         try:
@@ -37,9 +37,7 @@ async def _sheet_lock(sheet):
 
 
 async def _rows(sheet):
-    visible = (await sheet.request('GET', 'A:E')).get('values', [])
-    metadata = (await sheet.request('GET', 'R:T')).get('values', [])
-    cycle_ids = (await sheet.request('GET', 'X:X')).get('values', [])
+    visible, metadata, cycle_ids = await sheet.batch_get(['A:E', 'R:T', 'X:X'])
     if visible and visible[0] != HEADER:
         raise GoogleSheetsError('Заголовки продаж отличаются от ожидаемых')
     if metadata and metadata[0] != EFLP_META_HEADER:

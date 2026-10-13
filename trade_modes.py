@@ -1034,6 +1034,7 @@ def _switch_rejected_cash_reverse(journal, state, cycle_id, profile):
 
 async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None, sheets=None):
     from main import build_parser
+    from sheets import GoogleSheetsRateLimited
 
     async def wait_transient(exc):
         state['status'] = 'waiting'
@@ -1042,21 +1043,35 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
             state['mexc_read_waiting'] = True
         if isinstance(exc, AdsPowerUnavailable):
             state['adspower_waiting'] = True
+        if isinstance(exc, GoogleSheetsRateLimited):
+            state['sheets_waiting'] = True
         save_state(journal, state)
         try:
             await wait_until(datetime.now(timezone.utc) + timedelta(seconds=30), stop_event)
         finally:
             state.pop('mexc_read_waiting', None)
             state.pop('adspower_waiting', None)
+            state.pop('sheets_waiting', None)
             if not stop_event.is_set():
                 state['status'] = 'running'
             save_state(journal, state)
+
+    async def wait_for_sheets(operation):
+        while True:
+            try:
+                return await operation()
+            except GoogleSheetsRateLimited as exc:
+                await wait_transient(exc)
+                if stop_event.is_set():
+                    raise OperatorStopped('Остановлено оператором')
 
     async def refresh_eflp_progress():
         if sheets:
             from sheets import GoogleSheetsError
             try:
                 sales = await sheets.read_eflp_sales(journal)
+            except GoogleSheetsRateLimited:
+                raise
             except GoogleSheetsError as exc:
                 raise Paused(f'Не удалось сверить прогресс Eflp с Google Таблицей: {exc}') from exc
             except Exception as exc:
@@ -1072,6 +1087,8 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
             from sheets import GoogleSheetsError
             try:
                 sales = await sheets.read_eflp_sales(journal)
+            except GoogleSheetsRateLimited:
+                raise
             except GoogleSheetsError as exc:
                 raise Paused(f'Не удалось сверить уникальные наличные с Google Таблицей: {exc}') from exc
         else:
@@ -1083,6 +1100,7 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
 
     state.pop('mexc_read_waiting', None)
     state.pop('adspower_waiting', None)
+    state.pop('sheets_waiting', None)
     state['status'] = 'running'
     save_state(journal, state)
     sheet_checked = False
@@ -1103,14 +1121,14 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                         restore_eflp_progress(journal, state, journal.sales())
                         save_state(journal, state)
                 elif week_changed or sheets:
-                    await refresh_eflp_progress()
+                    await wait_for_sheets(refresh_eflp_progress)
                     sheet_checked = bool(sheets)
             elif state['mode'] == 'cash_unique':
                 from sheets import weekly_start
                 week_changed = (state.get('cash_unique_week_start')
                                 != weekly_start(datetime.now(timezone.utc)).isoformat())
                 if not state.get('active_cycle') and (week_changed or sheets and not sheet_checked):
-                    await refresh_cash_unique_progress()
+                    await wait_for_sheets(refresh_cash_unique_progress)
                     sheet_checked = bool(sheets)
             if stop_event.is_set():
                 raise OperatorStopped('Остановлено оператором')
@@ -1148,8 +1166,8 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                             and sheets and hasattr(sheets, 'send_weekly')):
                         from sheets import Reporter
                         from notifier import TelegramNotifier
-                        await Reporter(journal, telegram or TelegramNotifier('', ''), sheets,
-                                       keyboard=telegram_keyboard).flush(force_sheets=True)
+                        await wait_for_sheets(lambda: Reporter(journal, telegram or TelegramNotifier('', ''), sheets,
+                                       keyboard=telegram_keyboard).flush(force_sheets=True))
                     continue
                 args = build_parser().parse_args(['cycle', '--resume', cycle_id])
             else:
@@ -1420,8 +1438,8 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                         and sheets and hasattr(sheets, 'send_weekly')):
                     from sheets import Reporter
                     from notifier import TelegramNotifier
-                    await Reporter(journal, telegram or TelegramNotifier('', ''), sheets,
-                                   keyboard=telegram_keyboard).flush(force_sheets=True)
+                    await wait_for_sheets(lambda: Reporter(journal, telegram or TelegramNotifier('', ''), sheets,
+                                   keyboard=telegram_keyboard).flush(force_sheets=True))
                 continue
             if _handle_forward_rejection(journal, state, cycle_id, profile):
                 state.pop('current_profile', None)

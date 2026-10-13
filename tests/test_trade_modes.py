@@ -726,6 +726,34 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state['active_cycle'])
         self.assertEqual(state['completed_count'], 1)
 
+    async def test_eflp_rate_limit_waits_and_retries_without_losing_progress(self):
+        from sheets import GoogleSheetsRateLimited
+
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        cid = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+                                   'p1_profile': 'p1', 'p2_profile': '1',
+                                   'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(cid, 'forward_complete', 'both', 'done', 'sold',
+            result={'quantity': '20050'}, context={'amount': '100000', 'quantity': '20050'})
+        self.complete(cid, '20050')
+        state['active_cycle'] = cid
+        save_state(self.journal, state)
+        sheets = type('Sheets', (), {'read_eflp_sales': AsyncMock(side_effect=[
+            GoogleSheetsRateLimited('Google Sheets HTTP 429'), self.journal.sales()])})()
+        with (patch.dict(os.environ, env),
+              patch('trade_modes.wait_until', new_callable=AsyncMock) as wait,
+              patch('trade_modes._final_order', new_callable=AsyncMock,
+                    side_effect=Paused('final order preflight'))):
+            with self.assertRaisesRegex(Paused, 'final order preflight'):
+                await run_mode(self.journal, state, asyncio.Event(), None, sheets=sheets)
+        self.assertEqual(wait.await_count, 1)
+        self.assertEqual(sheets.read_eflp_sales.await_count, 2)
+        self.assertEqual(state['eflp_volume_by_profile']['1'], '20050')
+        self.assertNotIn('sheets_waiting', state)
+
     def test_eflp_volume_waits_for_return_when_unfinished_sale_crosses_target(self):
         self.journal.abandon(self.cycle_id)
         env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}

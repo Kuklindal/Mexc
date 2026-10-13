@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 import os
+import random
 from pathlib import Path
 from urllib.parse import quote
 
@@ -184,6 +185,24 @@ class GoogleSheetsError(RuntimeError):
     """Safe diagnostic text without credentials or raw HTTP responses."""
 
 
+class GoogleSheetsRateLimited(GoogleSheetsError):
+    """The Sheets per-minute quota is temporarily exhausted."""
+
+
+async def _google_request(method: str, url: str, **kwargs) -> httpx.Response:
+    # Google's per-minute quota is shared by bots using the same service account.
+    # The last attempt is more than one minute after the first one.
+    async with httpx.AsyncClient(timeout=30) as client:
+        for attempt in range(8):
+            response = await client.request(method, url, **kwargs)
+            if response.status_code != 429:
+                return response
+            if attempt == 7:
+                raise GoogleSheetsRateLimited('Google Sheets HTTP 429; лимит запросов, повторите позже')
+            await asyncio.sleep(min(2 ** attempt + random.random(), 64))
+    raise AssertionError('unreachable')
+
+
 class GoogleSheets:
     def __init__(self, spreadsheet_id: str, tab: str, credentials_file: str):
         from google.oauth2.service_account import Credentials
@@ -209,12 +228,11 @@ class GoogleSheets:
         a1 = "'" + self.tab.replace("'", "''") + "'!" + cell_range
         url = ("https://sheets.googleapis.com/v4/spreadsheets/"
                + quote(self.spreadsheet_id, safe="") + "/values/" + quote(a1, safe=""))
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.request(method, url,
-                headers={"Authorization": f"Bearer {token}"},
-                params=({"valueInputOption": "RAW"} if values is not None else
-                        {"valueRenderOption": value_render_option} if value_render_option else None),
-                json={"values": values} if values is not None else None)
+        response = await _google_request(method, url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=({"valueInputOption": "RAW"} if values is not None else
+                    {"valueRenderOption": value_render_option} if value_render_option else None),
+            json={"values": values} if values is not None else None)
         if response.status_code >= 400:
             hints = {403: ("запись отклонена для сервисного аккаунта в этой таблице; проверьте его роль для GOOGLE_SHEET_ID и ограничения файла"
                            if method != "GET" else "нет доступа на чтение таблицы для сервисного аккаунта"),
@@ -224,13 +242,28 @@ class GoogleSheets:
                                     + hints.get(response.status_code, "проверьте настройки или повторите позже"))
         return response.json()
 
+    async def batch_get(self, ranges: list[str]) -> list[list]:
+        token = await self.token()
+        prefix = "'" + self.tab.replace("'", "''") + "'!"
+        url = ("https://sheets.googleapis.com/v4/spreadsheets/"
+               + quote(self.spreadsheet_id, safe="") + "/values:batchGet")
+        response = await _google_request('GET', url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=[('ranges', prefix + cell_range) for cell_range in ranges])
+        if response.status_code >= 400:
+            raise GoogleSheetsError(f'Google Sheets batchGet HTTP {response.status_code}')
+        value_ranges = response.json().get('valueRanges', [])
+        if len(value_ranges) != len(ranges):
+            raise GoogleSheetsError('Google Sheets batchGet вернул неполный ответ')
+        return [item.get('values', []) for item in value_ranges]
+
     async def batch_update(self, requests: list[dict]) -> dict:
         token = await self.token()
         url = ("https://sheets.googleapis.com/v4/spreadsheets/"
                + quote(self.spreadsheet_id, safe="") + ":batchUpdate")
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(url, headers={"Authorization": f"Bearer {token}"},
-                                         json={"requests": requests})
+        response = await _google_request('POST', url,
+            headers={"Authorization": f"Bearer {token}"},
+            json={"requests": requests})
         if response.status_code >= 400:
             raise GoogleSheetsError(f"Google Sheets batchUpdate HTTP {response.status_code}; проверьте права и формулы")
         return response.json()
@@ -240,9 +273,9 @@ class GoogleSheets:
             return self.sheet_id
         token = await self.token()
         url = "https://sheets.googleapis.com/v4/spreadsheets/" + quote(self.spreadsheet_id, safe="")
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(url, headers={"Authorization": f"Bearer {token}"},
-                                        params={"fields": "sheets(properties(sheetId,title))"})
+        response = await _google_request('GET', url,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"fields": "sheets(properties(sheetId,title))"})
         if response.status_code >= 400:
             raise GoogleSheetsError(f"Google Sheets metadata HTTP {response.status_code}")
         matches = [sheet["properties"]["sheetId"] for sheet in response.json().get("sheets", [])
@@ -545,6 +578,8 @@ class Reporter:
                     self.journal.sale_delivered(sale["id"])
                 self.sheet_error_reported = False
             except Exception as exc:
+                if force_sheets and isinstance(exc, GoogleSheetsRateLimited):
+                    raise
                 if not sales:
                     raise
                 reason = str(exc) if isinstance(exc, GoogleSheetsError) else type(exc).__name__

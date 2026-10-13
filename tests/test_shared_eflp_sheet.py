@@ -25,6 +25,11 @@ class SharedEflpSheetTests(unittest.IsolatedAsyncioTestCase):
         self.sheet.get_sheet_id = AsyncMock(return_value=0)
         self.sheet.batch_update = AsyncMock(return_value={})
 
+        async def batch_get(ranges):
+            return [self.columns[cell_range] for cell_range in ranges]
+
+        self.sheet.batch_get = AsyncMock(side_effect=batch_get)
+
         async def request(method, cell_range, values=None, *, value_render_option=None):
             if method == 'GET':
                 return {'values': self.columns[cell_range]}
@@ -75,6 +80,7 @@ class SharedEflpSheetTests(unittest.IsolatedAsyncioTestCase):
         self.volume.sale_delivered(first['id'])
 
         await self.sheet.prepare(self.volume)
+        self.sheet.batch_get.assert_awaited_with(['A:E', 'R:T', 'X:X'])
         self.assertEqual(self.columns['X:X'], [SHARED_CYCLE_HEADER, [first['cycle_id']]])
         self.sheet.ready = False
         second = self.sale(self.unique, 'p1_4', '2', 'member-two')

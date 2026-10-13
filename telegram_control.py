@@ -366,6 +366,8 @@ class TelegramControl:
             bot_state = 'Ждёт ответа MEXC; повтор чтения каждые 30 секунд'
         elif self.running and scheduler and scheduler.get('adspower_waiting'):
             bot_state = 'Ждёт AdsPower; повтор через 30 секунд'
+        elif self.running and scheduler and scheduler.get('sheets_waiting'):
+            bot_state = 'Ждёт Google Таблицу; повтор через 30 секунд'
         elif (self.running and scheduler and scheduler.get('status') == 'waiting'
               and scheduler.get('last_error') and not cycle):
             bot_state = 'Повторяет подключение'
@@ -411,6 +413,7 @@ class TelegramControl:
                     f'{p2_nickname(name)} {quantity} USDT' for name, quantity in dust.items()))
             if (scheduler.get('last_error') and
                     (scheduler.get('mexc_read_waiting') or scheduler.get('adspower_waiting')
+                     or scheduler.get('sheets_waiting')
                      or self.running and not cycle)):
                 lines.append('⚠️ ' + scheduler['last_error'][:200])
         if cycle:
