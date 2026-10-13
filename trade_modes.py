@@ -95,8 +95,8 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
         maximum = Decimal(str(ad['maxSingleTransAmount']))
         if not all(value.is_finite() and value > 0 for value in (available, price, minimum, maximum)):
             raise Paused('Некорректный остаток, цена или лимиты SELL-объявления П1')
-        volume_transition = state['mode'] == 'eflp_volume' and next_maker is not None
-        if volume_transition:
+        eflp_reserve = state['mode'] in {'eflp_volume', 'eflp_unique'}
+        if eflp_reserve:
             reserve = Decimal('100')
             if reserve * price < minimum:
                 raise Paused('Для сохранения доступности SELL-объявления его минимум превышает резерв 100 USDT')
@@ -105,7 +105,7 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
             if reserve_floor > 1200:
                 raise Paused('Для сохранения доступности SELL-объявления его минимум превышает резерв 12 USDT')
             reserve = Decimal(random.randint(reserve_floor, 1200)) / 100
-        reserve_label = '100 USDT' if volume_transition else '10–12 USDT'
+        reserve_label = '100 USDT' if eflp_reserve else '10–12 USDT'
         quantity = (available - reserve).quantize(Decimal('0.0001'), rounding=ROUND_DOWN)
         if quantity <= 0:
             raise Paused(f'Остатка SELL-объявления П1 недостаточно для финального выкупа с резервом {reserve_label}')
