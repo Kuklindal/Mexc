@@ -98,8 +98,6 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
         eflp_reserve = state['mode'] in {'eflp_volume', 'eflp_unique'}
         if eflp_reserve:
             reserve = Decimal('100')
-            if reserve * price < minimum:
-                raise Paused('Для сохранения доступности SELL-объявления его минимум превышает резерв 100 USDT')
         else:
             reserve_floor = max(1000, int((minimum / price * 100).to_integral_value(rounding=ROUND_UP)))
             if reserve_floor > 1200:
@@ -110,8 +108,13 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
         if quantity <= 0:
             raise Paused(f'Остатка SELL-объявления П1 недостаточно для финального выкупа с резервом {reserve_label}')
         fiat_amount = quantity * price
-        if fiat_amount < minimum or (fiat_amount > maximum and not eflp_reserve):
+        if not eflp_reserve and not minimum <= fiat_amount <= maximum:
             raise Paused(f'Весь остаток SELL-объявления минус {reserve_label} не помещается в лимиты одного ордера')
+        target_minimum = min(minimum, (reserve * price).quantize(Decimal('0.01'), rounding=ROUND_DOWN),
+                             fiat_amount.quantize(Decimal('0.01'), rounding=ROUND_DOWN))
+        target_maximum = max(maximum, fiat_amount.quantize(Decimal('0.01'), rounding=ROUND_UP))
+        if eflp_reserve and target_minimum < Decimal('0.01'):
+            raise Paused('Финальный ордер Eflp меньше 0.01 в валюте объявления; лимиты изменить нельзя')
         if next_maker:
             next_profile = profile_from_env(next_maker, env)
             next_settings = settings_for_profile(next_maker)
@@ -130,19 +133,20 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
                     raise Paused('Финальный перевод не помещается в лимиты BUY-объявления следующего П1')
             finally:
                 await next_client.close()
-        if eflp_reserve and fiat_amount > maximum:
-            target = fiat_amount.quantize(Decimal('0.01'), rounding=ROUND_UP)
+        if eflp_reserve and (target_minimum < minimum or target_maximum > maximum):
             browser = maker_browser(maker, env)
             await browser.ensure_started()
             await browser.ensure_mexc_page()
-            await browser.increase_ad_limit({
+            await browser.adjust_ad_limits({
                 'edit_limit': True, 'adv_no': maker.sell_adv_no,
                 'side': 'SELL', 'fiat': ad['fiatUnit'],
                 'before_available': str(ad['availableQuantity']),
                 'before_frozen': str(ad.get('frozenQuantity') or 0),
-                'price': str(ad['price']), 'minimum': str(ad['minSingleTransAmount']),
+                'price': str(ad['price']),
+                'before_minimum': str(ad['minSingleTransAmount']),
+                'target_minimum': format(target_minimum, 'f'),
                 'before_maximum': str(ad['maxSingleTransAmount']),
-                'target_maximum': format(target, 'f'),
+                'target_maximum': format(target_maximum, 'f'),
             })
             # The browser response alone is insufficient: the public order API
             # must also expose the new maximum before a final order is created.
@@ -154,14 +158,16 @@ async def _final_order(state: dict, next_maker: str | None, *, env=os.environ) -
                         or updated.get('coinName') != ad.get('coinName')
                         or Decimal(str(updated.get('price'))) != price
                         or Decimal(str(updated.get('availableQuantity'))) != available
-                        or Decimal(str(updated.get('minSingleTransAmount'))) != minimum):
+                        or updated.get('advStatus') != 'OPEN'):
                     raise Paused('После изменения лимита SELL-объявление изменилось; проверьте его на MEXC')
-                if Decimal(str(updated.get('maxSingleTransAmount'))) >= target:
+                if (Decimal(str(updated.get('minSingleTransAmount'))) <= target_minimum
+                        and Decimal(str(updated.get('maxSingleTransAmount'))) >= target_maximum):
                     break
                 if attempt < 4:
                     await asyncio.sleep(2)
             else:
-                raise Paused(f'MEXC не подтвердил лимит SELL-объявления {target} {ad["fiatUnit"]}; финальный ордер не создан')
+                raise Paused(f'MEXC не подтвердил лимиты SELL-объявления '
+                             f'{target_minimum}–{target_maximum} {ad["fiatUnit"]}; финальный ордер не создан')
         return f'{fiat_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)} {ad["fiatUnit"]}', format(quantity, 'f')
     finally:
         await client.close()
@@ -1318,7 +1324,8 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                               if state['mode'] in {'eflp_volume', 'eflp_unique', 'cash_unique'} else None)
                 eflp_pool_done = (state['mode'] == 'eflp_unique' and next_maker is not None
                                   and bool(state['profiles'])
-                                  and all(name in state['unique_done'] for name in state['profiles']))
+                                  and bool(state['unique_done'])
+                                  and next_profile(state, journal=journal)[0] is None)
                 if cash_unique_done and len(state['p1_profiles']) == 1:
                     state['status'] = 'done'
                     save_state(journal, state)

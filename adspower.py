@@ -144,17 +144,21 @@ AD_LIMIT = r"""async (advNo, plan) => {
             || !same(before.availableQuantity,plan.before_available)
             || !same(before.frozenQuantity ?? 0,plan.before_frozen)
             || !same(before.price,plan.price)
-            || !same(before.minTradeLimit,plan.minimum)
             || !paymentIds || !Number.isFinite(num(before.coinId))
             || before.priceType !== 0 || !Number.isFinite(num(before.expirationTime))
             || before.kycLevel == null || before.display == null || before.adsType == null
             || before.merchantTradeEnable == null || before.onlyTradeKybUser == null)
         return {error:'ad_changed'};
-    if (!Number.isFinite(num(plan.target_maximum)))
+    if (!Number.isFinite(num(plan.target_maximum))
+            || !Number.isFinite(num(plan.target_minimum))
+            || num(plan.target_minimum) <= 0
+            || num(plan.target_minimum) > num(plan.target_maximum))
         return {error:'invalid_limit'};
-    if (num(before.maxTradeLimit) >= num(plan.target_maximum))
-        return {id:before.id,maxTradeLimit:before.maxTradeLimit};
-    if (!same(before.maxTradeLimit,plan.before_maximum))
+    if (num(before.maxTradeLimit) >= num(plan.target_maximum)
+            && num(before.minTradeLimit) <= num(plan.target_minimum))
+        return {id:before.id,minTradeLimit:before.minTradeLimit,maxTradeLimit:before.maxTradeLimit};
+    if (!same(before.maxTradeLimit,plan.before_maximum)
+            || !same(before.minTradeLimit,plan.before_minimum))
         return {error:'ad_changed'};
     const params = {
         id:advNo, tradeType:'SELL', coinId:before.coinId, currency:before.currency,
@@ -162,7 +166,7 @@ AD_LIMIT = r"""async (advNo, plan) => {
         quantity:before.availableQuantity,
         oldAvailableQuantity:before.availableQuantity,
         newAvailableQuantity:before.availableQuantity,
-        minTradeLimit:before.minTradeLimit, maxTradeLimit:plan.target_maximum,
+        minTradeLimit:plan.target_minimum, maxTradeLimit:plan.target_maximum,
         expirationTime:before.expirationTime,
         autoResponse:before.autoResponse ?? '', tradeTerms:before.tradeTerms ?? '',
         kycLevel:before.kycLevel ?? 1,
@@ -193,16 +197,16 @@ AD_LIMIT = r"""async (advNo, plan) => {
     const after = await read('read_after');
     if (after.error) return after;
     if (!same(after.maxTradeLimit,plan.target_maximum)
+            || !same(after.minTradeLimit,plan.target_minimum)
             || !same(after.availableQuantity,before.availableQuantity)
             || !same(after.frozenQuantity ?? 0,before.frozenQuantity ?? 0)
             || !same(after.price,before.price)
-            || !same(after.minTradeLimit,before.minTradeLimit)
             || after.state !== before.state || after.tradeType !== before.tradeType
             || after.currency !== before.currency
             || String(after.paymethodIds) !== String(before.paymethodIds)
             || JSON.stringify(after.overVerify ?? null) !== JSON.stringify(before.overVerify ?? null))
         return {error:'result_mismatch'};
-    return {id:after.id,maxTradeLimit:after.maxTradeLimit};
+    return {id:after.id,minTradeLimit:after.minTradeLimit,maxTradeLimit:after.maxTradeLimit};
 }"""
 
 
@@ -835,18 +839,22 @@ class AdsPower:
                 raise AdsPowerError("Некорректный общий остаток объявления; запрос не отправлен")
         return await self._ad_quantity(plan['adv_no'], plan)
 
-    async def increase_ad_limit(self, plan: dict) -> dict:
+    async def adjust_ad_limits(self, plan: dict) -> dict:
         try:
-            old = Decimal(plan['before_maximum'])
-            target = Decimal(plan['target_maximum'])
-            minimum = Decimal(plan['minimum'])
+            old_max = Decimal(plan['before_maximum'])
+            target_max = Decimal(plan['target_maximum'])
+            old_min = Decimal(plan['before_minimum'])
+            target_min = Decimal(plan['target_minimum'])
             price = Decimal(plan['price'])
             available = Decimal(plan['before_available'])
             frozen = Decimal(plan['before_frozen'])
         except (KeyError, ValueError, ArithmeticError):
             raise AdsPowerError('Некорректный план изменения лимита объявления') from None
-        if (not all(n.is_finite() for n in (old, target, minimum, price, available, frozen))
-                or not 0 < minimum <= old < target <= available * price
+        if (not all(n.is_finite() for n in (old_max, target_max, old_min,
+                                             target_min, price, available, frozen))
+                or not 0 < target_min <= old_min <= old_max <= target_max
+                or (target_min == old_min and target_max == old_max)
+                or (target_max > old_max and target_max > available * price)
                 or available <= 0 or frozen < 0 or plan.get('side') != 'SELL'
                 or not re.fullmatch(r'[A-Z]{3}', plan.get('fiat', ''))):
             raise AdsPowerError('Некорректный план изменения лимита объявления')
@@ -937,9 +945,9 @@ class AdsPower:
                 if plan and plan.get('edit_limit'):
                     if reason == 'limit_rejected':
                         raise AdsPowerError(
-                            f'MEXC отклонил увеличение максимума SELL-объявления до '
-                            f'{plan["target_maximum"]} {plan["fiat"]}{detail}; '
-                            'финальный ордер не создан. Проверьте предел в настройках объявления')
+                            f'MEXC отклонил изменение лимитов SELL-объявления до '
+                            f'{plan["target_minimum"]}–{plan["target_maximum"]} {plan["fiat"]}{detail}; '
+                            'финальный ордер не создан. Проверьте допустимые пределы объявления')
                     if reason in {'read_before_network', 'read_before_rejected'}:
                         raise AdsPowerUnavailable(
                             f'MEXC не дал прочитать SELL-объявление перед изменением лимита ({reason}{detail}); '

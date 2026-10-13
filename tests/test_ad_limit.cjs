@@ -15,7 +15,8 @@ const ad = {
 };
 const plan = {
     edit_limit:true, side:'SELL', fiat:'TJS', before_available:'500', before_frozen:'0',
-    price:'11.1', minimum:'1000', before_maximum:'3000', target_maximum:'4440'
+    price:'11.1', before_minimum:'1000', target_minimum:'1000',
+    before_maximum:'3000', target_maximum:'4440'
 };
 
 async function run(responses, intent=plan) {
@@ -51,6 +52,13 @@ async function run(responses, intent=plan) {
     assert.equal(body.get('paymethodIds'),'526');
     assert.equal(body.get('tradeTerms'),'existing terms');
     assert.equal(body.get('overVerify'),JSON.stringify({types:[1]}));
+
+    const lower={...plan,target_minimum:'500',target_maximum:'3000'};
+    r=await run([{code:0,data:ad},{code:0},
+                 {code:0,data:{...ad,minTradeLimit:500}}],lower);
+    assert.equal(r.result.minTradeLimit,500);
+    assert.equal(new URLSearchParams(r.calls[1].body).get('minTradeLimit'),'500');
+    assert.equal(new URLSearchParams(r.calls[1].body).get('maxTradeLimit'),'3000');
 
     r=await run([{code:0,data:{...ad,maxTradeLimit:4440}}]);
     assert.equal(r.result.maxTradeLimit,4440);
