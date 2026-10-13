@@ -25,22 +25,27 @@ async def main() -> None:
     if not row:
         raise RuntimeError('В выбранной базе нет состояния серии')
     state = json.loads(row[0])
-    name = state['p1_profile']
+    next_buy = '--next-buy' in sys.argv
+    pending = state.get('terminal_pending') or {}
+    name = pending.get('to') if next_buy else state['p1_profile']
+    if not name:
+        raise RuntimeError('В состоянии серии нет следующего П1')
     prefix = 'MEXC_P1' if name == 'p1' else 'MEXC_' + name.upper()
     profile_key = ('ADSPOWER_P1_PROFILE_ID' if name == 'p1'
                    else prefix + '_ADSPOWER_PROFILE_ID')
     profile_id = os.getenv(profile_key, '').strip()
-    sell_adv_no = os.getenv(prefix + '_SELL_ADV_NO', '').strip()
-    if not profile_id or not sell_adv_no:
-        raise RuntimeError(f'Проверьте {profile_key} и {prefix}_SELL_ADV_NO')
+    side = 'BUY' if next_buy else 'SELL'
+    adv_no = os.getenv(prefix + f'_{side}_ADV_NO', '').strip()
+    if not profile_id or not adv_no:
+        raise RuntimeError(f'Проверьте {profile_key} и {prefix}_{side}_ADV_NO')
     print('Конфигурация:', ENV_FILE.name, 'П1:', name, 'AdsPower ID:', profile_id,
-          'этап:', state.get('status'), flush=True)
+          'объявление:', side, 'этап:', state.get('status'), flush=True)
 
     browser = AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
                        os.getenv('ADSPOWER_API_KEY', ''), profile_id)
     expression = (
         '(async()=>{const out={host:location.hostname,protocol:location.protocol,'
-        'ready:document.readyState};const adv=' + json.dumps(sell_adv_no) + ';'
+        'ready:document.readyState};const adv=' + json.dumps(adv_no) + ';'
         "if(location.protocol!=='https:'||!['mexc.com','www.mexc.com','mexc.co',"
         "'www.mexc.co','mexc.io','www.mexc.io'].includes(location.hostname))return out;"
         "try{const r=await fetch('/api/platform/p2p/api/merchant/order/'+adv,"
@@ -52,17 +57,19 @@ async def main() -> None:
         targets = (await call('Target.getTargets', timeout=15)).get('targetInfos', [])
         pages = [target for target in targets if target.get('type') == 'page'
                  and 'mexc' in (urlsplit(target.get('url', '')).hostname or '')]
-        created_target_id = None
-        if '--open-co' in sys.argv and not any(
-                urlsplit(target.get('url', '')).hostname == 'www.mexc.co' for target in pages):
+        created_target_ids = set()
+        for flag, host in (('--open-com', 'www.mexc.com'), ('--open-co', 'www.mexc.co')):
+            if flag not in sys.argv or any(
+                    urlsplit(target.get('url', '')).hostname == host for target in pages):
+                continue
+            url = f'https://{host}/ru-RU/buy-crypto/create-advertising'
             created = await call('Target.createTarget', {
-                'url': 'https://www.mexc.co/ru-RU/buy-crypto/create-advertising',
-                'background': True}, timeout=30)
-            created_target_id = created.get('targetId')
-            if not created_target_id:
-                raise RuntimeError('AdsPower не открыл вкладку www.mexc.co')
-            pages.append({'type': 'page', 'targetId': created_target_id,
-                          'url': 'https://www.mexc.co/ru-RU/buy-crypto/create-advertising'})
+                'url': url, 'background': True}, timeout=30)
+            target_id = created.get('targetId')
+            if not target_id:
+                raise RuntimeError(f'AdsPower не открыл вкладку {host}')
+            created_target_ids.add(target_id)
+            pages.append({'type': 'page', 'targetId': target_id, 'url': url})
         print('Вкладок MEXC:', len(pages), flush=True)
         for target in pages:
             listed_host = urlsplit(target.get('url', '')).hostname
@@ -70,7 +77,7 @@ async def main() -> None:
                 attached = await call('Target.attachToTarget', {
                     'targetId': target['targetId'], 'flatten': True}, timeout=12)
                 value = None
-                for attempt in range(10 if target.get('targetId') == created_target_id else 1):
+                for attempt in range(10 if target.get('targetId') in created_target_ids else 1):
                     if attempt:
                         await asyncio.sleep(2)
                     result = await call('Runtime.evaluate', {
