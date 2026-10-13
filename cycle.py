@@ -1758,11 +1758,18 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                 await browser.ensure_mexc_page()
                 async with browser.connection() as call:
                     await call("Target.getTargets")
+                if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing:
+                    # Verify the logged-in browser owns this maker's ad before
+                    # creating an order. A valid AdsPower profile ID can still
+                    # be logged into a different MEXC account.
+                    await browser.ad_details(os.environ[f"{prefixes['p1']}_SELL_ADV_NO"])
                 if reverse_browser:
                     await reverse_browser.ensure_started()
                     await reverse_browser.ensure_mexc_page()
                     async with reverse_browser.connection() as call:
                         await call('Target.getTargets')
+                    if scheduler_mode in {'eflp_volume', 'eflp_unique'} and not existing:
+                        await reverse_browser.ad_details(os.environ[f'{reverse_p1_prefix}_BUY_ADV_NO'])
                 if p2_payment_browser and reverse_maker == 'p1' and not existing:
                     # Check the receiving account before the first order can lock USDT.
                     p2_payment_account_id = await p2_payment_browser.payment_account_by_method(

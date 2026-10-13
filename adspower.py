@@ -56,8 +56,18 @@ AD_QUANTITY = r"""async (advNo, plan) => {
         } catch (_) {
             return {error:stage + '_network'};
         }
-        if (!response.ok || body?.code !== 0)
+        if (!response.ok || body?.code !== 0) {
+            if (stage === 'read_before' && response.ok && body?.code === 60017) {
+                try {
+                    const listResponse = await fetch(root, {method:'GET',credentials:'same-origin',cache:'no-store'});
+                    const list = await listResponse.json();
+                    if (listResponse.ok && list?.code === 0 && Array.isArray(list.data)
+                            && !list.data.some(item => item?.id === advNo))
+                        return {error:'ad_not_in_browser_list',code:60017};
+                } catch (_) { /* Preserve the original rejection if listing fails. */ }
+            }
             return {error:stage + '_rejected',http:response.status,code:body?.code ?? null};
+        }
         const d = body.data;
         if (!d || d.id !== advNo) return {error:stage + '_mismatch'};
         return {id:d.id, availableQuantity:d.availableQuantity, frozenQuantity:d.frozenQuantity,
@@ -699,7 +709,10 @@ class AdsPower:
                 reason = value.get('error', 'read_failed') if isinstance(value, dict) else 'read_failed'
                 detail = (f"; HTTP {value['http']}" if isinstance(value, dict) and isinstance(value.get('http'), int) else '')
                 detail += (f"; MEXC {value['code']}" if isinstance(value, dict) and isinstance(value.get('code'), int) else '')
-                message = f"MEXC: чтение/пополнение объявления через браузер не подтверждено ({reason}{detail})"
+                message = (f"MEXC: профиль AdsPower не показывает объявление {adv_no}; "
+                           "проверьте, что в нём открыт аккаунт П1 этого цикла"
+                           if reason == 'ad_not_in_browser_list' else
+                           f"MEXC: чтение/пополнение объявления через браузер не подтверждено ({reason}{detail})")
                 if reason in {'read_before_network', 'read_before_rejected'}:
                     raise AdsPowerUnavailable(message + '; запрос пополнения не отправлен')
                 if plan and reason in {'read_failed', 'quantity_reply_unknown', 'read_after_network',

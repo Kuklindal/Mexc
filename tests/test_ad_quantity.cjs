@@ -71,5 +71,12 @@ async function run(responses, intent=plan) {
     r=await run([{code:0,data:ad},{code:0},new Error('read after write failed')]);
     assert.equal(r.result.error,'read_after_network');
     assert.equal(r.calls.filter(c=>c.method==='POST').length,1);
+    r=await run([{code:60017},{code:0,data:[{id:'a1835921549215662081'}]}]);
+    assert.equal(r.result.error,'ad_not_in_browser_list');
+    assert.equal(r.calls[1].url,'/api/platform/p2p/api/merchant/order');
+    assert.equal(r.calls.filter(c=>c.method==='POST').length,0);
+    r=await run([{code:60017},{code:0,data:[{id}]}]);
+    assert.equal(r.result.error,'read_before_rejected');
+    assert.equal(r.calls.filter(c=>c.method==='POST').length,0);
     console.log('Quantity-only requests: OK (mock fetch only)');
 })().catch(error=>{console.error(error);process.exitCode=1;});

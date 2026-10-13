@@ -32,6 +32,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 ('read_after_network', {'quantity': '100'}, AdsPowerClickUnknown),
                 ('result_mismatch', {'quantity': '100'}, AdsPowerClickUnknown),
                 ('read_failed', {'quantity': '100'}, AdsPowerClickUnknown),
+                ('ad_not_in_browser_list', {'quantity': '100'}, AdsPowerError),
                 ('read_before_network', None, AdsPowerUnavailable)):
             with self.subTest(reason=reason, plan=plan):
                 self.call.reset_mock(side_effect=True)
