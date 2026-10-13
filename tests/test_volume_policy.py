@@ -6,12 +6,31 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from journal import Journal
+from rollover import clear_cooldown, load_state, save_state
 from volume_policy import (cooldown_until, record_purchase, remaining_usdt,
                            rolling_cash_purchases, rolling_cash_retry_at,
                            should_rotate, window_for)
 
 
 class VolumePolicyTests(unittest.TestCase):
+    def test_cash_timer_cannot_be_cleared_while_order_outcome_is_unknown(self):
+        with TemporaryDirectory() as directory:
+            journal = Journal(Path(directory) / 'cycles.sqlite3')
+            attempted = datetime.now(timezone.utc) - timedelta(minutes=30)
+            cycle_id = journal.create({'p2_profile': '28', 'members': {'p2': 'member-28'}})
+            with patch('journal.now', return_value=attempted.isoformat()):
+                journal.transition(cycle_id, 'forward_create', 'p2', 'done', 'created',
+                                   result={'order_no': 'test-order'})
+            journal.abandon(cycle_id)
+            save_state(journal, {'mode': 'cash_volume', 'profiles': ['28'],
+                                 'cooldowns': {'28': {'reason': 'volume_rolling',
+                                                      'until': (attempted + timedelta(days=1)).isoformat()}}})
+            with patch.dict('os.environ', {'MEXC_P2_28_MEMBER_ID': 'member-28'}):
+                with self.assertRaisesRegex(ValueError, 'без подтверждённого итога'):
+                    clear_cooldown(journal, '28')
+            self.assertIn('28', load_state(journal)['cooldowns'])
+            journal.close()
+
     def test_third_trade_starts_24_hour_timer_and_purchase_is_idempotent(self):
         state = {}
         at = datetime(2026, 10, 2, 1, tzinfo=timezone.utc)

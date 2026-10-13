@@ -171,6 +171,18 @@ def clear_cooldown(journal, profile):
     if not state or profile not in state.get('profiles', []) or profile not in state.get('cooldowns', {}):
         raise ValueError('У этого профиля нет сохранённого таймера')
     limit = state['cooldowns'][profile]
+    if state.get('mode') == 'cash_volume' and limit.get('reason') == 'volume_rolling':
+        from trade_profiles import profile_prefix
+        from volume_policy import CASH_TARGET_USDT, rolling_cash_purchases
+
+        member_id = (os.getenv(f'{profile_prefix(profile)}_MEMBER_ID') or '').strip()
+        window = rolling_cash_purchases(journal, profile, member_id=member_id)
+        if window.get('uncertain_until'):
+            raise ValueError('Таймер не сброшен: в журнале есть покупка без подтверждённого итога. '
+                             'Сначала сверьте последний ордер на MEXC.')
+        if Decimal(window['quantity']) >= CASH_TARGET_USDT:
+            raise ValueError('Таймер не сброшен: подтверждённый объём покупок за 24 часа '
+                             'ещё достигает лимита налички.')
     if (state.get('mode') == 'volume' and limit.get('reason') == 'volume'
             and datetime.fromisoformat(limit['until']) > datetime.now(timezone.utc)):
         raise ValueError('В режиме «Объём» 24 часа от третьей сделки ещё не прошли; таймер не сброшен')
