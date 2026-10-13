@@ -66,7 +66,7 @@ def _eflp_target_reached(state: dict) -> bool:
     """Volume and unique modes have independent weekly completion targets."""
     volume = sum((Decimal(value) for value in state.get('eflp_volume_by_profile', {}).values()),
                  Decimal('0'))
-    unique = len(state.get('unique_done', []))
+    unique = len(state.get('eflp_unique_member_ids', state.get('unique_done', [])))
     if state['mode'] == 'eflp_volume':
         return volume >= Decimal('20000')
     return unique >= 20
@@ -141,6 +141,7 @@ def restore_eflp_progress(journal, state: dict, sales: list[dict], *, env=os.env
     volumes = {name: Decimal('0') for name in state['profiles']}
     counted = []
     unique_done = []
+    unique_members = set()
     completed_cycles = []
     incomplete = set()
     for sale in sales:
@@ -157,30 +158,39 @@ def restore_eflp_progress(journal, state: dict, sales: list[dict], *, env=os.env
                              'новый ордер остановлен') from None
         if weekly_start(completed_at) != current_week:
             continue
-        profile = member_profiles.get(str(sale.get('p2_member_id') or '').strip())
+        member_id = str(sale.get('p2_member_id') or '').strip()
+        profile = member_profiles.get(member_id)
         if not profile:
             profile = sale.get('p2_profile')
             if profile not in state['profiles']:
-                continue
-            expected_member = str(env.get(f'{profile_prefix(profile)}_MEMBER_ID') or '').strip()
-            if sale.get('p2_member_id') and sale['p2_member_id'] != expected_member:
-                raise ValueError(f'Изменился MEMBER_ID П2 {profile}; объём Eflp требует сверки журнала')
+                profile = 'member:' + member_id if member_id else profile or 'unknown'
+            else:
+                expected_member = str(env.get(f'{profile_prefix(profile)}_MEMBER_ID') or '').strip()
+                if member_id and member_id != expected_member:
+                    raise ValueError(f'Изменился MEMBER_ID П2 {profile}; объём Eflp требует сверки журнала')
+        volumes.setdefault(profile, Decimal('0'))
         volumes[profile] += quantity
-        counted.append(sale['cycle_id'])
-        cycle = journal.cycle(sale['cycle_id'])
-        returned = journal.step(sale['cycle_id'], 'reverse_complete')
-        refilled = journal.step(sale['cycle_id'], 'reverse_replenish')
+        if 'external_complete' not in sale:
+            counted.append(sale['cycle_id'])
+        external = 'external_complete' in sale
+        cycle = None if external else journal.cycle(sale['cycle_id'])
+        returned = None if external else journal.step(sale['cycle_id'], 'reverse_complete')
+        refilled = None if external else journal.step(sale['cycle_id'], 'reverse_replenish')
         buy_refilled = (journal.step(sale['cycle_id'], 'reverse_replenish_buy')
                         if cycle and cycle['spec'].get('buy_replenish') else None)
-        complete = (cycle and cycle['status'] == 'completed'
+        complete = sale.get('external_complete') or (cycle and cycle['status'] == 'completed'
                     and returned and returned['status'] == 'done'
                     and refilled and refilled['status'] == 'done'
                     and (not cycle['spec'].get('buy_replenish')
                          or buy_refilled and buy_refilled['status'] == 'done'))
         if complete:
-            if sale['scheduler_mode'] == state['mode']:
+            if sale['scheduler_mode'] == state['mode'] and 'external_complete' not in sale:
                 completed_cycles.append(sale['cycle_id'])
-            if profile not in unique_done:
+            if not member_id:
+                raise ValueError('У завершённой продажи Eflp нет MEMBER_ID П2; '
+                                 'уникальность не подтверждена')
+            unique_members.add(member_id)
+            if profile in state['profiles'] and profile not in unique_done:
                 unique_done.append(profile)
         else:
             incomplete.add(profile)
@@ -190,6 +200,7 @@ def restore_eflp_progress(journal, state: dict, sales: list[dict], *, env=os.env
     state['eflp_completed_cycles'] = completed_cycles
     state['completed_count'] = len(completed_cycles)
     state['unique_done'] = unique_done
+    state['eflp_unique_member_ids'] = sorted(unique_members)
     state['eflp_done'] = [name for name in unique_done
                           if volumes[name] >= Decimal('20000') and name not in incomplete]
     state['eflp_week_start'] = current_week.isoformat()
@@ -347,6 +358,7 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
         from sheets import weekly_start
         current_week = weekly_start(datetime.now(timezone.utc)).isoformat()
     completed_same_plan = (previous and previous['status'] == 'done'
+                           and not previous.get('eflp_unique_partial')
                            and (previous['mode'] == mode == 'cash_unique'
                                 and previous.get('p1_profiles') == cash_unique_p1_profiles(env)
                                 and len(previous.get('unique_done', [])) >= 25
@@ -723,6 +735,13 @@ def _finish_completed_cycle(journal, state, cycle_id, profile, *, persist=True):
           or state['mode'] == 'cash_unique' and cash_unique_current_week):
         if profile not in state['unique_done']:
             state['unique_done'].append(profile)
+        if state['mode'] in {'eflp_unique', 'eflp_volume'}:
+            member = str(spec.get('members', {}).get('p2') or '').strip()
+            if not member:
+                raise Paused('У завершённого цикла Eflp нет MEMBER_ID П2')
+            members = state.setdefault('eflp_unique_member_ids', [])
+            if member not in members:
+                members.append(member)
     state['active_cycle'] = None
     state.pop('current_profile', None)
     state['last_cycle_rowid'] = cycle_rowid(journal, cycle_id)
@@ -784,7 +803,9 @@ def _finish_terminal_cycle(journal, state, cycle_id: str, profile: str) -> None:
                   else 'eflp_profile_done')
     if not journal.step(cycle_id, event_name):
         label = profile_from_env(pending['from'], os.environ).nickname
-        count = len(state.get('unique_done', []))
+        count = (len(state.get('eflp_unique_member_ids', state.get('unique_done', [])))
+                 if state['mode'] in {'eflp_volume', 'eflp_unique'}
+                 else len(state.get('unique_done', [])))
         volume = state.get('eflp_volume_total', '0')
         message = (f'✅ Уникальные наличка завершены: {label}, {count}/25 П2.'
                    if state['mode'] == 'cash_unique' else
@@ -853,7 +874,7 @@ def _queue_eflp_mode_done(journal, state):
                    f'Общий объём: {total} USDT')
     else:
         message = (f'✅ Уникальные Eflp завершены\nП1: {p1_name}\n'
-                   f'Уникальных П2: {len(state["unique_done"])}')
+                   f'Уникальных П2: {len(state.get("eflp_unique_member_ids", state["unique_done"]))}')
     journal.transition(cycle_id, 'eflp_mode_done', 'system', 'done', message)
 
 
@@ -1081,7 +1102,7 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                     if week_changed:
                         restore_eflp_progress(journal, state, journal.sales())
                         save_state(journal, state)
-                elif week_changed or sheets and not sheet_checked:
+                elif week_changed or sheets:
                     await refresh_eflp_progress()
                     sheet_checked = bool(sheets)
             elif state['mode'] == 'cash_unique':
@@ -1268,6 +1289,19 @@ async def run_mode(journal, state, stop_event, telegram, telegram_keyboard=None,
                         await Reporter(journal, telegram, None, keyboard=telegram_keyboard).flush()
                 if profile is None:
                     if deadline is None:
+                        if (state['mode'] == 'eflp_unique'
+                                and all(name in state['unique_done'] for name in state['profiles'])):
+                            state['status'] = 'done'
+                            state['eflp_unique_partial'] = True
+                            save_state(journal, state)
+                            if telegram and getattr(telegram, 'enabled', False):
+                                await telegram.send(
+                                    f'✅ Настроенные П2 завершили циклы для П1 '
+                                    f'{profile_from_env(state["p1_profile"], os.environ).nickname}: '
+                                    f'{len(state.get("eflp_unique_member_ids", []))}/20 '
+                                    'уникальных за неделю. Добавьте других П2 и запустите режим снова.',
+                                    reply_markup=telegram_keyboard() if telegram_keyboard else None)
+                            return
                         if (state['mode'] == 'cash_unique'
                                 and all(name in state['unique_done'] for name in state['profiles'])):
                             state['status'] = 'done'

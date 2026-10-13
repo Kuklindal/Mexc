@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from functools import partial
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 import os
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -24,6 +26,7 @@ EFLP_MARKER = "П1"
 OLD_EFLP_MARKER = "Eflp: аккаунт П1"
 OLD_EFLP_META_HEADER = ["П1 для сводки Eflp", "Режим", "MEMBER_ID П2"]
 EFLP_META_HEADER = ["Ключ П1 для сводки Eflp", "Режим", "MEMBER_ID П2"]
+SHARED_CYCLE_HEADER = ["ID цикла Eflp"]
 WEEK_START_FORMULA = '=IFERROR(DATEVALUE(LEFT($G$1;10))+TIMEVALUE(RIGHT($G$1;5));0)'
 WEEK_SALES_FORMULA = '=ARRAYFORMULA(IF(B2:B="";"";IFERROR(DATEVALUE(B2:B)+TIMEVALUE(C2:C)-4/24;"")))'
 MOSCOW = timezone(timedelta(hours=3))
@@ -190,6 +193,9 @@ class GoogleSheets:
         self.tab = tab
         self.ready = False
         self.sheet_id = None
+        self.shared_eflp = os.getenv('GOOGLE_SHEET_SHARED_EFLP', '').lower() in {'1', 'true', 'yes'}
+        identity = hashlib.sha256(f'{spreadsheet_id}/{tab}'.encode()).hexdigest()[:24]
+        self.shared_lock = Path(__file__).resolve().parent / 'data' / f'sheet-{identity}.lock'
 
     async def token(self) -> str:
         if not self.credentials.valid:
@@ -248,6 +254,10 @@ class GoogleSheets:
 
     async def prepare(self, journal: Journal):
         if self.ready:
+            return
+        if getattr(self, 'shared_eflp', False):
+            from shared_eflp_sheet import prepare
+            await prepare(self, journal)
             return
         target = self.spreadsheet_id + "/" + self.tab
         existing = (await self.request("GET", "A:D")).get("values", [])
@@ -331,6 +341,10 @@ class GoogleSheets:
         self.ready = True
 
     async def send(self, sale: dict):
+        if getattr(self, 'shared_eflp', False):
+            from shared_eflp_sheet import send
+            await send(self, sale)
+            return
         row = int(sale["id"]) + 1
         values = [sale_values(sale)]
         # A timeout after a successful write can safely be retried at the same row.
@@ -338,6 +352,9 @@ class GoogleSheets:
 
     async def read_eflp_sales(self, journal: Journal) -> list[dict]:
         """Read Eflp rows, accepting only sales that match the local journal."""
+        if getattr(self, 'shared_eflp', False):
+            from shared_eflp_sheet import read_sales
+            return await read_sales(self, journal)
         target = self.spreadsheet_id + "/" + self.tab
         if journal.sheet_target() not in {None, target}:
             raise GoogleSheetsError('Журнал привязан к другой Google Таблице/вкладке')
@@ -383,6 +400,10 @@ class GoogleSheets:
                             and not sale['sent'] and sale['id'] not in confirmed_ids]
 
     async def send_weekly(self, sales: list[dict], journal: Journal | None = None):
+        if getattr(self, 'shared_eflp', False):
+            from shared_eflp_sheet import send_weekly
+            await send_weekly(self, sales, journal)
+            return
         eflp = (any(sale.get('scheduler_mode') in {'eflp_volume', 'eflp_unique'} for sale in sales)
                 or bool(os.getenv('EFLP_P1_PROFILES', '').strip()))
         existing = (await self.request("GET", "F:J")).get("values", [])

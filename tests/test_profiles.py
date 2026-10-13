@@ -215,6 +215,7 @@ class ProfileCommandTests(unittest.IsolatedAsyncioTestCase):
                     browser.profile_id = profile_id
                     browser.ensure_started = AsyncMock()
                     browser.ensure_mexc_page = AsyncMock()
+                    browser.ad_details = AsyncMock(return_value={'id': 'a1234567890123456789'})
                     browser.payment_account_by_method = AsyncMock(return_value=12345)
                     browser.connection.return_value.__aenter__.return_value = AsyncMock(return_value={})
                     return browser
