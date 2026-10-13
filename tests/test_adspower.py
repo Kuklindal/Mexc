@@ -535,7 +535,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unresponsive_tab_stops_after_single_read_retry(self):
         self.browser.view = AsyncMock(side_effect=AdsPowerTimeout("timeout"))
-        with self.assertRaisesRegex(AdsPowerError, "Кнопка проверки не нажималась"):
+        with self.assertRaisesRegex(AdsPowerUnavailable, "Кнопка проверки не нажималась"):
             await self.browser.read_view(self.call, "s", "tab", ORDER)
         self.assertEqual(self.browser.view.await_count, 2)
         self.call.assert_awaited_once()

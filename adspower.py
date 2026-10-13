@@ -712,7 +712,7 @@ class AdsPower:
             try:
                 return await self.view(call, session, order_no)
             except AdsPowerTimeout:
-                raise AdsPowerError("Вкладка MEXC не отвечает даже после переключения на неё. Кнопка проверки не нажималась") from None
+                raise AdsPowerUnavailable("Вкладка MEXC не отвечает даже после переключения на неё. Кнопка проверки не нажималась") from None
 
     async def locate(self, call, order_no, *, allow_missing=False):
         if not re.fullmatch(r"d\d{15,25}", order_no):

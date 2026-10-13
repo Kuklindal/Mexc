@@ -103,8 +103,10 @@ class TelegramControl:
                 (state['active_cycle'],)).fetchone()
             legacy_check_pause = bool(
                 event and event['step'] == 'forward_check' and event['status'] == 'error'
-                and 'Кнопка проверки ордера ' in event['message']
-                and 'недоступна в портале мерчанта П1' in event['message'])
+                and (('Кнопка проверки ордера ' in event['message']
+                      and 'недоступна в портале мерчанта П1' in event['message'])
+                     or ('Вкладка MEXC не отвечает даже после переключения на неё' in event['message']
+                         and 'Кнопка проверки не нажималась' in event['message'])))
         if not state or not (state.get('resume_on_boot') or state.get('status') in {'running', 'waiting'}
                              or legacy_read_pause or legacy_check_pause):
             return False

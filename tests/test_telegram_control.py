@@ -123,6 +123,29 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                                     'Неверный профиль П1', cycle_status='paused')
             self.assertFalse(self.control().resume_after_restart())
 
+    async def test_service_restart_resumes_legacy_unresponsive_tab_before_click(self):
+        from rollover import begin, save_state
+
+        self.journal.abandon(self.cycle_id)
+        state = begin(self.journal, 'all')
+        cycle_id = self.journal.create(self.spec)
+        state.update(status='paused', active_cycle=cycle_id, last_error='AdsPowerError')
+        self.journal.transition(cycle_id, 'forward_check', 'p1', 'error',
+            'П1 нажимает «Проверка пройдена» на MEXC: '
+            'Вкладка MEXC не отвечает даже после переключения на неё. '
+            'Кнопка проверки не нажималась', cycle_status='paused')
+        save_state(self.journal, state)
+        with patch.dict(os.environ, {'AUTO_RESUME_ON_BOOT': 'true'}):
+            control = self.control()
+            with patch.object(control, 'work_rollover', new=AsyncMock()) as worker:
+                self.assertTrue(control.resume_after_restart())
+                await control.task
+                worker.assert_awaited_once()
+
+            self.journal.transition(cycle_id, 'forward_check', 'p1', 'error',
+                                    'Неверный профиль П1', cycle_status='paused')
+            self.assertFalse(self.control().resume_after_restart())
+
     async def test_chat_recovery_requires_explicit_confirmation_and_never_duplicates(self):
         self.uncertain_chat()
         control = self.control()
