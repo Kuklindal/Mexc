@@ -52,6 +52,23 @@ async def main() -> None:
                           settings.base_url, settings.recv_window,
                           settings.proxy_url)
     try:
+        with sqlite3.connect(f'file:{path.resolve().as_posix()}?mode=ro', uri=True) as db:
+            last_refill = db.execute("""SELECT c.id,s.result FROM cycles c
+                JOIN steps s ON s.cycle_id=c.id
+                    AND s.name='reverse_replenish' AND s.status='done'
+                WHERE json_extract(c.spec,'$.p1_profile')=?
+                ORDER BY c.rowid DESC LIMIT 1""", (profile,)).fetchone()
+        if last_refill:
+            plan = json.loads(last_refill[1])
+            recorded_ad = plan.get('adv_no')
+            configured_ad = os.environ.get(f'{prefix}_SELL_ADV_NO', '').strip()
+            print('Последний SELL:', last_refill[0], 'номер совпадает:',
+                  recorded_ad == configured_ad, 'цель:',
+                  plan.get('target_available'), 'USDT', flush=True)
+            if recorded_ad and recorded_ad != configured_ad:
+                old = await client.get_ad(recorded_ad)
+                print('Старый SELL:', 'статус', old.get('advStatus'),
+                      'остаток', old.get('availableQuantity'), flush=True)
         for side in ('SELL', 'BUY'):
             ad_no = os.environ.get(f'{prefix}_{side}_ADV_NO', '').strip()
             if not ad_no:
