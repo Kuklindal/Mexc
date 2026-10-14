@@ -50,6 +50,12 @@ async def main() -> None:
     print('П1', profile.key, 'SELL API:', ad.get('advStatus'),
           ad.get('availableQuantity'), 'USDT, цена', ad.get('price'),
           'лимиты', ad.get('minSingleTransAmount'), '–', ad.get('maxSingleTransAmount'), flush=True)
+    public_payment = ad.get('paymethodIds')
+    print('Публичный API: способы оплаты',
+          len(public_payment) if isinstance(public_payment, list) else
+          len(str(public_payment).split(',')) if public_payment else 0,
+          'поля', [key for key in ad if 'paymethod' in key.lower() or 'payment' in key.lower()],
+          flush=True)
     browser = maker_browser(profile, os.environ)
     expression = """(async (advNo) => {
         try {
@@ -60,6 +66,7 @@ async def main() -> None:
                 coinName:d.coinName,currency:d.currency,tradeType:d.tradeType,state:d.state,
                 available:d.availableQuantity,frozen:d.frozenQuantity ?? 0,price:d.price,
                 minimum:d.minTradeLimit,maximum:d.maxTradeLimit,
+                paymentKeys:Object.keys(d).filter(k=>/paymethod|payment/i.test(k)),
                 paymentCount:Array.isArray(d.paymethodIds)?d.paymethodIds.length:
                     String(d.paymethodIds ?? '').split(',').filter(Boolean).length,
                 coinIdPresent:d.coinId!=null,priceType:d.priceType,
@@ -114,7 +121,8 @@ async def main() -> None:
                     mismatches.append('нет способов оплаты')
                 print('Вкладка', host, 'API', value.get('code'), 'лимиты',
                       value.get('minimum'), '–', value.get('maximum'),
-                      'несовпадения:', ', '.join(mismatches) or 'нет', flush=True)
+                      'несовпадения:', ', '.join(mismatches) or 'нет',
+                      'поля оплаты:', value.get('paymentKeys'), flush=True)
             except Exception as exc:
                 print('Вкладка', host, 'ошибка', type(exc).__name__, flush=True)
 
