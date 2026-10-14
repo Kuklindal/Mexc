@@ -100,11 +100,18 @@ async def main() -> None:
                             'displayPresent', 'adsTypePresent', 'merchantTradePresent',
                             'onlyKybPresent')
                 mismatches.extend(field for field in required if not value.get(field))
-                if (value.get('state') != 1 or value.get('tradeType') != 1
-                        or value.get('priceType') != 0 or value.get('coinName') != 'USDT'
-                        or value.get('currency') != ad.get('fiatUnit')
-                        or not value.get('paymentCount')):
-                    mismatches.append('тип/статус/реквизит/валюта')
+                if value.get('state') != 1:
+                    mismatches.append('статус=' + repr(value.get('state')))
+                if value.get('tradeType') != 1:
+                    mismatches.append('сторона=' + repr(value.get('tradeType')))
+                if value.get('priceType') != 0:
+                    mismatches.append('тип цены=' + repr(value.get('priceType')))
+                if value.get('coinName') != 'USDT':
+                    mismatches.append('токен=' + repr(value.get('coinName')))
+                if value.get('currency') != ad.get('fiatUnit'):
+                    mismatches.append('валюта=' + repr(value.get('currency')))
+                if not value.get('paymentCount'):
+                    mismatches.append('нет способов оплаты')
                 print('Вкладка', host, 'API', value.get('code'), 'лимиты',
                       value.get('minimum'), '–', value.get('maximum'),
                       'несовпадения:', ', '.join(mismatches) or 'нет', flush=True)
