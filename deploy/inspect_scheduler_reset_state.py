@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
+import sys
 
 from dotenv import dotenv_values
 
@@ -56,5 +57,5 @@ def inspect(name: str) -> None:
 
 
 if __name__ == '__main__':
-    for config in ('.env.cash2', '.env'):
+    for config in sys.argv[1:] or ('.env.cash2', '.env'):
         inspect(config)
