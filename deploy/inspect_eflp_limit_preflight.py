@@ -59,6 +59,14 @@ async def main() -> None:
           ad.get('availableQuantity'), 'USDT, цена', ad.get('price'),
           'лимиты', ad.get('minSingleTransAmount'), '–', ad.get('maxSingleTransAmount'), flush=True)
     public_payment = ad.get('paymethodIds')
+    public_payment_info = ad.get('paymentInfo') or []
+    public_payment_ids = ([str(item.get('id')) for item in public_payment_info]
+                          if isinstance(public_payment_info, list)
+                          and all(isinstance(item, dict) and str(item.get('id', '')).isdigit()
+                                  for item in public_payment_info) else [])
+    print('Публичная связь оплаты: payMethod=paymentInfo.id',
+          bool(public_payment_ids) and str(ad.get('payMethod')) == ','.join(public_payment_ids),
+          flush=True)
     print('Публичный API: способы оплаты',
           len(public_payment) if isinstance(public_payment, list) else
           len(str(public_payment).split(',')) if public_payment else 0,
@@ -84,6 +92,12 @@ async def main() -> None:
                     [typeof v,!!v]]})),
                 paymentCount:Array.isArray(d.paymethodIds)?d.paymethodIds.length:
                     String(d.paymethodIds ?? '').split(',').filter(Boolean).length,
+                paymentIdsValid:Array.isArray(d.paymentInfo) && d.paymentInfo.length > 0
+                    && d.paymentInfo.every(x=>x && /^\d+$/.test(String(x.id)) && Number(x.id)>0),
+                payMethodMatchesPaymentInfoIds:Array.isArray(d.paymentInfo) && d.paymentInfo.length > 0
+                    && String(d.payMethod) === d.paymentInfo.map(x=>String(x.id)).join(','),
+                payMethodMatchesPaymentInfoTypes:Array.isArray(d.paymentInfo) && d.paymentInfo.length > 0
+                    && String(d.payMethod) === d.paymentInfo.map(x=>String(x.payMethod)).join(','),
                 coinIdPresent:d.coinId!=null,priceType:d.priceType,
                 expirationPresent:d.expirationTime!=null,kycPresent:d.kycLevel!=null,
                 displayPresent:d.display!=null,adsTypePresent:d.adsType!=null,
@@ -138,7 +152,10 @@ async def main() -> None:
                       value.get('minimum'), '–', value.get('maximum'),
                       'несовпадения:', ', '.join(mismatches) or 'нет',
                       'поля оплаты:', value.get('paymentKeys'),
-                      'формы:', value.get('paymentShapes'), flush=True)
+                      'формы:', value.get('paymentShapes'),
+                      'связь:', {key: value.get(key) for key in
+                                 ('paymentIdsValid', 'payMethodMatchesPaymentInfoIds',
+                                  'payMethodMatchesPaymentInfoTypes')}, flush=True)
             except Exception as exc:
                 print('Вкладка', host, 'ошибка', type(exc).__name__, flush=True)
 
