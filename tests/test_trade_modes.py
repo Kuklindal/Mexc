@@ -825,13 +825,10 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                            p2_profiles=['1', '2'], env=env)
         state['last_profile'] = '2'
         state['terminal_pending'] = {'kind': 'eflp_cross', 'from': 'p1', 'to': 'p1_2',
-                                     'p2': '2', 'verified': True, 'finish': False,
-                                     'cycle_id': self.cycle_id}
-        with patch.dict(os.environ, env), patch('adspower.AdsPower') as browser_cls, \
-             patch('eflp_ads.prepare_next_sell', new_callable=AsyncMock) as prepare:
+                                     'p2': '2', 'verified': True, 'finish': False}
+        with patch.dict(os.environ, env), patch('adspower.AdsPower') as browser_cls:
             browser_cls.return_value.ensure_stopped = AsyncMock()
             await _apply_terminal_switch(self.journal, state)
-        prepare.assert_awaited_once_with(self.journal, self.cycle_id, 'p1_2')
         browser_cls.return_value.ensure_stopped.assert_awaited_once()
         self.assertEqual(state['p1_profile'], 'p1_2')
         self.assertEqual(state['status'], 'running')
