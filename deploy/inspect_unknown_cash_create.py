@@ -21,7 +21,8 @@ from mexc_client import MexcP2PClient  # noqa: E402
 
 
 async def inspect(client: MexcP2PClient, label: str, plan: dict,
-                  start_ms: int, end_ms: int) -> None:
+                  start_ms: int, end_ms: int,
+                  control: tuple[str, int, int] | None = None) -> None:
     try:
         orders = await client.list_orders(start_time_ms=start_ms, end_time_ms=end_ms, limit=50)
         if len(orders) >= 50:
@@ -41,6 +42,15 @@ async def inspect(client: MexcP2PClient, label: str, plan: dict,
                 continue
             detail = await client.get_order_detail(order_no)
             print(label, 'ордер:', order_no, 'статус:', detail.get('state'))
+        if control:
+            known_no, known_start, known_end = control
+            known_orders = await client.list_orders(start_time_ms=known_start,
+                                                    end_time_ms=known_end, limit=50)
+            if len(known_orders) >= 50:
+                print(label, 'контрольная история неполная: 50 ордеров')
+            else:
+                print(label, 'контрольный ранее известный ордер виден:',
+                      any(str(item.get('advOrderNo')) == known_no for item in known_orders))
     except (ValueError, InvalidOperation):
         print(label, 'MEXC вернул неполные данные; требуется ручная сверка')
     except Exception as exc:
@@ -61,6 +71,13 @@ async def main() -> None:
                           (args.cycle_id,)).fetchone()
         attempted = db.execute("""SELECT time FROM events WHERE cycle_id=? AND step='forward_create'
             AND status='in_flight' ORDER BY id LIMIT 1""", (args.cycle_id,)).fetchone()
+        control_row = db.execute("""SELECT s.result,e.time FROM cycles c
+            JOIN steps s ON s.cycle_id=c.id AND s.name='forward_create' AND s.status='done'
+            JOIN events e ON e.id=(SELECT MIN(id) FROM events WHERE cycle_id=c.id
+                AND step='forward_create' AND status='in_flight')
+            WHERE json_extract(c.spec,'$.p2_profile')=(SELECT json_extract(spec,'$.p2_profile')
+                FROM cycles WHERE id=?) AND json_extract(s.result,'$.order_no') IS NOT NULL
+            ORDER BY c.rowid DESC LIMIT 1""", (args.cycle_id,)).fetchone()
     if not row or not step or not attempted:
         raise SystemExit('Нет полного журнала попытки; история MEXC не запрошена')
     spec = json.loads(row[0])
@@ -73,13 +90,21 @@ async def main() -> None:
         raise SystemExit('У попытки нет часового пояса; история MEXC не запрошена')
     start_ms = int((started - timedelta(seconds=30)).timestamp() * 1000)
     end_ms = int((started + timedelta(minutes=10)).timestamp() * 1000)
+    control = None
+    if control_row:
+        known_no = json.loads(control_row[0]).get('order_no')
+        known_at = datetime.fromisoformat(control_row[1])
+        if known_no and known_at.tzinfo is not None:
+            control = (known_no,
+                       int((known_at - timedelta(seconds=30)).timestamp() * 1000),
+                       int((known_at + timedelta(minutes=10)).timestamp() * 1000))
     print('П2:', spec.get('p2_profile'), 'попытка UTC:', started.astimezone(timezone.utc).isoformat())
     for account in ('p2', 'p1'):
         settings = Settings.from_env(account, p2_profile=spec['p2_profile'] if account == 'p2' else None)
         client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url,
                               settings.recv_window, settings.proxy_url)
         try:
-            await inspect(client, account.upper(), plan, start_ms, end_ms)
+            await inspect(client, account.upper(), plan, start_ms, end_ms, control)
         finally:
             await client.close()
 
