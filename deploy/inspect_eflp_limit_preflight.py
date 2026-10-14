@@ -28,6 +28,14 @@ def same(left, right) -> bool:
         return False
 
 
+def shape(value):
+    if isinstance(value, list):
+        return ('list', len(value), list(value[0])[:12] if value and isinstance(value[0], dict) else [])
+    if isinstance(value, dict):
+        return ('object', len(value), list(value)[:12])
+    return (type(value).__name__, bool(value))
+
+
 async def main() -> None:
     load_dotenv(os.environ.get('MEXC_ENV_FILE', str(ROOT / '.env.eflp-unique2')),
                 override=True)
@@ -56,6 +64,8 @@ async def main() -> None:
           len(str(public_payment).split(',')) if public_payment else 0,
           'поля', [key for key in ad if 'paymethod' in key.lower() or 'payment' in key.lower()],
           flush=True)
+    print('Публичные поля оплаты:', {key: shape(ad.get(key)) for key in
+          ('payMethod', 'paymentInfo', 'paymethodIds', 'securityOrderPaymethodIds')}, flush=True)
     browser = maker_browser(profile, os.environ)
     expression = """(async (advNo) => {
         try {
@@ -67,6 +77,11 @@ async def main() -> None:
                 available:d.availableQuantity,frozen:d.frozenQuantity ?? 0,price:d.price,
                 minimum:d.minTradeLimit,maximum:d.maxTradeLimit,
                 paymentKeys:Object.keys(d).filter(k=>/paymethod|payment/i.test(k)),
+                paymentShapes:Object.fromEntries(['payMethod','paymentInfo','paymethodIds',
+                    'securityOrderPaymethodIds'].map(k=>{const v=d[k];return [k,
+                    Array.isArray(v)?['list',v.length,v[0]&&typeof v[0]==='object'?Object.keys(v[0]).slice(0,12):[]]:
+                    v&&typeof v==='object'?['object',Object.keys(v).length,Object.keys(v).slice(0,12)]:
+                    [typeof v,!!v]]})),
                 paymentCount:Array.isArray(d.paymethodIds)?d.paymethodIds.length:
                     String(d.paymethodIds ?? '').split(',').filter(Boolean).length,
                 coinIdPresent:d.coinId!=null,priceType:d.priceType,
@@ -122,7 +137,8 @@ async def main() -> None:
                 print('Вкладка', host, 'API', value.get('code'), 'лимиты',
                       value.get('minimum'), '–', value.get('maximum'),
                       'несовпадения:', ', '.join(mismatches) or 'нет',
-                      'поля оплаты:', value.get('paymentKeys'), flush=True)
+                      'поля оплаты:', value.get('paymentKeys'),
+                      'формы:', value.get('paymentShapes'), flush=True)
             except Exception as exc:
                 print('Вкладка', host, 'ошибка', type(exc).__name__, flush=True)
 
