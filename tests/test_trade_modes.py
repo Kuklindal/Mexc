@@ -13,7 +13,8 @@ from trade_modes import (_apply_terminal_switch, _eflp_target_reached, _finish_c
                            _finish_terminal_cycle,
                            _handle_forward_rejection, _record_forward,
                            begin_mode, choose_mode_amount, configured_mode_profiles,
-                           next_profile, restore_eflp_progress, run_mode)
+                           next_profile, reset_completed_eflp_volume,
+                           restore_eflp_progress, run_mode)
 from volume_policy import record_purchase
 import test_auto as fixtures
 
@@ -906,6 +907,67 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unique['unique_done'], ['1'])
         self.assertEqual(unique['completed_count'], 1)
         self.assertEqual(next_profile(unique)[0], '2')
+
+    def test_completed_eflp_volume_reset_excludes_old_sales_on_new_run_and_sheet_refresh(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        old = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+            'p1_profile': 'p1', 'p2_profile': '1',
+            'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(old, 'forward_complete', 'both', 'done', 'sold',
+            result={'quantity': '20000'}, context={'amount': '1000', 'quantity': '20000'})
+        self.complete(old, '20000')
+        self.journal.db.execute('UPDATE sales SET completed_at=? WHERE cycle_id=?',
+            ((datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat(), old))
+        self.journal.db.commit()
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        state['status'] = 'done'
+        save_state(self.journal, state)
+        with self.assertRaisesRegex(ValueError, 'текущую неделю'):
+            begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                       p2_profiles=['1'], env=env)
+        marker = datetime.now(timezone.utc)
+        reset = reset_completed_eflp_volume(self.journal, now=marker)
+        self.assertEqual(reset['status'], 'stopped')
+        self.assertEqual(reset['eflp_volume_total'], '0')
+        self.assertEqual(self.journal.cycle(old)['status'], 'completed')
+        self.assertEqual(self.journal.db.execute(
+            "SELECT COUNT(*) FROM meta WHERE key LIKE 'eflp_volume_reset_%'").fetchone()[0], 1)
+        restarted = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                               p2_profiles=['1'], env=env)
+        self.assertEqual(restarted['eflp_volume_total'], '0')
+        self.assertEqual(restarted['completed_count'], 0)
+        self.assertEqual(restarted['eflp_volume_reset_at'], marker.isoformat())
+        self.assertEqual(restarted['eflp_volume_reset_sale_id'], 1)
+        restore_eflp_progress(self.journal, restarted, self.journal.sales() + [{
+            'scheduler_mode': 'eflp_unique', 'p1_profile': 'p1', 'p2_profile': '1',
+            'p2_member_id': env['MEXC_P2_1_MEMBER_ID'], 'quantity': '5000',
+            'completed_at': (marker - timedelta(seconds=1)).isoformat(),
+            'external_complete': True}], env=env)
+        self.assertEqual(restarted['eflp_volume_total'], '0')
+        new = self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+            'p1_profile': 'p1', 'p2_profile': '1',
+            'members': {'p2': env['MEXC_P2_1_MEMBER_ID']}})
+        self.journal.transition(new, 'forward_complete', 'both', 'done', 'sold',
+            result={'quantity': '100'}, context={'amount': '1000', 'quantity': '100'})
+        self.complete(new, '100')
+        restore_eflp_progress(self.journal, restarted, self.journal.sales(), env=env)
+        self.assertEqual(restarted['eflp_volume_total'], '100')
+        self.assertEqual(restarted['completed_count'], 1)
+
+    def test_eflp_volume_reset_rejects_unfinished_cycle(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        state = begin_mode(self.journal, 'eflp_volume', p1_profile='p1',
+                           p2_profiles=['1'], env=env)
+        state['status'] = 'done'
+        save_state(self.journal, state)
+        self.journal.create({'mode': 'api', 'scheduler_mode': 'eflp_volume',
+                             'p1_profile': 'p1', 'p2_profile': '1'})
+        with self.assertRaisesRegex(RuntimeError, 'незавершённый цикл'):
+            reset_completed_eflp_volume(self.journal)
+        self.assertEqual(load_state(self.journal)['status'], 'done')
 
     async def test_sheet_progress_is_restored_before_new_eflp_order(self):
         from rollover import save_state

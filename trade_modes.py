@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import os
 import random
+import uuid
 
 from config import Settings, p2_nickname, p2_profile_name
 from cycle import CashVolumeLimitReached, OperatorStopped, Paused, run_command
@@ -185,6 +186,9 @@ def restore_eflp_progress(journal, state: dict, sales: list[dict], *, env=os.env
     from sheets import weekly_start
 
     current_week = weekly_start(now or datetime.now(timezone.utc))
+    reset_at = (datetime.fromisoformat(state['eflp_volume_reset_at'])
+                if state.get('mode') == 'eflp_volume' and state.get('eflp_volume_reset_at') else None)
+    reset_sale_id = state.get('eflp_volume_reset_sale_id')
     member_profiles = {member: name for name in state['profiles']
                        if (member := str(env.get(f'{profile_prefix(name)}_MEMBER_ID') or '').strip())}
     volumes = {name: Decimal('0') for name in state['profiles']}
@@ -207,6 +211,11 @@ def restore_eflp_progress(journal, state: dict, sales: list[dict], *, env=os.env
                              'новый ордер остановлен') from None
         if weekly_start(completed_at) != current_week:
             continue
+        if reset_at:
+            local_id = sale.get('id') if not str(sale.get('cycle_id', '')).startswith('external:') else None
+            if (local_id is not None and reset_sale_id is not None
+                    and int(local_id) <= int(reset_sale_id)) or (local_id is None and completed_at <= reset_at):
+                continue
         member_id = str(sale.get('p2_member_id') or '').strip()
         profile = member_profiles.get(member_id)
         if not profile:
@@ -253,6 +262,38 @@ def restore_eflp_progress(journal, state: dict, sales: list[dict], *, env=os.env
     state['eflp_done'] = [name for name in unique_done
                           if volumes[name] >= Decimal('20000') and name not in incomplete]
     state['eflp_week_start'] = current_week.isoformat()
+
+
+def reset_completed_eflp_volume(journal, *, now: datetime | None = None) -> dict:
+    """Archive a finished volume run and start a new progress epoch without changing orders."""
+    state = load_state(journal)
+    if not state or state.get('mode') != 'eflp_volume' or state.get('status') != 'done':
+        raise ValueError('Сброс разрешён только для завершённой серии «Объём Eflp»')
+    if state.get('active_cycle') or state.get('pending_return') or state.get('terminal_pending'):
+        raise ValueError('У серии остался цикл или переход; сначала сверьте его на MEXC')
+    journal.ensure_can_create()
+    reset_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    archived = dict(state)
+    updated = dict(state)
+    updated.update(status='stopped', active_cycle=None, pending_return=None,
+                   terminal_pending=None, current_profile=None, selected=None,
+                   completed_count=0, cursor=0, unique_done=[], eflp_done=[],
+                   eflp_volume_by_profile={}, eflp_volume_total='0',
+                   eflp_counted_cycles=[], eflp_completed_cycles=[],
+                   eflp_unique_member_ids=[], eflp_volume_reset_at=reset_at,
+                   eflp_volume_reset_sale_id=journal.db.execute(
+                       'SELECT COALESCE(MAX(id),0) FROM sales').fetchone()[0],
+                   last_cycle_rowid=journal.db.execute(
+                       'SELECT COALESCE(MAX(rowid),0) FROM cycles').fetchone()[0])
+    updated.pop('last_error', None)
+    archive_key = f'eflp_volume_reset_{uuid.uuid4().hex}'
+    with journal.db:
+        journal.db.execute('INSERT INTO meta(key,value) VALUES (?,?)',
+                           (archive_key, json.dumps({'reset_at': reset_at, 'state': archived},
+                                                    ensure_ascii=False)))
+        journal.db.execute('UPDATE meta SET value=? WHERE key=?',
+                           (json.dumps(updated, ensure_ascii=False), STATE_KEY))
+    return updated
 
 
 def restore_cash_unique_progress(journal, state: dict, sales: list[dict], *, env=os.environ,
@@ -467,6 +508,12 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
         'unique_done': [], 'ad_rejection_streaks': dict(previous.get('ad_rejection_streaks', {})) if previous else {},
         'eflp_volume_by_profile': {}, 'eflp_counted_cycles': [],
         'eflp_completed_cycles': [], 'eflp_done': [],
+        'eflp_volume_reset_at': (previous.get('eflp_volume_reset_at')
+                                 if mode == 'eflp_volume' and previous
+                                 and previous.get('mode') == 'eflp_volume' else None),
+        'eflp_volume_reset_sale_id': (previous.get('eflp_volume_reset_sale_id')
+                                     if mode == 'eflp_volume' and previous
+                                     and previous.get('mode') == 'eflp_volume' else None),
         'last_cycle_rowid': journal.db.execute('SELECT COALESCE(MAX(rowid),0) FROM cycles').fetchone()[0],
     }
     if mode in {'eflp_volume', 'eflp_unique'}:
