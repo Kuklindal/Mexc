@@ -46,7 +46,11 @@ def main() -> None:
                 result = json.loads(step['result'])
                 quantity = result.get('quantity')
                 return step['status'] + (f'/{quantity} USDT' if quantity is not None else '')
+            spec = json.loads(row['spec'])
             print('Цикл:', row['id'], row['status'],
+                  'П1:', spec.get('p1_profile'),
+                  'обратный П1:', spec.get('reverse_p1_profile') or 'тот же',
+                  'финальный:', bool(spec.get('terminal')),
                   'покупка:', value('forward_create'),
                   'продажа:', value('forward_complete'),
                   'возврат:', value('reverse_complete'),

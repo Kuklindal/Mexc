@@ -66,9 +66,8 @@ async def main() -> None:
                   recorded_ad == configured_ad, 'цель:',
                   plan.get('target_available'), 'USDT', flush=True)
             if recorded_ad and recorded_ad != configured_ad:
-                old = await client.get_ad(recorded_ad)
-                print('Старый SELL:', 'статус', old.get('advStatus'),
-                      'остаток', old.get('availableQuantity'), flush=True)
+                print('Последний SELL относится к другому П1; проверка его остатка пропущена',
+                      flush=True)
         for side in ('SELL', 'BUY'):
             ad_no = os.environ.get(f'{prefix}_{side}_ADV_NO', '').strip()
             if not ad_no:
