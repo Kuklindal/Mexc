@@ -33,10 +33,10 @@ def main() -> None:
               'получено USDT:', json.loads(transfer['result']).get('quantity'), flush=True)
         rows = db.execute("""SELECT c.rowid,c.id,c.status,c.spec FROM cycles c
             WHERE c.rowid>? AND json_extract(c.spec,'$.p1_profile')=?
-            ORDER BY c.rowid LIMIT 12""", (transfer['rowid'], profile)).fetchall()
+            ORDER BY c.rowid DESC LIMIT 12""", (transfer['rowid'], profile)).fetchall()
         if not rows:
             print('Циклов нового П1 после перехода нет', flush=True)
-        for row in rows:
+        for row in reversed(rows):
             steps = {s['name']: s for s in db.execute(
                 'SELECT name,status,result FROM steps WHERE cycle_id=?', (row['id'],))}
             def value(name: str) -> str:
@@ -51,6 +51,11 @@ def main() -> None:
                   'продажа:', value('forward_complete'),
                   'возврат:', value('reverse_complete'),
                   'SELL-пополнение:', value('reverse_replenish'), flush=True)
+            refill = steps.get('reverse_replenish')
+            if refill:
+                plan = json.loads(refill['result'])
+                print('  SELL-остаток:', plan.get('before_available'), '→',
+                      plan.get('target_available'), 'USDT', flush=True)
 
 
 if __name__ == '__main__':
