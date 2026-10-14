@@ -144,7 +144,7 @@ AD_LIMIT = r"""async (advNo, plan) => {
             || !same(before.availableQuantity,plan.before_available)
             || !same(before.frozenQuantity ?? 0,plan.before_frozen)
             || !same(before.price,plan.price)
-            || !paymentIds || !Number.isFinite(num(before.coinId))
+            || !Number.isFinite(num(before.coinId))
             || before.priceType !== 0 || !Number.isFinite(num(before.expirationTime))
             || before.kycLevel == null || before.display == null || before.adsType == null
             || before.merchantTradeEnable == null || before.onlyTradeKybUser == null)
@@ -160,6 +160,10 @@ AD_LIMIT = r"""async (advNo, plan) => {
     if (!same(before.maxTradeLimit,plan.before_maximum)
             || !same(before.minTradeLimit,plan.before_minimum))
         return {error:'ad_changed'};
+    // The merchant detail may have paymentInfo while paymethodIds is empty.
+    // Its payMethod is the method type, not a payment-account ID. Guessing an
+    // ID here could alter the payment method when the ad is saved.
+    if (!paymentIds) return {error:'payment_ids_missing'};
     const params = {
         id:advNo, tradeType:'SELL', coinId:before.coinId, currency:before.currency,
         priceType:before.priceType, price:before.price,
@@ -955,6 +959,12 @@ class AdsPower:
                 detail = (f"; HTTP {value['http']}" if isinstance(value, dict) and isinstance(value.get('http'), int) else '')
                 detail += (f"; MEXC {value['code']}" if isinstance(value, dict) and isinstance(value.get('code'), int) else '')
                 if plan and plan.get('edit_limit'):
+                    if reason == 'payment_ids_missing':
+                        raise AdsPowerError(
+                            f'MEXC не вернул ID способов оплаты SELL-объявления; '
+                            f'автоматическое изменение лимита не отправлено. '
+                            f'Установите максимум не ниже {plan["target_maximum"]} {plan["fiat"]} '
+                            'в объявлении П1 на MEXC и продолжите серию')
                     if reason == 'limit_rejected':
                         raise AdsPowerError(
                             f'MEXC отклонил изменение лимитов SELL-объявления до '

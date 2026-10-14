@@ -66,6 +66,14 @@ async function run(responses, intent=plan) {
     r=await run([{code:0,data:{...ad,currency:'GEL'}}]);
     assert.equal(r.result.error,'ad_changed');
     assert.equal(r.calls.length,1);
+    const missingIds={...ad,paymethodIds:'',payMethod:'578',
+                      paymentInfo:[{id:2604184,payMethod:578}]};
+    r=await run([{code:0,data:missingIds}]);
+    assert.equal(r.result.error,'payment_ids_missing');
+    assert.equal(r.calls.length,1);
+    r=await run([{code:0,data:{...missingIds,maxTradeLimit:4440}}]);
+    assert.equal(r.result.maxTradeLimit,4440);
+    assert.equal(r.calls.length,1);
     r=await run([{code:0,data:ad},{code:60064}]);
     assert.equal(r.result.error,'limit_rejected');
     assert.equal(r.calls.length,2);
