@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal, InvalidOperation
 
 from adspower import AdsPower, AdsPowerError, AdsPowerUnavailable
 
@@ -23,6 +24,15 @@ async def ensure_online(client, browser: AdsPower, ad: dict, ad_no: str,
         return ad
     if status != 'CLOSE':
         raise AdsPowerError(f'Объявление {ad_no}: статус {status}; автоматическая публикация недоступна')
+    if side == 'SELL':
+        try:
+            available = Decimal(str(ad.get('availableQuantity', 'NaN')))
+        except InvalidOperation:
+            available = Decimal('NaN')
+        if not available.is_finite() or available <= 0:
+            raise AdsPowerError(
+                f'SELL-объявление {ad_no} пустое; публикация не отправлена. '
+                'Сверьте завершённый цикл и остаток USDT перед пополнением')
     await browser.ensure_started()
     await browser.ensure_mexc_page()
     await browser.publish_ad(ad_no, side, fiat)

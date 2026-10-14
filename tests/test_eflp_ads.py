@@ -48,6 +48,13 @@ class EflpAdTests(unittest.IsolatedAsyncioTestCase):
                                 AD_NO, 'BUY', 'TJS')
         browser.publish_ad.assert_not_awaited()
 
+    async def test_empty_sell_never_publishes(self):
+        browser = MagicMock(publish_ad=AsyncMock())
+        sell = {**ad(), 'side': 'SELL', 'availableQuantity': '0'}
+        with self.assertRaisesRegex(AdsPowerError, 'пустое'):
+            await ensure_online(MagicMock(), browser, sell, AD_NO, 'SELL', 'TJS')
+        browser.publish_ad.assert_not_awaited()
+
     async def test_unconfirmed_publication_waits_for_reconciliation(self):
         client = MagicMock(get_ad=AsyncMock(return_value=ad('CLOSE')))
         browser = MagicMock(ensure_started=AsyncMock(), ensure_mexc_page=AsyncMock(),
