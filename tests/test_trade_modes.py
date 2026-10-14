@@ -519,6 +519,19 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                            p2_profiles=['1', '2'], env=env)
         self.assertEqual(state['profiles'], ['2'])
 
+    def test_eflp_unique_names_duplicate_p2_accounts_without_exposing_credentials(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(2) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        env['MEXC_P2_2_MEMBER_ID'] = env['MEXC_P2_1_MEMBER_ID']
+        with self.assertRaisesRegex(ValueError, '1 и 2 имеют одинаковый MEMBER_ID'):
+            begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                       p2_profiles=['1', '2'], env=env)
+        env['MEXC_P2_2_MEMBER_ID'] = 'another-member'
+        env['MEXC_P2_2_API_KEY'] = env['MEXC_P2_1_API_KEY']
+        with self.assertRaisesRegex(ValueError, '1 и 2 имеют одинаковый API-ключ'):
+            begin_mode(self.journal, 'eflp_unique', p1_profile='p1',
+                       p2_profiles=['1', '2'], env=env)
+
     async def test_saved_eflp_series_skips_new_alias_before_next_order(self):
         from rollover import save_state
 

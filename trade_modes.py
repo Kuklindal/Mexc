@@ -378,8 +378,8 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
             raise ValueError('Для П1 нужны объявления продажи и покупки USDT')
         fiat = eflp_p1_fiat(p1_profile, env)
         mode_pay_method_id(mode, fiat, env)
-        member_ids = {p1.member_id}
-        api_keys = {env.get(f'{p1.prefix}_API_KEY', '').strip()}
+        member_ids = {p1.member_id: p1_profile}
+        api_keys = {env.get(f'{p1.prefix}_API_KEY', '').strip(): p1_profile}
         for name in chosen:
             prefix = profile_prefix(name)
             required = ('API_KEY', 'SECRET_KEY', 'MEMBER_ID', 'NICKNAME')
@@ -390,10 +390,12 @@ def begin_mode(journal, mode: str, *, p1_profile='p1', p2_profiles=None, env=os.
             eflp_p2_payment_id(name, fiat, env)
             member = env[f'{prefix}_MEMBER_ID'].strip()
             key = env[f'{prefix}_API_KEY'].strip()
-            if member in member_ids or key in api_keys:
-                raise ValueError('П1 и П2 Eflp должны иметь разные MEMBER_ID и API-ключи')
-            member_ids.add(member)
-            api_keys.add(key)
+            if member in member_ids:
+                raise ValueError(f'Профили Eflp {member_ids[member]} и {name} имеют одинаковый MEMBER_ID')
+            if key in api_keys:
+                raise ValueError(f'Профили Eflp {api_keys[key]} и {name} имеют одинаковый API-ключ')
+            member_ids[member] = name
+            api_keys[key] = name
     else:
         chosen = list(p2_profiles or [])
         if any(name not in names for name in chosen):
