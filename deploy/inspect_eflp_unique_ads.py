@@ -35,6 +35,18 @@ async def main() -> None:
     prefix = profile_prefix(profile)
     print('П1', profile, 'серия', state.get('status'),
           'цикл', state.get('active_cycle') or 'нет', flush=True)
+    with sqlite3.connect(f'file:{path.resolve().as_posix()}?mode=ro', uri=True) as db:
+        row = db.execute("""SELECT c.id,c.status,s.result
+            FROM cycles c JOIN steps s ON s.cycle_id=c.id
+                AND s.name='reverse_complete' AND s.status='done'
+            WHERE json_extract(c.spec,'$.scheduler_mode')='eflp_unique'
+                AND json_extract(c.spec,'$.reverse_p1_profile')=?
+            ORDER BY c.rowid DESC LIMIT 1""", (profile,)).fetchone()
+    if row:
+        print('Финальный переход:', row[0], 'цикл', row[1],
+              'получено USDT', json.loads(row[2]).get('quantity'), flush=True)
+    else:
+        print('Финальный переход: не найден в этом журнале', flush=True)
     settings = Settings.from_env('p1', p1_profile=profile)
     client = MexcP2PClient(settings.api_key, settings.secret_key,
                           settings.base_url, settings.recv_window,
