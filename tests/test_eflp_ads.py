@@ -1,9 +1,13 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from adspower import AdsPowerError, AdsPowerUnavailable
 from cycle import CycleRunner, Step
-from eflp_ads import ensure_online
+from eflp_ads import ensure_online, prepare_next_sell
+from journal import Journal
 from mexc_client import MexcAPIError
 
 
@@ -16,6 +20,98 @@ def ad(status='CLOSE', number=AD_NO):
 
 
 class EflpAdTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_maker_empty_sell_is_refilled_once_from_verified_transfer(self):
+        with TemporaryDirectory() as directory:
+            journal = Journal(Path(directory) / 'cycles.sqlite3')
+            cycle_id = journal.create({'scheduler_mode': 'eflp_unique',
+                                       'reverse_p1_profile': 'p1_2'})
+            journal.transition(cycle_id, 'reverse_complete', 'both', 'done', 'received',
+                               result={'quantity': '101'}, cycle_status='completed')
+            public = {'advNo': AD_NO, 'side': 'SELL', 'coinName': 'USDT',
+                      'fiatUnit': 'KZT', 'advStatus': 'CLOSE',
+                      'availableQuantity': '0'}
+            client = MagicMock(get_ad=AsyncMock(side_effect=[public,
+                {**public, 'availableQuantity': '101'}]), close=AsyncMock())
+            browser = MagicMock(ensure_started=AsyncMock(), ensure_mexc_page=AsyncMock(),
+                ad_details=AsyncMock(return_value={'id': AD_NO, 'tradeType': 1,
+                    'coinName': 'USDT', 'currency': 'KZT', 'availableQuantity': 0,
+                    'frozenQuantity': 0, 'overVerify': None}),
+                replenish_ad=AsyncMock())
+            profile = SimpleNamespace(sell_adv_no=AD_NO, adspower_profile_id='browser')
+            settings = SimpleNamespace(api_key='key', secret_key='secret',
+                base_url='https://api.mexc.com', recv_window=5000, proxy_url=None)
+            with patch('trade_profiles.profile_from_env', return_value=profile), \
+                 patch('trade_profiles.settings_for_profile', return_value=settings), \
+                 patch('mexc_client.MexcP2PClient', return_value=client), \
+                 patch('eflp_ads.maker_browser', return_value=browser):
+                await prepare_next_sell(journal, cycle_id, 'p1_2')
+                await prepare_next_sell(journal, cycle_id, 'p1_2')
+            browser.replenish_ad.assert_awaited_once()
+            self.assertEqual(browser.replenish_ad.await_args.args[0]['quantity'], '101')
+            self.assertEqual(journal.step(cycle_id, 'eflp_next_sell_refill')['status'], 'done')
+            journal.close()
+
+    async def test_unknown_refill_is_reconciled_without_second_post(self):
+        with TemporaryDirectory() as directory:
+            journal = Journal(Path(directory) / 'cycles.sqlite3')
+            cycle_id = journal.create({'scheduler_mode': 'eflp_unique',
+                                       'reverse_p1_profile': 'p1_2'})
+            journal.transition(cycle_id, 'reverse_complete', 'both', 'done', 'received',
+                               result={'quantity': '101'}, cycle_status='completed')
+            journal.transition(cycle_id, 'eflp_next_sell_refill', 'system', 'in_flight',
+                               'submitted', result={'adv_no': AD_NO,
+                                   'before_available': '0', 'target_available': '101'})
+            public = {'advNo': AD_NO, 'side': 'SELL', 'coinName': 'USDT',
+                      'fiatUnit': 'KZT', 'advStatus': 'CLOSE',
+                      'availableQuantity': '101'}
+            client = MagicMock(get_ad=AsyncMock(return_value=public), close=AsyncMock())
+            browser = MagicMock(ensure_started=AsyncMock(), ensure_mexc_page=AsyncMock(),
+                ad_details=AsyncMock(return_value={'id': AD_NO, 'tradeType': 1,
+                    'coinName': 'USDT', 'currency': 'KZT', 'availableQuantity': 101,
+                    'frozenQuantity': 0}), replenish_ad=AsyncMock())
+            profile = SimpleNamespace(sell_adv_no=AD_NO, adspower_profile_id='browser')
+            settings = SimpleNamespace(api_key='key', secret_key='secret',
+                base_url='https://api.mexc.com', recv_window=5000, proxy_url=None)
+            with patch('trade_profiles.profile_from_env', return_value=profile), \
+                 patch('trade_profiles.settings_for_profile', return_value=settings), \
+                 patch('mexc_client.MexcP2PClient', return_value=client), \
+                 patch('eflp_ads.maker_browser', return_value=browser):
+                await prepare_next_sell(journal, cycle_id, 'p1_2')
+            browser.replenish_ad.assert_not_awaited()
+            self.assertEqual(journal.step(cycle_id, 'eflp_next_sell_refill')['status'], 'done')
+            journal.close()
+
+    async def test_unknown_refill_with_unchanged_balance_stays_blocked(self):
+        with TemporaryDirectory() as directory:
+            journal = Journal(Path(directory) / 'cycles.sqlite3')
+            cycle_id = journal.create({'scheduler_mode': 'eflp_unique',
+                                       'reverse_p1_profile': 'p1_2'})
+            journal.transition(cycle_id, 'reverse_complete', 'both', 'done', 'received',
+                               result={'quantity': '101'}, cycle_status='completed')
+            journal.transition(cycle_id, 'eflp_next_sell_refill', 'system', 'in_flight',
+                               'submitted', result={'adv_no': AD_NO,
+                                   'before_available': '0', 'target_available': '101'})
+            public = {'advNo': AD_NO, 'side': 'SELL', 'coinName': 'USDT',
+                      'fiatUnit': 'KZT', 'advStatus': 'CLOSE',
+                      'availableQuantity': '0'}
+            client = MagicMock(get_ad=AsyncMock(return_value=public), close=AsyncMock())
+            browser = MagicMock(ensure_started=AsyncMock(), ensure_mexc_page=AsyncMock(),
+                ad_details=AsyncMock(return_value={'id': AD_NO, 'tradeType': 1,
+                    'coinName': 'USDT', 'currency': 'KZT', 'availableQuantity': 0,
+                    'frozenQuantity': 0}), replenish_ad=AsyncMock())
+            profile = SimpleNamespace(sell_adv_no=AD_NO, adspower_profile_id='browser')
+            settings = SimpleNamespace(api_key='key', secret_key='secret',
+                base_url='https://api.mexc.com', recv_window=5000, proxy_url=None)
+            with patch('trade_profiles.profile_from_env', return_value=profile), \
+                 patch('trade_profiles.settings_for_profile', return_value=settings), \
+                 patch('mexc_client.MexcP2PClient', return_value=client), \
+                 patch('eflp_ads.maker_browser', return_value=browser):
+                with self.assertRaises(AdsPowerUnavailable):
+                    await prepare_next_sell(journal, cycle_id, 'p1_2')
+            browser.replenish_ad.assert_not_awaited()
+            self.assertEqual(journal.step(cycle_id, 'eflp_next_sell_refill')['status'], 'in_flight')
+            journal.close()
+
     async def test_reverse_replenish_validates_sell_ad_as_sell(self):
         runner = CycleRunner.__new__(CycleRunner)
         runner.spec = {'scheduler_mode': 'eflp_volume', 'fiat': 'TJS'}

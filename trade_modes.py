@@ -897,6 +897,9 @@ async def _apply_terminal_switch(journal, state) -> None:
                        os.getenv('ADSPOWER_API_KEY', ''),
                        returned.adspower_profile_id).ensure_stopped()
     if target and not pending.get('finish'):
+        if state['mode'] == 'eflp_unique' and pending['kind'] == 'eflp_cross':
+            from eflp_ads import prepare_next_sell
+            await prepare_next_sell(journal, pending['cycle_id'], target)
         eligible, _ = split_eflp_p2_profiles(target, state['all_profiles'], os.environ)
         if not eligible:
             raise Paused('Для следующего П1 недостаточно П2 после исключения совпадающего аккаунта')
