@@ -27,10 +27,17 @@ def inspect(name: str) -> None:
         row = db.execute("SELECT value FROM meta WHERE key='rollover_scheduler_v1'").fetchone()
         unfinished = db.execute("""SELECT COUNT(*) FROM cycles
             WHERE status NOT IN ('completed','abandoned')""").fetchone()[0]
+        state = json.loads(row[0]) if row else None
+        active = state.get('active_cycle') if state else None
+        cycle = db.execute('SELECT status,spec FROM cycles WHERE id=?', (active,)).fetchone() if active else None
+        steps = db.execute("""SELECT name,status,result FROM steps WHERE cycle_id=?
+            AND name IN ('forward_create','forward_complete','reverse_create',
+                         'reverse_complete','reverse_replenish')""", (active,)).fetchall() if active else []
+        last = db.execute("""SELECT step,status FROM events WHERE cycle_id=?
+            ORDER BY id DESC LIMIT 1""", (active,)).fetchone() if active else None
     if not row:
         print(name, 'сохранённой серии нет', 'незавершённых циклов:', unfinished)
         return
-    state = json.loads(row[0])
     print(name, 'режим:', state.get('mode'), 'статус:', state.get('status'),
           'активный цикл:', state.get('active_cycle') or 'нет',
           'ожидается возврат:', bool(state.get('pending_return')),
@@ -38,6 +45,14 @@ def inspect(name: str) -> None:
           'незавершённых циклов:', unfinished,
           'неделя налички:', state.get('cash_unique_week_start') or 'нет',
           'неделя Eflp:', state.get('eflp_week_start') or 'нет')
+    if cycle:
+        spec = json.loads(cycle[1])
+        print(' ', 'цикл:', cycle[0], 'П2:', spec.get('p2_profile'),
+              'последний шаг:', tuple(last) if last else 'нет')
+        for step_name, step_status, result in steps:
+            data = json.loads(result)
+            print(' ', step_name, step_status, 'ордер:', data.get('order_no') or 'нет',
+                  'USDT:', data.get('quantity') or 'нет')
 
 
 if __name__ == '__main__':
