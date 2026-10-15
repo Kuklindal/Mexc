@@ -49,7 +49,8 @@ def week_choices(sales: list[dict], selected: str | None = None,
                  moment: datetime | None = None) -> tuple[str, list[str]]:
     current = weekly_start(moment or datetime.now(timezone.utc))
     starts = [weekly_start(datetime.fromisoformat(sale["completed_at"])) for sale in sales]
-    first = min(starts + [current])
+    # Keep the previous week selectable even if this journal has no sales in it.
+    first = min(starts + [current - timedelta(days=7)])
     last = max(starts + [current]) + timedelta(days=7)
     choices = [week_label(first + timedelta(days=7 * i))
                for i in range((last - first).days // 7 + 1)]
@@ -61,6 +62,15 @@ def week_choices(sales: list[dict], selected: str | None = None,
     if chosen not in choices:
         choices.append(chosen)
     return chosen, list(reversed(choices))
+
+
+def week_selector_text_request(sheet_id: int) -> dict:
+    """Keep date-looking dropdown labels as text for strict validation."""
+    return {"repeatCell": {
+        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                  "startColumnIndex": 6, "endColumnIndex": 7},
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}},
+        "fields": "userEnteredFormat.numberFormat"}}
 
 
 def weekly_formulas(sales: list[dict], selected: str, row_count: int) -> list[list[str]]:
@@ -562,6 +572,7 @@ class GoogleSheets:
                                                       "startIndex": 17, "endIndex": 21},
                                             "properties": {"hiddenByUser": True},
                                             "fields": "hiddenByUser"}},
+            week_selector_text_request(sheet_id),
         ]
         await self.batch_update(requests)
 

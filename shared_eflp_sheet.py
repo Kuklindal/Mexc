@@ -14,7 +14,8 @@ from journal import process_lock
 from sheets import (EFLP_META_HEADER, EFLP_WEEKLY_MARKER, HEADER, SHARED_CYCLE_HEADER,
                     WEEK_SALES_FORMULA, WEEK_START_FORMULA, GoogleSheetsError,
                     _complete_sale_cycle, eflp_meta_values, eflp_weekly_formulas,
-                    sale_values, sheet_number, validate_eflp_visitors_column, week_choices)
+                    sale_values, sheet_number, validate_eflp_visitors_column,
+                    week_choices, week_selector_text_request)
 
 
 @asynccontextmanager
@@ -256,5 +257,6 @@ async def send_weekly(sheet, sales, journal):
                     'values': [{'userEnteredValue': choice} for choice in choices]},
                     'strict': True, 'showCustomUi': True,
                     'inputMessage': 'Выберите неделю: четверг 18:50 МСК'}}},
+            week_selector_text_request(sheet_id),
         ]
         await sheet.batch_update(requests)

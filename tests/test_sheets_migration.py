@@ -207,6 +207,12 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[11][0], '2')
         self.assertIn('SUMIFS', rows[11][1])
 
+    def test_previous_week_is_selectable_without_sales(self):
+        moment = datetime(2026, 10, 15, 15, 50, tzinfo=timezone.utc)
+        selected, choices = week_choices([], moment=moment)
+        self.assertEqual(selected, '15.10.2026 18:50')
+        self.assertIn('08.10.2026 18:50', choices)
+
     def test_weekly_cells_contain_formulas_and_keep_selected_week(self):
         moment = datetime(2026, 10, 1, 15, 50, tzinfo=timezone.utc)
         sale = dict(quantity='2500000', completed_at=moment.isoformat(), p2_profile='3')
@@ -345,6 +351,9 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected, '17.09.2026 18:50')
         self.assertIn(selected, [v['userEnteredValue'] for v in
             requests[5]['setDataValidation']['rule']['condition']['values']])
+        self.assertEqual(requests[-1]['repeatCell']['cell']['userEnteredFormat']['numberFormat'],
+                         {'type': 'TEXT'})
+        self.assertEqual(requests[-1]['repeatCell']['range']['startColumnIndex'], 6)
 
     def test_legacy_journal_backfills_from_first_sale_event(self):
         self.journal.db.execute("UPDATE sales SET quantity='', completed_at=''")

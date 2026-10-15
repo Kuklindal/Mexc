@@ -90,6 +90,9 @@ class SharedEflpSheetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.columns['A:E']), 3)
         self.assertEqual(self.columns['X:X'][2], [second['cycle_id']])
         await self.sheet.send_weekly(self.unique.sales(), self.unique)
+        weekly_requests = self.sheet.batch_update.await_args.args[0]
+        self.assertEqual(weekly_requests[-1]['repeatCell']['cell']['userEnteredFormat']['numberFormat'],
+                         {'type': 'TEXT'})
         self.assertEqual(self.columns['R:T'][1], eflp_meta_values(first, completed=True))
         self.assertEqual(self.columns['R:T'][2], eflp_meta_values(second, completed=True))
         report = self.sheet.batch_update.await_args.args[0][1]['updateCells']['rows']
