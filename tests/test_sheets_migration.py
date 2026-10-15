@@ -150,7 +150,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         def value(row, column):
             return next(iter(report[row]['values'][column]['userEnteredValue'].values()))
         self.assertEqual(value(0, 0), EFLP_WEEKLY_MARKER)
-        self.assertEqual(value(0, 1), '17.09.2026 18:50')
+        self.assertEqual(value(0, 1), '17.09.2026 МСК 18:50')
         self.assertEqual([value(1, i) for i in range(4)],
                          ['П1', 'Уникальных П2', 'Общая сумма продаж (USDT)', 'Итого USDT'])
         self.assertEqual(value(2, 0), 'Maker')
@@ -200,8 +200,8 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         sales = [dict(quantity='100', completed_at=before.isoformat(), p2_profile='old'),
                  dict(quantity='200', completed_at=after.isoformat(), p2_profile='2')]
         selected, choices = week_choices(sales, moment=after)
-        self.assertEqual(selected, '01.10.2026 18:50')
-        self.assertIn('24.09.2026 18:50', choices)
+        self.assertEqual(selected, '01.10.2026 МСК 18:50')
+        self.assertIn('24.09.2026 МСК 18:50', choices)
         rows = weekly_formulas(sales, selected, 0)
         self.assertEqual(rows[0][1], selected)
         self.assertEqual(rows[11][0], '2')
@@ -210,14 +210,17 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
     def test_previous_week_is_selectable_without_sales(self):
         moment = datetime(2026, 10, 15, 15, 50, tzinfo=timezone.utc)
         selected, choices = week_choices([], moment=moment)
-        self.assertEqual(selected, '15.10.2026 18:50')
-        self.assertIn('08.10.2026 18:50', choices)
+        self.assertEqual(selected, '15.10.2026 МСК 18:50')
+        self.assertIn('08.10.2026 МСК 18:50', choices)
+        self.assertEqual(choices[0][:10], '22.10.2026')
+        self.assertEqual(choices[0][-5:], '18:50')
 
     def test_weekly_cells_contain_formulas_and_keep_selected_week(self):
         moment = datetime(2026, 10, 1, 15, 50, tzinfo=timezone.utc)
         sale = dict(quantity='2500000', completed_at=moment.isoformat(), p2_profile='3')
         chosen, _ = week_choices([sale], '24.09.2026 18:50 МСК', moment)
-        self.assertEqual(chosen, '24.09.2026 18:50')
+        self.assertEqual(chosen, '24.09.2026 МСК 18:50')
+        self.assertEqual(week_choices([sale], '24.09.2026 МСК 18:50', moment)[0], chosen)
         rows = weekly_formulas([sale], chosen, 0)
         self.assertIn('$U$1+7', rows[0][3])
         self.assertIn('SUMIFS', rows[2][1])
@@ -348,7 +351,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         await self.sheets.send_weekly(self.journal.sales())
         requests = self.sheets.batch_update.await_args.args[0]
         selected = requests[1]['updateCells']['rows'][0]['values'][1]['userEnteredValue']['stringValue']
-        self.assertEqual(selected, '17.09.2026 18:50')
+        self.assertEqual(selected, '17.09.2026 МСК 18:50')
         self.assertIn(selected, [v['userEnteredValue'] for v in
             requests[5]['setDataValidation']['rule']['condition']['values']])
         self.assertEqual(requests[-1]['repeatCell']['cell']['userEnteredFormat']['numberFormat'],

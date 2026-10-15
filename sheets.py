@@ -42,7 +42,9 @@ def weekly_start(moment: datetime) -> datetime:
 
 
 def week_label(start: datetime) -> str:
-    return start.strftime("%d.%m.%Y %H:%M")
+    # The marker prevents Sheets from converting a dropdown choice into a date
+    # serial. Keep the date at the start and time at the end for the U1 formula.
+    return start.strftime("%d.%m.%Y МСК %H:%M")
 
 
 def week_choices(sales: list[dict], selected: str | None = None,
@@ -55,7 +57,8 @@ def week_choices(sales: list[dict], selected: str | None = None,
     choices = [week_label(first + timedelta(days=7 * i))
                for i in range((last - first).days // 7 + 1)]
     try:
-        parsed = datetime.strptime((selected or "").removesuffix(" МСК"), "%d.%m.%Y %H:%M")
+        legacy_or_current = (selected or "").strip().replace(" МСК ", " ").removesuffix(" МСК")
+        parsed = datetime.strptime(legacy_or_current, "%d.%m.%Y %H:%M")
         chosen = week_label(weekly_start(parsed.replace(tzinfo=MOSCOW)))
     except ValueError:
         chosen = week_label(current)
@@ -65,7 +68,7 @@ def week_choices(sales: list[dict], selected: str | None = None,
 
 
 def week_selector_text_request(sheet_id: int) -> dict:
-    """Keep date-looking dropdown labels as text for strict validation."""
+    """Keep the week selector's labels as text for strict validation."""
     return {"repeatCell": {
         "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
                   "startColumnIndex": 6, "endColumnIndex": 7},
