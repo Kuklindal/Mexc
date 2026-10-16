@@ -144,8 +144,11 @@ def main() -> None:
         if profile_id not in configured or needed.get(profile_id):
             raise SystemExit(f'{profile_id}: закрытие запрещено: профиль неизвестен или нужен боту')
         browser = AdsPower(base, source['ADSPOWER_API_KEY'], profile_id)
-        asyncio.run(browser.ensure_stopped())
-        print(f'{profile_id}: закрыт через AdsPower', flush=True)
+        # Under heavy I/O pressure the preliminary per-profile /active request
+        # can time out before /stop is sent. The inventory and role checks above
+        # already establish that this exact open profile may be closed.
+        asyncio.run(browser.stop_profile())
+        print(f'{profile_id}: AdsPower принял запрос закрытия; проверьте повторным списком', flush=True)
 
 
 if __name__ == '__main__':
