@@ -436,6 +436,30 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.journal.step(self.cycle_id, 'forward_paid')['status'], 'pending')
         self.assertFalse(any(op == 'paid' for _, op, _ in self.exchange.calls))
 
+    async def test_forward_check_mexc_read_failure_before_click_is_retryable(self):
+        runner = self.runner()
+        runner.delay_seconds = runner.delay_max_seconds = 0
+        read = runner.clients['p1'].get_order_detail
+        failures = 0
+
+        async def read_before_click(order_no):
+            nonlocal failures
+            step = self.journal.step(self.cycle_id, 'forward_check')
+            if step and step['status'] == 'in_flight' and failures == 0:
+                failures += 1
+                raise MexcReadUnavailable('MEXC read request failed (ReadTimeout); no action was sent')
+            return await read(order_no)
+
+        runner.clients['p1'].get_order_detail = read_before_click
+        with self.assertRaises(MexcReadUnavailable):
+            await runner.run(self.cycle_id)
+        self.assertEqual(self.journal.step(self.cycle_id, 'forward_check')['status'], 'pending')
+        runner.browser.approve.assert_not_called()
+        self.assertFalse(any(op == 'paid' for _, op, _ in self.exchange.calls))
+        await runner.run(self.cycle_id)
+        self.assertEqual(runner.browser.approve.await_count, 1)
+        self.assertEqual(self.journal.cycle(self.cycle_id)['status'], 'completed')
+
     async def test_uncertain_mark_paid_retries_when_order_is_still_unpaid(self):
         runner = self.runner()
         runner.delay_seconds = runner.delay_max_seconds = 0

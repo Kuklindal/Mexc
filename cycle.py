@@ -752,6 +752,14 @@ class CycleRunner:
                             'AdsPower недоступен до отправки действия на MEXC; шаг можно повторить',
                             context=self.context(step.key), result=payment_context)
                         raise
+                    if action == 'check' and isinstance(exc, MexcReadUnavailable):
+                        # The only MEXC-client read in execute(check) precedes
+                        # the browser click. A failed read cannot mean a click
+                        # was sent, so preserve an ordinary retryable step.
+                        self.journal.transition(cycle_id, step.key, step.actor, 'pending',
+                            'MEXC не ответил до нажатия проверки; кнопку не нажимали, шаг можно повторить',
+                            context=self.context(step.key), result=payment_context)
+                        raise
                     if (isinstance(exc, MexcAPIError) and exc.code == 700003
                             and exc.http_status == 400):
                         self.journal.transition(cycle_id, step.key, step.actor, 'rejected',
