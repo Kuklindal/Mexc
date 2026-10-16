@@ -1,17 +1,22 @@
 """List locally open AdsPower profiles and the bot roles that currently need them."""
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 import sqlite3
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 import httpx
 from dotenv import dotenv_values
 
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from adspower import AdsPower  # noqa: E402
 
 
 def browser_key(role: str) -> str:
@@ -56,6 +61,10 @@ def scheduler_state(env: dict) -> dict:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--close', metavar='PROFILE_ID',
+                        help='Close one currently idle, configured AdsPower profile')
+    args = parser.parse_args()
     files = [path for path in sorted(ROOT.glob('.env*'))
              if path.name == '.env' or (path.name.startswith('.env.')
                  and not any(marker in path.name for marker in
@@ -106,12 +115,37 @@ def main() -> None:
            or not entry['user_id'] for entry in entries):
         raise SystemExit('AdsPower вернул неполный список; кандидаты не определены')
     ids = sorted({entry['user_id'] for entry in entries})
+    unknown_names = {}
+    with httpx.Client(timeout=8, trust_env=False) as client:
+        for profile_id in ids:
+            if profile_id in configured:
+                continue
+            try:
+                details = client.get(base + '/api/v1/user/list',
+                    params={'user_id': profile_id}, headers=headers).json()
+                rows = (details.get('data') or {}).get('list') or []
+                if details.get('code') == 0 and len(rows) == 1:
+                    unknown_names[profile_id] = str(rows[0].get('name') or 'без имени')
+            except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+                pass
     print(f'Открыто профилей AdsPower: {len(ids)}', flush=True)
     for profile_id in ids:
         role = ('НУЖЕН СЕЙЧАС' if needed.get(profile_id) else
                 'КАНДИДАТ' if configured.get(profile_id) else 'НЕИЗВЕСТНЫЙ')
         labels = ', '.join(needed.get(profile_id) or configured.get(profile_id) or [])
+        if not labels and profile_id in unknown_names:
+            labels = f'имя в AdsPower: {unknown_names[profile_id]}'
         print(f'{profile_id}: {role} {labels}', flush=True)
+    if args.close:
+        profile_id = args.close
+        if profile_id not in ids:
+            print(f'{profile_id}: уже закрыт', flush=True)
+            return
+        if profile_id not in configured or needed.get(profile_id):
+            raise SystemExit(f'{profile_id}: закрытие запрещено: профиль неизвестен или нужен боту')
+        browser = AdsPower(base, source['ADSPOWER_API_KEY'], profile_id)
+        asyncio.run(browser.ensure_stopped())
+        print(f'{profile_id}: закрыт через AdsPower', flush=True)
 
 
 if __name__ == '__main__':
