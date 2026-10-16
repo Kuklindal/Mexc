@@ -642,7 +642,9 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
     if not eflp and mode not in {'cash_volume', 'cash_unique'}:
         settings.append(Settings.from_env('p2', p2_profile=p2_key))
     clients = [MexcP2PClient(s.api_key, s.secret_key, s.base_url, s.recv_window,
-                            proxy_url=s.proxy_url) for s in settings]
+                            proxy_url=s.proxy_url,
+                            read_retry_timeout_seconds=10 if mode == 'cash_volume' else None)
+               for s in settings]
     try:
         sell = await _ad(clients[0], p1.sell_adv_no, 'SELL',
                          eflp_browser=(lambda: maker_browser(p1, env)) if eflp else None)
@@ -660,7 +662,8 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
                 buy_settings = settings_for_profile(buy_key)
                 buy_client = MexcP2PClient(buy_settings.api_key, buy_settings.secret_key,
                     buy_settings.base_url, buy_settings.recv_window,
-                    proxy_url=buy_settings.proxy_url)
+                    proxy_url=buy_settings.proxy_url,
+                    read_retry_timeout_seconds=10 if mode == 'cash_volume' else None)
                 clients.append(buy_client)
             buy = await _ad(buy_client, buy_no, 'BUY', sell.get('fiatUnit'),
                             eflp_browser=(lambda: maker_browser(profile_from_env(buy_key, env), env))

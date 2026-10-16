@@ -131,6 +131,7 @@ class MexcP2PClient:
         recv_window: int = 5000,
         proxy_url: str | None = None,
         timeout_seconds: float = 20.0,
+        read_retry_timeout_seconds: float | None = None,
     ):
         self.api_key = api_key
         self.secret_key = secret_key.encode("utf-8")
@@ -140,6 +141,11 @@ class MexcP2PClient:
         self.proxy_url = proxy_url
         if not 1 <= float(timeout_seconds) <= 120:
             raise ValueError('Таймаут MEXC должен быть от 1 до 120 секунд')
+        if read_retry_timeout_seconds is not None and not 1 <= float(read_retry_timeout_seconds) <= 120:
+            raise ValueError('Таймаут повторного чтения MEXC должен быть от 1 до 120 секунд')
+        self.read_retry_timeout = (httpx.Timeout(float(read_retry_timeout_seconds),
+                                                 connect=min(6.0, float(read_retry_timeout_seconds)))
+                                   if read_retry_timeout_seconds is not None else None)
         self.logger = logging.getLogger("mexc_p2p.api")
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(float(timeout_seconds)),
@@ -182,15 +188,27 @@ class MexcP2PClient:
     ) -> Any:
         self.logger.debug("%s %s", method.upper(), path)
         for attempt in range(2):
-            query = self._signed_query(params)
-            url = f"{self.base_url}{path}?{query}"
-            try:
-                response = await self.http.request(method.upper(), url)
-            except httpx.RequestError as exc:
-                if method.upper() == "GET":
-                    raise MexcReadUnavailable(
-                        f"MEXC read request failed ({type(exc).__name__}); no action was sent") from None
-                raise MexcMutationUnknown(f"MEXC network error ({type(exc).__name__}); execution may be unknown") from None
+            read_retries = 2 if method.upper() == "GET" and self.read_retry_timeout is not None else 1
+            for read_attempt in range(read_retries):
+                # Re-sign each read attempt so the timestamp remains valid after a timeout.
+                query = self._signed_query(params)
+                url = f"{self.base_url}{path}?{query}"
+                try:
+                    if self.read_retry_timeout is None or method.upper() != "GET":
+                        response = await self.http.request(method.upper(), url)
+                    else:
+                        response = await self.http.request(method.upper(), url,
+                                                           timeout=self.read_retry_timeout)
+                    break
+                except httpx.RequestError as exc:
+                    if method.upper() == "GET":
+                        if read_attempt + 1 < read_retries and isinstance(
+                                exc, (httpx.TimeoutException, httpx.ConnectError)):
+                            self.logger.warning("MEXC GET transport %s; retrying read once", type(exc).__name__)
+                            continue
+                        raise MexcReadUnavailable(
+                            f"MEXC read request failed ({type(exc).__name__}); no action was sent") from None
+                    raise MexcMutationUnknown(f"MEXC network error ({type(exc).__name__}); execution may be unknown") from None
 
             # Never retry a network/5xx failure on a state-changing endpoint.
             try:

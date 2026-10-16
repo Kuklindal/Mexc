@@ -28,6 +28,28 @@ class SigningTests(unittest.IsolatedAsyncioTestCase):
                     await self.client._request('POST', '/api/v3/fiat/release_coin')
                 self.assertNotIsInstance(caught.exception, MexcReadUnavailable)
 
+    async def test_cash_read_retries_transport_timeout_but_never_retries_mutation(self):
+        await self.client.close()
+        self.client = MexcP2PClient('test-key', 'test-secret',
+                                   timeout_seconds=45, read_retry_timeout_seconds=10)
+        calls = []
+
+        async def handler(request):
+            calls.append(request)
+            if len(calls) == 1 or request.method == 'POST':
+                raise httpx.ReadTimeout('slow', request=request)
+            return httpx.Response(200, json={'code': 0, 'data': 'OK'})
+
+        await self.client.http.aclose()
+        self.client.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.assertEqual((await self.client._request('GET', '/api/v3/fiat/order/detail'))['data'], 'OK')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].extensions['timeout']['read'], 10)
+        self.assertEqual(calls[0].extensions['timeout']['connect'], 6)
+        with self.assertRaises(MexcMutationUnknown):
+            await self.client._request('POST', '/api/v3/fiat/merchant/order/deal')
+        self.assertEqual(len(calls), 3)
+
     async def test_chat_proxy_reset_is_classified_for_automatic_retry(self):
         await self.client.close()
         client = MexcP2PClient('test-key', 'test-secret', proxy_url='http://proxy.example:8080')

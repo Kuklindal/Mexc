@@ -1742,7 +1742,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                     profiles[actor] = fingerprint(profile.api_key)
                     clients[actor] = MexcP2PClient(profile.api_key, profile.secret_key, profile.base_url,
                                                    profile.recv_window, proxy_url=profile.proxy_url,
-                                                   timeout_seconds=45 if scheduler_mode == 'cash_volume' and reverse_maker == 'p2' else 20)
+                                                   timeout_seconds=45 if scheduler_mode == 'cash_volume' and reverse_maker == 'p2' else 20,
+                                                   read_retry_timeout_seconds=10 if scheduler_mode == 'cash_volume' else None)
                 if reverse_p1_profile:
                     reverse_settings = settings_for_profile(reverse_p1_profile)
                     profiles['reverse_p1'] = fingerprint(reverse_settings.api_key)
