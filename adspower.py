@@ -345,6 +345,7 @@ class AdsPower:
         self.base_url = local_url(base_url.rstrip('/'), {"http", "https"})
         self.api_key, self.profile_id = api_key.strip(), profile_id.strip()
         self.command_timeout = 10
+        self.prefer_merchant_row = False
         self.alternative_mexc_domains = alternative_mexc_domains
 
     @classmethod
@@ -771,6 +772,12 @@ class AdsPower:
                 if verified in {"passed", "not_required"}:
                     return verified
                 return await self.open_merchant_order(call, order_no)
+            if self.prefer_merchant_row:
+                # A visible merchant row can avoid loading a slow standalone page.
+                # Opening its dialog does not approve verification or change an order.
+                state = await self.open_merchant_order(call, order_no, quick=True)
+                if state is not None:
+                    return state
             targets = (await call("Target.getTargets")).get("targetInfos", [])
             existing = [t for t in targets if t.get("type") == "page"
                         and urlsplit(t.get("url", "")).scheme == "https"
@@ -1068,7 +1075,7 @@ class AdsPower:
                 return "not_required"
             raise AdsPowerError("Не удалось прочитать состояние проверки ордера на MEXC через профиль П1")
 
-    async def open_merchant_order(self, call, order_no: str) -> str:
+    async def open_merchant_order(self, call, order_no: str, *, quick: bool = False) -> str | None:
         """The standalone page can hide pending verification. Open the exact maker row."""
         def merchant_page(target):
             url = urlsplit(target.get('url', ''))
@@ -1079,6 +1086,8 @@ class AdsPower:
         targets = [target for target in (await call('Target.getTargets')).get('targetInfos', [])
                    if merchant_page(target)]
         if not targets:
+            if quick:
+                return None
             created = await call('Target.createTarget', {
                 'url': 'https://www.mexc.com/ru-RU/buy-crypto/control',
                 'background': False})
@@ -1086,6 +1095,7 @@ class AdsPower:
                 raise AdsPowerError('AdsPower не открыл портал мерчанта П1; кнопка не нажималась')
             targets = [{'type': 'page', 'targetId': created['targetId'],
                         'url': 'https://www.mexc.com/ru-RU/buy-crypto/control'}]
+        opened_row = False
         for target in targets:
             session = (await call("Target.attachToTarget", {"targetId": target["targetId"], "flatten": True}))["sessionId"]
             expression = r"""(orderNo => {
@@ -1096,19 +1106,22 @@ class AdsPower:
                 if (icons.length !== 1) return false;
                 icons[0].dispatchEvent(new MouseEvent('click', {bubbles:true,cancelable:true})); return true;
             })""" + f"({json.dumps(order_no)})"
-            for _ in range(15):
+            for _ in range(1 if quick else 15):
                 result = await call("Runtime.evaluate", {"expression": expression, "returnByValue": True}, session)
                 if result.get("result", {}).get("value") is True:
                     break
                 await asyncio.sleep(1)
             else:
                 continue
+            opened_row = True
             for _ in range(10):
                 state = await self.read_view(call, session, target["targetId"], order_no)
                 if state == "ready":
                     return state
                 await asyncio.sleep(1)
             break
+        if quick and not opened_row:
+            return None
         # Opening the merchant row is navigation, not approval. Before retrying
         # the preflight, recognize verification completed elsewhere meanwhile.
         try:

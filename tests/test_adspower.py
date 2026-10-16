@@ -383,6 +383,25 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             "url": "https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=" + ORDER, "background": False}))
         self.assertTrue(all(not c.kwargs.get("click") for c in self.browser.view.call_args_list))
 
+    async def test_cash_order_uses_existing_merchant_row_first(self):
+        self.browser.prefer_merchant_row = True
+        self.browser.locate = AsyncMock(return_value=None)
+        self.browser.open_merchant_order = AsyncMock(return_value='ready')
+        self.assertEqual(await self.browser.open_order(ORDER), 'ready')
+        self.browser.open_merchant_order.assert_awaited_once_with(self.call, ORDER, quick=True)
+        self.call.assert_not_called()
+
+    async def test_cash_order_falls_back_when_merchant_row_is_absent(self):
+        self.browser.prefer_merchant_row = True
+        self.browser.locate = AsyncMock(return_value=None)
+        self.browser.open_merchant_order = AsyncMock(return_value=None)
+        self.call.side_effect = [{'targetInfos': []}, {'targetId': 'new'}, {'sessionId': 'session'}]
+        self.browser.view = AsyncMock(return_value='ready')
+        self.assertEqual(await self.browser.open_order(ORDER), 'ready')
+        self.browser.open_merchant_order.assert_awaited_once_with(self.call, ORDER, quick=True)
+        self.assertEqual(self.call.call_args_list[1].args[0], 'Target.createTarget')
+        self.assertTrue(all(not c.kwargs.get('click') for c in self.browser.view.call_args_list))
+
     async def test_unloaded_existing_page_does_not_create_duplicate(self):
         self.browser.locate = AsyncMock(return_value=None)
         self.call.side_effect = [{"targetInfos": [{"type": "page", "targetId": "existing",
@@ -431,6 +450,29 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('/buy-crypto/control', self.call.call_args_list[1].args[1]['url'])
         self.assertEqual(self.call.call_args_list[4].args[2], 's')
         self.assertIn(ORDER, self.call.call_args_list[4].args[1]['expression'])
+
+    async def test_quick_merchant_probe_does_not_open_tab_when_row_absent(self):
+        target = {'type': 'page', 'targetId': 'control',
+                  'url': 'https://www.mexc.com/ru-RU/buy-crypto/control'}
+        self.call.side_effect = [
+            {'targetInfos': [target]}, {'sessionId': 's'}, {'result': {'value': False}},
+        ]
+        self.browser.read_view = AsyncMock()
+        self.assertIsNone(await self.browser.open_merchant_order(self.call, ORDER, quick=True))
+        self.assertFalse(any(c.args[0] == 'Target.createTarget' for c in self.call.call_args_list))
+        self.browser.read_view.assert_not_called()
+
+    async def test_quick_merchant_probe_reconciles_after_opening_row(self):
+        target = {'type': 'page', 'targetId': 'control',
+                  'url': 'https://www.mexc.com/ru-RU/buy-crypto/control'}
+        self.call.side_effect = [
+            {'targetInfos': [target]}, {'sessionId': 's'}, {'result': {'value': True}},
+        ]
+        self.browser.read_view = AsyncMock(return_value='missing')
+        self.browser.server_verification_state.return_value = 'passed'
+        with patch('adspower.asyncio.sleep', new=AsyncMock()):
+            self.assertEqual(await self.browser.open_merchant_order(self.call, ORDER, quick=True), 'passed')
+        self.browser.server_verification_state.assert_awaited_once_with(ORDER)
 
     async def test_missing_merchant_button_is_retryable_before_approval(self):
         target = {'type': 'page', 'targetId': 'control',

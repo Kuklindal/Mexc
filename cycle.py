@@ -1852,6 +1852,8 @@ async def run_command(args, *, stop_event: asyncio.Event | None = None, use_lock
                     await maker_browser.ensure_mexc_page()
                     async with maker_browser.connection() as call:
                         await call('Target.getTargets')
+                if browser and scheduler_mode == 'cash_volume':
+                    browser.prefer_merchant_row = True
             cash_wait_min, cash_wait_max = 75.0, 105.0
             if scheduler_mode == 'cash_volume' and not existing:
                 cash_wait_min = float(os.getenv('CASH_REVERSE_WAIT_MIN_SECONDS', '75'))
