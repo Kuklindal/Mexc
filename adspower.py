@@ -102,7 +102,9 @@ AD_QUANTITY = r"""async (advNo, plan) => {
         return {error:'quantity_reply_unknown'};
     }
     if (!response.ok || body?.code !== 0)
-        return {error:'quantity_rejected',code:body?.code ?? null,http:response.status};
+        return {error:'quantity_rejected',code:body?.code ?? null,http:response.status,
+            message:typeof body?.msg === 'string' ? body.msg :
+                typeof body?.message === 'string' ? body.message : null};
     const after = await read('read_after');
     if (after.error) return after;
     if ((plan.target_total !== undefined ? !sameTotal(after, plan.target_total)
@@ -958,6 +960,11 @@ class AdsPower:
                 reason = value.get('error', 'read_failed') if isinstance(value, dict) else 'read_failed'
                 detail = (f"; HTTP {value['http']}" if isinstance(value, dict) and isinstance(value.get('http'), int) else '')
                 detail += (f"; MEXC {value['code']}" if isinstance(value, dict) and isinstance(value.get('code'), int) else '')
+                if (isinstance(value, dict) and reason == 'quantity_rejected'
+                        and isinstance(value.get('message'), str)):
+                    response_message = ' '.join(value['message'].split())[:160]
+                    if response_message:
+                        detail += f'; {response_message}'
                 if plan and plan.get('edit_limit'):
                     if reason == 'payment_ids_missing':
                         raise AdsPowerError(

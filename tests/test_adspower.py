@@ -48,6 +48,19 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                                  ['Target.getTargets', 'Target.activateTarget',
                                   'Target.attachToTarget', 'Runtime.evaluate'])
 
+    async def test_quantity_rejection_includes_mexc_message(self):
+        adv_no = 'a1781101617440872449'
+        self.call.side_effect = [
+            {'targetInfos': [{'targetId': 'mexc-tab', 'type': 'page',
+                              'url': 'https://www.mexc.com/ru-RU/buy-crypto/'}]},
+            {}, {'sessionId': 'mexc-session'},
+            {'result': {'value': {'error': 'quantity_rejected', 'http': 200,
+                                  'code': 90009, 'message': '  Insufficient  balance\n'}}},
+        ]
+        with self.assertRaisesRegex(AdsPowerError,
+                                    'quantity_rejected; HTTP 200; MEXC 90009; Insufficient balance'):
+            await self.browser._ad_quantity(adv_no, {'quantity': '1041'})
+
     async def test_eflp_quantity_uses_authorized_alternate_domain(self):
         adv_no = 'a1835908380845933569'
         self.browser.alternative_mexc_domains = True
