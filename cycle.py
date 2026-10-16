@@ -657,7 +657,8 @@ class CycleRunner:
                         except Paused:
                             browser = self.maker_browser if step.actor == 'p2' else (self.reverse_browser or self.browser)
                             current_plan = (await self.quantity_plan(ad, plan['adv_no'], plan['quantity'],
-                                        side=plan.get('side', 'SELL'), browser=browser)
+                                        side=plan.get('side', 'SELL'), browser=browser,
+                                        fiat=self.fiat_for(leg))
                                        if plan.get('method') == 'quantity_only' else
                                        self.replenish_plan(ad, plan['adv_no'], plan['quantity']))
                             if current_plan != plan:

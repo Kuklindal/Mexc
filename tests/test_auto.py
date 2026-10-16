@@ -587,6 +587,35 @@ class AutoTests(unittest.IsolatedAsyncioTestCase):
             await runner.run(self.cycle_id)
         self.assertEqual(len(self.exchange.ad_calls), 2)
 
+    async def test_auto_resume_replenishment_uses_next_maker_currency(self):
+        runner = self.runner()
+        runner.delay_seconds = runner.delay_max_seconds = 0
+        self.exchange.fail = 'replenish_no_change'
+        with self.assertRaises(Paused):
+            await runner.run(self.cycle_id)
+        self.assertEqual(self.journal.step(self.cycle_id, 'reverse_replenish')['status'], 'unknown')
+        saved = self.journal.step(self.cycle_id, 'reverse_replenish')['result'] | {
+            'method': 'quantity_only'}
+        self.journal.db.execute("UPDATE steps SET result=? WHERE cycle_id=? AND name='reverse_replenish'",
+                                (json.dumps(saved), self.cycle_id))
+
+        spec = self.journal.cycle(self.cycle_id)['spec'] | {
+            'reverse_fiat': 'KGS',
+            'reverse_p1_profile': 'p1_2', 'replenish_adv_no': 'AD-SELL',
+        }
+        self.journal.db.execute('UPDATE cycles SET spec=? WHERE id=?',
+                                (json.dumps(spec), self.cycle_id))
+        self.journal.db.commit()
+        runner.clients['reverse_p1'] = self.exchange.client('p1')
+        runner.reverse_browser = runner.browser
+        runner.guard_participants = AsyncMock()
+        runner.snapshot = AsyncMock(return_value={
+            'state': 'DONE', 'order_no': 'ORDER-1', 'quantity': '100'})
+        runner.quantity_plan = AsyncMock(side_effect=Paused('test probe'))
+        with self.assertRaisesRegex(Paused, 'test probe'):
+            await runner.run(self.cycle_id)
+        self.assertEqual(runner.quantity_plan.await_args.kwargs['fiat'], 'KGS')
+
     async def test_explicit_timestamp_rejection_can_resume_without_duplicate_order(self):
         runner = self.runner()
         runner.delay_seconds = runner.delay_max_seconds = 0
