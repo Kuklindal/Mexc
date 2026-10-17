@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
@@ -87,6 +88,27 @@ class TelegramControl:
                 save_state(self.journal, state)
         self.stop_event.set()
         self.shutdown_event.set()
+
+    async def cleanup_cash_tabs(self, browser) -> None:
+        """Reclaim old order tabs independently of the trading worker."""
+        from browser_housekeeping import cleanup_abandoned_cash_tabs
+        from mexc_client import MexcP2PClient
+
+        client = None
+        try:
+            settings = Settings.from_env('p1')
+            client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url,
+                                  settings.recv_window, settings.proxy_url)
+            found, confirmed, closed, skipped = await asyncio.wait_for(
+                cleanup_abandoned_cash_tabs(self.journal.db, browser, client), timeout=120)
+            if found:
+                self.logger.info('Cash browser cleanup: %s abandoned tabs, %s final, '
+                                 '%s closed, %s retained', found, confirmed, closed, skipped)
+        except Exception as exc:
+            self.logger.warning('Cash browser cleanup unavailable (%s)', type(exc).__name__)
+        finally:
+            if client is not None:
+                await client.close()
 
     def resume_after_restart(self) -> bool:
         """Resume running work or a narrowly identified legacy retryable preflight."""
@@ -1006,6 +1028,8 @@ class TelegramControl:
         profile_check_at = 0.0
         profile_check_failed = False
         resumed = self.resume_after_restart()
+        browser_cleanup_at = asyncio.get_running_loop().time() + 60
+        browser_cleanup_task = None
         await self.reply(('Управление включено. Продолжаю серию после перезапуска.\n' if resumed else
                           'Управление включено. Сделки сами не запускаются — выбери действие.\n')
                          + self.status())
@@ -1014,6 +1038,19 @@ class TelegramControl:
                 try:
                     operation = 'profile check'
                     now = asyncio.get_running_loop().time()
+                    if now >= browser_cleanup_at:
+                        browser_cleanup_at = now + 600
+                        from rollover import load_state
+                        try:
+                            scheduler = load_state(self.journal)
+                        except Exception as exc:
+                            self.logger.warning('Cash browser cleanup state unavailable (%s)',
+                                                type(exc).__name__)
+                            scheduler = None
+                        if (browser_guard and browser_guard.api_key and browser_guard.profile_id
+                                and scheduler and scheduler.get('mode') == 'cash_volume'
+                                and (browser_cleanup_task is None or browser_cleanup_task.done())):
+                            browser_cleanup_task = asyncio.create_task(self.cleanup_cash_tabs(browser_guard))
                     if (browser_guard and browser_guard.api_key and browser_guard.profile_id
                             and now >= profile_check_at):
                         profile_check_at = now + 60
@@ -1059,6 +1096,10 @@ class TelegramControl:
                     await asyncio.sleep(5)
         finally:
             self.stop_event.set()
+            if browser_cleanup_task is not None and not browser_cleanup_task.done():
+                browser_cleanup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await browser_cleanup_task
             if self.running:
                 await asyncio.shield(self.task)
 

@@ -1,8 +1,9 @@
 import json
 import sqlite3
 import unittest
+from unittest.mock import AsyncMock, MagicMock
 
-from deploy.cleanup_cash_abandoned_tabs import abandoned_orders, is_final_order
+from browser_housekeeping import abandoned_orders, cleanup_abandoned_cash_tabs, is_final_order
 
 
 class AbandonedTabCleanupTests(unittest.TestCase):
@@ -30,6 +31,43 @@ class AbandonedTabCleanupTests(unittest.TestCase):
         self.assertFalse(is_final_order({'advOrderNo': number, 'state': 'PAID'}, number))
         self.assertFalse(is_final_order({'advOrderNo': 'd2222222222222222222',
                                          'state': 'DONE'}, number))
+
+
+class CleanupBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_closes_only_terminal_abandoned_tab(self):
+        old = 'd1111111111111111111'
+        unsettled = 'd3333333333333333333'
+        paused = 'd2222222222222222222'
+        with sqlite3.connect(':memory:') as db:
+            db.executescript('''
+                CREATE TABLE cycles(id TEXT PRIMARY KEY, status TEXT);
+                CREATE TABLE steps(cycle_id TEXT, name TEXT, status TEXT, result TEXT);
+            ''')
+            for cycle_id, status, number in (('old', 'abandoned', old),
+                                             ('paused', 'paused', paused),
+                                             ('unsettled', 'abandoned', unsettled)):
+                db.execute('INSERT INTO cycles VALUES (?, ?)', (cycle_id, status))
+                db.execute('INSERT INTO steps VALUES (?, ?, ?, ?)',
+                           (cycle_id, 'forward_create', 'done',
+                            json.dumps({'order_no': number})))
+            call = AsyncMock(return_value={'targetInfos': [
+                {'type': 'page', 'url': 'https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=' + old},
+                {'type': 'page', 'url': 'https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=' + paused},
+                {'type': 'page', 'url': 'https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=' + unsettled},
+            ]})
+            browser = MagicMock()
+            browser.connection.return_value.__aenter__ = AsyncMock(return_value=call)
+            browser.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+            browser.close_order_tabs = AsyncMock(return_value=1)
+            client = MagicMock()
+            client.get_order_detail = AsyncMock(side_effect=[
+                {'advOrderNo': old, 'state': 'DONE'},
+                {'advOrderNo': unsettled, 'state': 'PAID'},
+            ])
+
+            self.assertEqual(await cleanup_abandoned_cash_tabs(db, browser, client), (2, 1, 1, 1))
+            self.assertEqual(client.get_order_detail.await_count, 2)
+            browser.close_order_tabs.assert_awaited_once_with([old])
 
 
 if __name__ == '__main__':
