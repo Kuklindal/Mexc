@@ -49,9 +49,11 @@ async def main() -> None:
         "if(location.protocol!=='https:'||!['mexc.com','www.mexc.com','mexc.co',"
         "'www.mexc.co','mexc.io','www.mexc.io'].includes(location.hostname))return out;"
         "try{const r=await fetch('/api/platform/p2p/api/merchant/order/'+adv,"
-        "{credentials:'same-origin',cache:'no-store'});const b=await r.json();"
-        'out.http=r.status;out.code=b.code;out.ownsAd=b.data?.id===adv}'
-        "catch(_){out.error='read_failed'}return out})()"
+        "{credentials:'same-origin',cache:'no-store'});"
+        "out.http=r.status;out.contentType=(r.headers.get('content-type')||'').split(';')[0];"
+        "let b;try{b=await r.json()}catch(_){out.error='non_json';return out}"
+        'out.code=b.code;out.ownsAd=b.data?.id===adv}'
+        "catch(e){out.error='fetch_'+(e?.name||'Error')}return out})()"
     )
     async with browser.connection() as call:
         targets = (await call('Target.getTargets', timeout=15)).get('targetInfos', [])
