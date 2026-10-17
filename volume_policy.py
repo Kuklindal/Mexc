@@ -7,8 +7,8 @@ import os
 
 TARGET_USDT = Decimal('70000')
 CEILING_USDT = Decimal('71000')
-CASH_TARGET_USDT = Decimal('67000')
-CASH_CEILING_USDT = Decimal('70000')
+CASH_TARGET_USDT = Decimal('66000')
+CASH_CEILING_USDT = Decimal('66500')
 
 
 def cash_final_return(env=None) -> str:

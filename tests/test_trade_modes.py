@@ -1241,14 +1241,14 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                 await choose_mode_amount('eflp_volume', 'p1', '1', {}, env)
         client.close.assert_awaited_once()
 
-    async def test_cash_amount_uses_journal_across_runs_and_stops_at_67k(self):
+    async def test_cash_amount_uses_journal_across_runs_and_stops_at_66k(self):
         self.journal.abandon(self.cycle_id)
         env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
         previous = self.journal.create(dict(self.spec, p2_profile='1',
                                             members={'p1': 'main-member', 'p2': 'member-1'}))
         self.journal.transition(previous, 'forward_complete', 'both', 'done', 'sale',
-                                result={'quantity': '67000'},
-                                context={'amount': '6700000', 'quantity': '67000'})
+                                result={'quantity': '66000'},
+                                context={'amount': '6600000', 'quantity': '66000'})
         self.journal.abandon(previous)
         sell = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL',
                 'coinName': 'USDT', 'fiatUnit': 'RUB', 'advStatus': 'OPEN',
@@ -1264,23 +1264,84 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                                                         env, journal=self.journal))
         self.assertEqual(client.close.await_count, 1)
 
+    async def test_cash_last_purchase_is_random_between_66k_and_66500(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        previous = self.journal.create(dict(self.spec, p2_profile='1',
+                                            members={'p1': 'main-member', 'p2': 'member-1'}))
+        self.journal.transition(previous, 'forward_complete', 'both', 'done', 'sale',
+                                result={'quantity': '65000'},
+                                context={'amount': '6500000', 'quantity': '65000'})
+        self.journal.abandon(previous)
+        sell = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL',
+                'coinName': 'USDT', 'fiatUnit': 'RUB', 'advStatus': 'OPEN',
+                'price': '100', 'maxSingleTransAmount': '250000',
+                'minSingleTransAmount': '1000', 'availableQuantity': '3000'}
+        buy = dict(sell, advNo=env['MEXC_P1_BUY_ADV_NO'], side='BUY')
+        client = type('Client', (), {})()
+        client.get_ad = AsyncMock(side_effect=lambda ad_no: sell if ad_no == sell['advNo'] else buy)
+        client.close = AsyncMock()
+        state = {'mode': 'cash_volume', 'volume_windows': {'1': {'quantity': '0', 'orders': []}}}
+        with (patch.dict(os.environ, env),
+              patch('trade_modes.MexcP2PClient', return_value=client),
+              patch('trade_modes.random.randint', return_value=14250000) as draw):
+            amount = await choose_mode_amount('cash_volume', 'p1', '1', state,
+                                              env, journal=self.journal)
+        self.assertEqual(amount, '142500.00 RUB')
+        low, high = draw.call_args.args
+        self.assertLessEqual(low, 14250000)
+        self.assertGreaterEqual(high, 14250000)
+        self.assertGreaterEqual(Decimal(amount.split()[0]) / 100 + 65000, 66000)
+        self.assertLessEqual(Decimal(amount.split()[0]) / 100 + 65000, 66500)
+        self.assertEqual(client.close.await_count, 1)
+
+    async def test_cash_last_purchase_respects_live_ceiling_and_ad_minimum(self):
+        self.journal.abandon(self.cycle_id)
+        env = env_for(1) | {'MEXC_P1_BUY_ADV_NO': 'a1234567890123456788'}
+        previous = self.journal.create(dict(self.spec, p2_profile='1',
+                                            members={'p1': 'main-member', 'p2': 'member-1'}))
+        self.journal.transition(previous, 'forward_complete', 'both', 'done', 'sale',
+                                result={'quantity': '65000'},
+                                context={'amount': '6500000', 'quantity': '65000'})
+        self.journal.abandon(previous)
+        sell = {'advNo': env['MEXC_P1_SELL_ADV_NO'], 'side': 'SELL',
+                'coinName': 'USDT', 'fiatUnit': 'RUB', 'advStatus': 'OPEN',
+                'price': '100', 'maxSingleTransAmount': '250000',
+                'minSingleTransAmount': '1000', 'availableQuantity': '3000'}
+        buy = dict(sell, advNo=env['MEXC_P1_BUY_ADV_NO'], side='BUY')
+        client = type('Client', (), {})()
+        client.get_ad = AsyncMock(side_effect=lambda ad_no: sell if ad_no == sell['advNo'] else buy)
+        client.close = AsyncMock()
+        with (patch.dict(os.environ, env),
+              patch('trade_modes.MexcP2PClient', return_value=client),
+              patch('trade_modes.random.randint', side_effect=lambda low, high: high)):
+            amount = await choose_mode_amount('cash_volume', 'p1', '1', {},
+                                              env, journal=self.journal)
+            quantity = Decimal(amount.split()[0]) / Decimal(100)
+            self.assertLessEqual(Decimal(65000) + quantity * Decimal('1.005'),
+                                 Decimal(66500))
+            self.assertGreaterEqual(Decimal(65000) + quantity, Decimal(66000))
+            sell['minSingleTransAmount'] = '160000'
+            self.assertIsNone(await choose_mode_amount('cash_volume', 'p1', '1', {},
+                                                       env, journal=self.journal))
+
     async def test_cash_preflight_blocks_changed_price_before_order_submission(self):
         self.journal.abandon(self.cycle_id)
         old = self.journal.create(dict(self.spec, p2_profile='1',
                                        members={'p2': 'member-1'}))
         self.journal.transition(old, 'forward_complete', 'both', 'done', 'sale',
-                                result={'quantity': '68800'},
-                                context={'amount': '6880000', 'quantity': '68800'})
+                                result={'quantity': '65000'},
+                                context={'amount': '6500000', 'quantity': '65000'})
         self.journal.abandon(old)
         runner = fixtures.AutoTests.runner(self)
         runner.cycle_id = self.cycle_id
         runner.p2_profile = '1'
         runner.trusted_members = {'p1': 'main-member', 'p2': 'member-1'}
-        runner.spec = dict(self.spec, cash_policy='rolling24_p1', amount='180000')
+        runner.spec = dict(self.spec, cash_policy='rolling24_p1', amount='142500')
         self.journal.transition(self.cycle_id, 'forward_ad', 'p1', 'done', 'ad',
                                 result={'adv_no': 'AD-SELL'})
         runner.clients['p1'].get_ad = AsyncMock(return_value={
-            'advNo': 'AD-SELL', 'side': 'SELL', 'advStatus': 'OPEN', 'price': '100'})
+            'advNo': 'AD-SELL', 'side': 'SELL', 'advStatus': 'OPEN', 'price': '95'})
         with self.assertRaises(CashVolumeLimitReached):
             await runner.prepare(Step('forward_create', 'p2', 'create'), recovery=False)
         self.assertIsNone(self.journal.step(self.cycle_id, 'forward_create'))
@@ -1292,8 +1353,8 @@ class TradeModeTests(unittest.IsolatedAsyncioTestCase):
                            p2_profiles=['1', '2'], env=env)
         old = self.journal.create(dict(self.spec, p2_profile='1', members={'p2': 'member-1'}))
         self.journal.transition(old, 'forward_complete', 'both', 'done', 'sale',
-                                result={'quantity': '66000'},
-                                context={'amount': '6600000', 'quantity': '66000'})
+                                result={'quantity': '65000'},
+                                context={'amount': '6500000', 'quantity': '65000'})
         self.journal.abandon(old)
         state['last_cycle_rowid'] = self.journal.db.execute(
             'SELECT rowid FROM cycles WHERE id=?', (old,)).fetchone()[0]

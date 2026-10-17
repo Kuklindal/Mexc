@@ -701,16 +701,36 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
                 raise Paused('Некорректная цена, лимит или остаток объявления покупки П1')
             buy_max_usdt = min((buy_max - Decimal('0.01')) / buy_price, buy_available)
             buy_min_usdt = buy_min / buy_price
+        cash_window = None
+        cash_quantity = None
+        if mode == 'cash_volume':
+            cash_window = (rolling_cash_purchases(
+                journal, p2_key,
+                member_id=(env.get(f'{profile_prefix(p2_key)}_MEMBER_ID') or '').strip())
+                if journal is not None else window_for(state, p2_key))
+            cash_quantity = Decimal(cash_window['quantity'])
+            if cash_quantity >= CASH_TARGET_USDT or cash_window.get('uncertain_until'):
+                return None
         if mode == 'eflp_volume':
             amount = _eflp_volume_amount(sell, p1_price, fiat, buy_min_usdt, buy_max_usdt)
         elif mode in {'volume', 'cash_volume', 'cash_unique'}:
             _, high_fiat, _ = amount_from_ad(sell)
             high_usdt = min(high_fiat / p1_price, reverse_max_usdt, buy_max_usdt)
             p1_min_usdt = Decimal(str(sell['minSingleTransAmount'])) / p1_price
-            low_usdt = max(high_usdt - Decimal(100), p1_min_usdt,
-                           reverse_min_usdt, buy_min_usdt)
+            minimum_usdt = max(p1_min_usdt, reverse_min_usdt, buy_min_usdt)
+            low_usdt = max(high_usdt - Decimal(100), minimum_usdt)
             if high_usdt < 200:
                 raise Paused(f'🚨 Доступный новый ордер меньше 200 USDT ({high_usdt:.2f}); проверьте объявления')
+            if mode == 'cash_volume':
+                # The last purchase reaches 66,000 plus a random 0–500 USDT,
+                # while keeping a 0.5% cushion for a changing advertisement price.
+                high_usdt = min(high_usdt,
+                                (CASH_CEILING_USDT - cash_quantity) / Decimal('1.005'))
+                if cash_quantity + high_usdt >= CASH_TARGET_USDT:
+                    low_usdt = max(CASH_TARGET_USDT - cash_quantity,
+                                   minimum_usdt, Decimal(200))
+                if low_usdt > high_usdt:
+                    return None
             amount = _fiat_amount(low_usdt, high_usdt, p1_price, fiat)
         else:
             p1_min = Decimal(str(sell['minSingleTransAmount'])) / p1_price
@@ -730,17 +750,13 @@ async def choose_mode_amount(mode, p1_key, p2_key, state, env=os.environ, journa
                     'Проверьте минимум, максимум и остатки обоих объявлений') from None
         if mode in {'volume', 'cash_volume'}:
             projected = Decimal(amount.split()[0]) / p1_price
-            window = (rolling_cash_purchases(journal, p2_key,
-                      member_id=(env.get(f'{profile_prefix(p2_key)}_MEMBER_ID') or '').strip())
-                      if mode == 'cash_volume' and journal is not None else window_for(state, p2_key))
+            window = cash_window if mode == 'cash_volume' else window_for(state, p2_key)
             ceiling = CASH_CEILING_USDT if mode == 'cash_volume' else CEILING_USDT
             if mode == 'cash_volume':
                 # Leave a small cushion for the fiat-to-USDT rounding and a
                 # price change between reading the advertisement and creation.
                 projected *= Decimal('1.005')
-            if (mode == 'cash_volume' and (Decimal(window['quantity']) >= CASH_TARGET_USDT
-                                          or window.get('uncertain_until'))
-                    or Decimal(window['quantity']) + projected > ceiling):
+            if Decimal(window['quantity']) + projected > ceiling:
                 return None
         return amount
     finally:

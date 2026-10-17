@@ -419,8 +419,8 @@ class CycleRunner:
             self.spec = spec
             over_limit = Decimal(window['quantity']) > CASH_CEILING_USDT
             self.journal.transition(self.cycle_id, 'cash_route', 'system', 'done',
-                ('⚠️ Скользящий объём превысил 70 000 USDT; обратную сделку завершить, '
-                 'новые покупки П2 заблокированы' if over_limit else
+                ('⚠️ Скользящий объём превысил 66 500 USDT; обратную сделку завершить,'
+                 ' новые покупки П2 заблокированы' if over_limit else
                  'Обычный обратный ордер: П2 продаёт USDT в объявление покупки П1'),
                 result={'reverse_maker': 'p1', 'return_route': 'ordinary',
                         'volume_usdt': window['quantity'], 'limit_breached': over_limit})
@@ -1192,8 +1192,8 @@ class CycleRunner:
                     if (window.get('uncertain_until')
                             or Decimal(window['quantity']) >= CASH_TARGET_USDT
                             or Decimal(window['quantity']) + projected > CASH_CEILING_USDT):
-                        raise CashVolumeLimitReached('Скользящий объём П2 достиг лимита 67–70 тыс. USDT; '
-                                                     'новая покупка не отправлена')
+                        raise CashVolumeLimitReached('Скользящий объём П2 достиг лимита 66–66,5 тыс. USDT;'
+                                                     ' новая покупка не отправлена')
                 self.console.write(f"После подтверждения П2 откроет сделку по объявлению {args['adv_no']} "
                                    f"на {self.spec['amount']} {self.spec['fiat']}.")
                 args.update(({"tradable_quantity": self.spec['forward_quantity']}
