@@ -32,6 +32,25 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
     def buttons(self, control):
         return [button['text'] for row in control.keyboard()['inline_keyboard'] for button in row]
 
+    async def test_terminal_tab_cleanup_uses_current_p1_account(self):
+        control = self.control()
+        settings = SimpleNamespace(api_key='key', secret_key='secret', base_url='https://api.mexc.com',
+                                   recv_window=5000, proxy_url=None)
+        client = SimpleNamespace(close=AsyncMock())
+        with patch('trade_profiles.profile_from_env', return_value=SimpleNamespace(
+                adspower_profile_id='current-p1')) as profile, \
+             patch('trade_profiles.settings_for_profile', return_value=settings) as selected, \
+             patch('adspower.AdsPower') as browser_type, \
+             patch('mexc_client.MexcP2PClient', return_value=client), \
+             patch('browser_housekeeping.cleanup_terminal_order_tabs', new=AsyncMock(
+                 return_value=(1, 1, 1, 0))) as cleanup:
+            await control.cleanup_terminal_tabs({'mode': 'eflp_unique', 'p1_profile': 'p1_7'})
+        profile.assert_called_once_with('p1_7', os.environ)
+        selected.assert_called_once_with('p1_7')
+        self.assertEqual(browser_type.call_args.args[2], 'current-p1')
+        cleanup.assert_awaited_once()
+        client.close.assert_awaited_once()
+
     def test_status_explains_connection_retry_when_profiles_have_no_timer(self):
         from rollover import save_state
 

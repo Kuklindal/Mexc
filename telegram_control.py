@@ -89,23 +89,28 @@ class TelegramControl:
         self.stop_event.set()
         self.shutdown_event.set()
 
-    async def cleanup_cash_tabs(self, browser) -> None:
-        """Reclaim old order tabs independently of the trading worker."""
-        from browser_housekeeping import cleanup_abandoned_cash_tabs
+    async def cleanup_terminal_tabs(self, state: dict) -> None:
+        """Reclaim finished order tabs independently of the trading worker."""
+        from adspower import AdsPower
+        from browser_housekeeping import cleanup_terminal_order_tabs
         from mexc_client import MexcP2PClient
+        from trade_profiles import profile_from_env, settings_for_profile
 
         client = None
         try:
-            settings = Settings.from_env('p1')
+            p1_key = state.get('p1_profile') or 'p1'
+            profile = profile_from_env(p1_key, os.environ)
+            settings = settings_for_profile(p1_key)
+            browser = AdsPower(os.getenv('ADSPOWER_BASE_URL', 'http://127.0.0.1:50325'),
+                               os.getenv('ADSPOWER_API_KEY', ''), profile.adspower_profile_id)
             client = MexcP2PClient(settings.api_key, settings.secret_key, settings.base_url,
                                   settings.recv_window, settings.proxy_url)
             found, confirmed, closed, skipped = await asyncio.wait_for(
-                cleanup_abandoned_cash_tabs(self.journal.db, browser, client), timeout=120)
-            if found:
-                self.logger.info('Cash browser cleanup: %s abandoned tabs, %s final, '
-                                 '%s closed, %s retained', found, confirmed, closed, skipped)
+                cleanup_terminal_order_tabs(self.journal.db, browser, client), timeout=120)
+            self.logger.info('Browser cleanup: %s terminal-cycle tabs, %s final, '
+                             '%s closed, %s retained', found, confirmed, closed, skipped)
         except Exception as exc:
-            self.logger.warning('Cash browser cleanup unavailable (%s)', type(exc).__name__)
+            self.logger.warning('Browser cleanup unavailable (%s)', type(exc).__name__)
         finally:
             if client is not None:
                 await client.close()
@@ -1044,13 +1049,15 @@ class TelegramControl:
                         try:
                             scheduler = load_state(self.journal)
                         except Exception as exc:
-                            self.logger.warning('Cash browser cleanup state unavailable (%s)',
+                            self.logger.warning('Browser cleanup state unavailable (%s)',
                                                 type(exc).__name__)
                             scheduler = None
                         if (browser_guard and browser_guard.api_key and browser_guard.profile_id
-                                and scheduler and scheduler.get('mode') == 'cash_volume'
+                                and scheduler and scheduler.get('mode') in {
+                                    'volume', 'unique', 'cash_volume', 'cash_unique',
+                                    'eflp_volume', 'eflp_unique'}
                                 and (browser_cleanup_task is None or browser_cleanup_task.done())):
-                            browser_cleanup_task = asyncio.create_task(self.cleanup_cash_tabs(browser_guard))
+                            browser_cleanup_task = asyncio.create_task(self.cleanup_terminal_tabs(scheduler))
                     if (browser_guard and browser_guard.api_key and browser_guard.profile_id
                             and now >= profile_check_at):
                         profile_check_at = now + 60

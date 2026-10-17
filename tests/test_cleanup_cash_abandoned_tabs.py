@@ -3,7 +3,9 @@ import sqlite3
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-from browser_housekeeping import abandoned_orders, cleanup_abandoned_cash_tabs, is_final_order
+from browser_housekeeping import (abandoned_orders, cleanup_abandoned_cash_tabs,
+                                  cleanup_terminal_order_tabs, is_final_order,
+                                  terminal_orders)
 
 
 class AbandonedTabCleanupTests(unittest.TestCase):
@@ -68,6 +70,39 @@ class CleanupBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await cleanup_abandoned_cash_tabs(db, browser, client), (2, 1, 1, 1))
             self.assertEqual(client.get_order_detail.await_count, 2)
             browser.close_order_tabs.assert_awaited_once_with([old])
+
+    async def test_completed_cycle_tab_is_reclaimed_but_paused_tab_is_preserved(self):
+        finished = 'd4444444444444444444'
+        paused = 'd5555555555555555555'
+        with sqlite3.connect(':memory:') as db:
+            db.executescript('''
+                CREATE TABLE cycles(id TEXT PRIMARY KEY, status TEXT);
+                CREATE TABLE steps(cycle_id TEXT, name TEXT, status TEXT, result TEXT);
+            ''')
+            for cycle_id, status, number in (('finished', 'completed', finished),
+                                             ('paused', 'paused', paused)):
+                db.execute('INSERT INTO cycles VALUES (?, ?)', (cycle_id, status))
+                db.execute('INSERT INTO steps VALUES (?, ?, ?, ?)',
+                           (cycle_id, 'reverse_create', 'done',
+                            json.dumps({'order_no': number})))
+            self.assertEqual(terminal_orders(db, frozenset({'completed', 'abandoned'})),
+                             {finished})
+            call = AsyncMock(return_value={'targetInfos': [
+                {'type': 'page', 'url': 'https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=' + finished},
+                {'type': 'page', 'url': 'https://www.mexc.com/ru-RU/buy-crypto/order-processing?id=' + paused},
+            ]})
+            browser = MagicMock()
+            browser.connection.return_value.__aenter__ = AsyncMock(return_value=call)
+            browser.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+            browser.close_order_tabs = AsyncMock(return_value=1)
+            client = MagicMock()
+            client.get_order_detail = AsyncMock(return_value={
+                'advOrderNo': finished, 'state': 'DONE'})
+
+            self.assertEqual(await cleanup_terminal_order_tabs(db, browser, client),
+                             (1, 1, 1, 0))
+            client.get_order_detail.assert_awaited_once_with(finished)
+            browser.close_order_tabs.assert_awaited_once_with([finished])
 
 
 if __name__ == '__main__':

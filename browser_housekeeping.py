@@ -1,4 +1,4 @@
-"""Conservative cleanup of terminal order tabs left by abandoned cash cycles."""
+"""Conservative cleanup of terminal order tabs left by finished cycles."""
 from __future__ import annotations
 
 import json
@@ -23,8 +23,8 @@ def tab_order_no(target: dict) -> str | None:
     return ids[0] if len(ids) == 1 and ORDER_NO.fullmatch(ids[0]) else None
 
 
-def abandoned_orders(db: sqlite3.Connection) -> set[str]:
-    """An order is eligible only when all its journal cycles are abandoned."""
+def terminal_orders(db: sqlite3.Connection, allowed_statuses: frozenset[str]) -> set[str]:
+    """An order is eligible only when all its journal cycles have allowed terminal states."""
     statuses: dict[str, set[str]] = defaultdict(set)
     for cycle_status, raw in db.execute("""SELECT c.status,s.result FROM steps s
         JOIN cycles c ON c.id=s.cycle_id
@@ -35,7 +35,12 @@ def abandoned_orders(db: sqlite3.Connection) -> set[str]:
             continue
         if isinstance(number, str) and ORDER_NO.fullmatch(number):
             statuses[number].add(cycle_status)
-    return {number for number, values in statuses.items() if values == {'abandoned'}}
+    return {number for number, values in statuses.items() if values <= allowed_statuses}
+
+
+def abandoned_orders(db: sqlite3.Connection) -> set[str]:
+    """Preserve the narrow selection used by the manual cash cleanup tool."""
+    return terminal_orders(db, frozenset({'abandoned'}))
 
 
 def is_final_order(detail: dict, number: str) -> bool:
@@ -43,12 +48,13 @@ def is_final_order(detail: dict, number: str) -> bool:
             and detail.get('state') in FINAL_STATES)
 
 
-async def cleanup_abandoned_cash_tabs(db, browser, client) -> tuple[int, int, int, int]:
+async def cleanup_terminal_order_tabs(db, browser, client, *,
+                                      allowed_statuses=frozenset({'completed', 'abandoned'})) -> tuple[int, int, int, int]:
     """Return open candidates, API-confirmed orders, closed tabs, skipped orders.
 
     No MEXC mutation is sent. Active and paused cycle tabs are never selected.
     """
-    candidates = abandoned_orders(db)
+    candidates = terminal_orders(db, allowed_statuses)
     if not candidates:
         return 0, 0, 0, 0
     async with browser.connection() as call:
@@ -57,7 +63,7 @@ async def cleanup_abandoned_cash_tabs(db, browser, client) -> tuple[int, int, in
                               if (number := tab_order_no(target)) in candidates})
     confirmed = closed = skipped = 0
     for number in open_candidates:
-        if number not in abandoned_orders(db):
+        if number not in terminal_orders(db, allowed_statuses):
             skipped += 1
             continue
         try:
@@ -75,3 +81,9 @@ async def cleanup_abandoned_cash_tabs(db, browser, client) -> tuple[int, int, in
             # A changed tab or an unavailable browser is left for the next run.
             skipped += 1
     return len(open_candidates), confirmed, closed, skipped
+
+
+async def cleanup_abandoned_cash_tabs(db, browser, client) -> tuple[int, int, int, int]:
+    """Compatibility wrapper for the manual cash cleanup command."""
+    return await cleanup_terminal_order_tabs(
+        db, browser, client, allowed_statuses=frozenset({'abandoned'}))
