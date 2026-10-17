@@ -11,6 +11,48 @@ from dotenv import dotenv_values
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def safe_origin(pid: int) -> str:
+    """Describe a browser root without printing its command line or URLs."""
+    directory = Path('/proc') / str(pid)
+    try:
+        args = [item.decode('utf-8', 'replace') for item in
+                (directory / 'cmdline').read_bytes().split(b'\0') if item]
+    except OSError:
+        args = []
+    kind = next((item.removeprefix('--type=') for item in args
+                 if item.startswith('--type=')), 'browser')
+    data_dir = next((item.removeprefix('--user-data-dir=') for item in args
+                     if item.startswith('--user-data-dir=')), '')
+    try:
+        executable = (directory / 'exe').resolve().name
+    except OSError:
+        executable = 'неизвестен'
+    ancestors = []
+    current = pid
+    for _ in range(5):
+        try:
+            status = dict(line.split(':', 1) for line in
+                          (Path('/proc') / str(current) / 'status').read_text().splitlines()
+                          if ':' in line)
+            parent = int(status['PPid'].strip())
+            if parent <= 1:
+                break
+            parent_dir = Path('/proc') / str(parent)
+            name = (parent_dir / 'comm').read_text().strip()
+            uid = parent_dir.stat().st_uid
+            try:
+                user = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                user = str(uid)
+            ancestors.append(f'{name}({user}, {parent})')
+            current = parent
+        except (OSError, ValueError, KeyError):
+            break
+    return (f'тип {kind} исполняемый {executable} каталог профиля '
+            f'{Path(data_dir.rstrip("/")).name if data_dir else "не указан"} '
+            f'предки {" → ".join(ancestors) if ancestors else "не видны"}')
+
+
 def configured_ids() -> set[str]:
     result = {'k1hshm0m'}  # A previously identified unused legacy profile.
     for path in ROOT.glob('.env*'):
@@ -72,6 +114,8 @@ def main() -> None:
               f'родитель {parent_name} процессов {len(members)} '
               f'сумма RSS {sum(processes[pid]["rss"] for pid in members) // 1024} МиБ '
               f'профиль {", ".join(ids) if ids else "ID не виден"}', flush=True)
+        if not ids:
+            print('    происхождение: ' + safe_origin(root), flush=True)
 
 
 if __name__ == '__main__':
