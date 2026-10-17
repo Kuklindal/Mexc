@@ -53,7 +53,10 @@ async def main() -> None:
         "out.http=r.status;out.contentType=(r.headers.get('content-type')||'').split(';')[0];"
         "let b;try{b=await r.json()}catch(_){out.error='non_json';return out}"
         'out.code=b.code;out.ownsAd=b.data?.id===adv}'
-        "catch(e){out.error='fetch_'+(e?.name||'Error')}return out})()"
+        "catch(e){out.error='fetch_'+(e?.name||'Error')}"
+        "if(out.error){try{const p=await fetch('/favicon.ico',{cache:'no-store'});"
+        "out.siteHttp=p.status}catch(e){out.siteError='fetch_'+(e?.name||'Error')}}"
+        "return out})()"
     )
     async with browser.connection() as call:
         targets = (await call('Target.getTargets', timeout=15)).get('targetInfos', [])
