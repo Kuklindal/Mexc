@@ -45,8 +45,8 @@ async def main() -> None:
     with sqlite3.connect(f'file:{path.resolve().as_posix()}?mode=ro', uri=True) as db:
         row = db.execute("SELECT value FROM meta WHERE key='rollover_scheduler_v1'").fetchone()
     state = json.loads(row[0]) if row else {}
-    if state.get('mode') != 'eflp_unique' or state.get('active_cycle'):
-        raise SystemExit('Нет остановленной серии Eflp без активного цикла')
+    if state.get('mode') not in {'eflp_unique', 'eflp_volume'} or state.get('active_cycle'):
+        raise SystemExit('Нет серии Eflp без активного цикла')
     profile = profile_from_env(state['p1_profile'], os.environ)
     settings = Settings.from_env('p1', p1_profile=profile.key)
     client = MexcP2PClient(settings.api_key, settings.secret_key,
